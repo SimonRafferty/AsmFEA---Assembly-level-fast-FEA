@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AsmFEA - Getting started</title>
+<!-- Images come from guide_images/; installer/build.py embeds them, so the installed guide is one file. -->
+<style>
+  :root {
+    --ink: #1c2430; --muted: #5d6878; --line: #e2e7ee; --bg: #f5f7fa; --card: #ffffff;
+    --blue: #1f6fd1; --teal: #17a9b8; --green: #3aa856; --amber: #f2a51a; --red: #d9412b;
+    --shadow: 0 1px 2px rgba(16,24,40,.06), 0 6px 20px rgba(16,24,40,.07);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.6 "Segoe UI", Arial, sans-serif; }
+  a { color: var(--blue); }
+  header {
+    background: linear-gradient(120deg, #13233d 0%, #1b3a66 55%, #1f6fd1 100%); color: #fff;
+    padding: 40px 20px 46px;
+  }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 16px; }
+  .hero { display: flex; align-items: center; gap: 26px; }
+  .hero img { width: 96px; height: 96px; flex: none; filter: drop-shadow(0 4px 10px rgba(0,0,0,.35)); }
+  .hero h1 { margin: 0; font-size: 34px; letter-spacing: .3px; }
+  .hero p { margin: 6px 0 0; color: #d6e3f7; font-size: 18px; }
+  .rainbow { height: 6px; background: linear-gradient(90deg, #2b3fd8, #1f8fe0, #17b8c8, #3aa856, #b5d62e, #f2c418, #f28a1a, #d9412b); }
+  .flow { display: flex; flex-wrap: wrap; gap: 8px; margin: 22px 0 0; padding: 0; list-style: none; }
+  .flow li { background: rgba(255,255,255,.12); border: 1px solid rgba(255,255,255,.25); border-radius: 999px;
+             padding: 4px 14px; font-size: 14px; color: #fff; }
+  main { padding: 28px 0 60px; }
+  .card { background: var(--card); border-radius: 14px; box-shadow: var(--shadow); padding: 26px 28px; margin: 22px 0; }
+  .step { display: grid; grid-template-columns: minmax(0, 1fr) 330px; gap: 28px; align-items: start; }
+  .step.wide { grid-template-columns: minmax(0, 1fr); }
+  .num { display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; border-radius: 50%;
+         color: #fff; font-weight: 700; margin-right: 10px; flex: none; }
+  h2 { display: flex; align-items: center; margin: 0 0 10px; font-size: 22px; }
+  ol, ul { padding-left: 22px; margin: 8px 0; }
+  li { margin: 6px 0; }
+  .btn { display: inline-block; padding: 0 8px; border: 1px solid #aeb7c4; border-radius: 4px; background: #f0f2f5;
+         font-size: 14px; line-height: 22px; white-space: nowrap; }
+  figure { margin: 0; }
+  figure img { width: 100%; height: auto; display: block; border-radius: 8px; border: 1px solid var(--line); background: #fff; }
+  figcaption { color: var(--muted); font-size: 13.5px; margin-top: 7px; text-align: center; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 16px; }
+  .tip { background: #eef5ff; border-left: 4px solid var(--blue); border-radius: 6px; padding: 10px 14px; margin: 14px 0 0; }
+  .warn { background: #fff4f1; border-left-color: var(--red); }
+  code { background: #eef1f5; padding: 1px 6px; border-radius: 4px; font-size: 14px; }
+  footer { color: var(--muted); font-size: 13px; text-align: center; padding: 10px 16px 40px; }
+  @media (max-width: 820px) {
+    .step, .pair { grid-template-columns: minmax(0, 1fr); }
+    .step figure { max-width: 400px; }
+    .hero img { width: 64px; height: 64px; }
+    .hero h1 { font-size: 27px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="wrap">
+    <div class="hero">
+      <img src="guide_images/icon.png" alt="AsmFEA icon">
+      <div>
+        <h1>AsmFEA - Getting started</h1>
+        <p>Stress analysis of a whole SOLIDWORKS assembly, from a task pane, in a few clicks.</p>
+      </div>
+    </div>
+    <ul class="flow">
+      <li>1&nbsp; Find the pane</li><li>2&nbsp; Prepare</li><li>3&nbsp; Loads &amp; fixtures</li>
+      <li>4&nbsp; Connections</li><li>5&nbsp; Run</li><li>6&nbsp; Results</li>
+    </ul>
+  </div>
+</header>
+<div class="rainbow"></div>
+
+<main class="wrap">
+
+<section class="card step wide">
+  <div>
+    <h2><span class="num" style="background:var(--blue)">1</span>Find AsmFEA in SOLIDWORKS</h2>
+    <ol>
+      <li>Start SOLIDWORKS (2018 or later; one of the versions you ticked in the installer). AsmFEA loads with it.</li>
+      <li>On the right of the window, the task pane has a new tab with the coloured hexagon icon (the one at the top of this page): click it to open AsmFEA.</li>
+      <li>If it is missing: <b>Tools &gt; Add-ins</b>, tick <b>AsmFEA</b> in both columns, then OK.</li>
+    </ol>
+  </div>
+</section>
+
+<section class="card step">
+  <div>
+    <h2><span class="num" style="background:#2b8fd8">2</span>Prepare the assembly and start a study</h2>
+    <ul>
+      <li>Open the assembly and give every part a material (right-click the part &gt; <b>Material</b>).
+        A single part works too: its bodies are treated as the parts, and bodies that touch are joined.</li>
+      <li>Click <span class="btn">New</span> in the pane and name the study. It is saved inside the assembly (or part).</li>
+      <li>On the <b>Study</b> tab pick a mesh fidelity (<i>coarse</i> is quick for a first look) and check the
+        pass/fail criteria the reports use. Changes are kept as you make them.</li>
+      <li>If you expect to try several sizes of load, tick <i>Fast load-size changes</i>: each load is solved once,
+        and changing only load sizes afterwards needs no new solve.</li>
+    </ul>
+    <div class="tip">Parts that touch are joined automatically. Mates tell AsmFEA where parts can slide or turn;
+      weld beads are used too, and a sub-assembly is treated as one rigid piece.</div>
+  </div>
+  <figure><img src="guide_images/pane_study.png" alt="The Study tab"><figcaption>The Study tab</figcaption></figure>
+</section>
+
+<section class="card step">
+  <div>
+    <h2><span class="num" style="background:var(--teal)">3</span>Add fixtures and loads</h2>
+    <ol>
+      <li>Select one or more faces on the model.</li>
+      <li>On the <b>Loads and fixtures</b> tab click <span class="btn">Fixed</span> (held still) or
+        <span class="btn">Pinned</span> (can rotate).</li>
+      <li>Loads belong to a <b>load case</b> (a set of loads solved together). Pick one at the top of the tab, or
+        click <span class="btn">New load case</span>; every case is solved in the same run. Fixtures apply to all cases.
+        Tick <b>Buckling</b> to check a case for buckling too (runs take longer).</li>
+      <li>Select faces and click <span class="btn">Force</span> or <span class="btn">Pressure</span>, or click
+        <span class="btn">Gravity</span> for self-weight. Give the force as X, Y and Z components; the
+        resultant shows as you type.</li>
+      <li>For a force acting away from the faces (a lever arm, a torque), also give how far from the faces' centre it
+        acts, in X, Y and Z (leave 0, 0, 0 for a force on the faces).</li>
+    </ol>
+    <p>Click a row in the list to highlight its faces on the model; a load also shows an arrow pointing at
+      where it acts. Double-click a row to change it.</p>
+  </div>
+  <figure><img src="guide_images/pane_loads.png" alt="The Loads and fixtures tab"><figcaption>Loads and fixtures</figcaption></figure>
+  <figure style="grid-column: 1 / -1"><img src="guide_images/model_fixtures.png" alt="A fixed face highlighted on the model">
+    <figcaption>The fixed face highlighted in blue. This assembly is a plate on a base, held by a 6 mm weld bead along one edge.</figcaption></figure>
+</section>
+
+<section class="card step">
+  <div>
+    <h2><span class="num" style="background:var(--green)">4</span>Check how the parts connect</h2>
+    <ul>
+      <li>Click <span class="btn">Analyse connections</span>: the list shows every place where parts meet and how they will be joined.</li>
+      <li>To change one, select it and <i>Set to</i>: <span class="btn">Fixed</span> (bonded),
+        <span class="btn">Sliding with friction...</span>, <span class="btn">Sliding joint...</span> or
+        <span class="btn">Not connected</span>. <span class="btn">Automatic</span> undoes your choice.</li>
+      <li>Weld beads appear as their own rows.</li>
+    </ul>
+    <div class="tip">Hover over any button for a tip. Double-click a connection or a warning, or press
+      <span class="btn">?</span>, for a full explanation.</div>
+  </div>
+  <figure><img src="guide_images/pane_connections.png" alt="The Connections tab"><figcaption>Connections, including a weld bead</figcaption></figure>
+</section>
+
+<section class="card step">
+  <div>
+    <h2><span class="num" style="background:var(--amber)">5</span>Run</h2>
+    <ul>
+      <li>On the <b>Run</b> tab click <span class="btn">Run</span>. The bar and the line below it show what is
+        happening; a first run takes from under a minute to a few minutes.</li>
+      <li><span class="btn">Check only</span> just checks the set-up, quickly, without solving.</li>
+      <li><span class="btn">Fast run</span> is for trying design changes: a coarser model that shows where the
+        problem is and whether a change helped, in a fraction of the time. Its results are marked
+        <b>APPROXIMATE</b> and it writes no report: do a full <span class="btn">Run</span> at the end, before you
+        rely on the numbers.</li>
+      <li>A re-run redoes only what your changes need: with nothing changed it finishes in seconds, and a new
+        pass/fail limit skips the solve. Tick <i>Full re-run</i> to redo everything.</li>
+      <li>A model too large for CalculiX to fit in your computer's memory is no longer refused: AsmFEA solves it with
+        its own hybrid solver, part by part, using the memory it has free. A note on the Run tab and in the report says
+        when that happened.</li>
+      <li>Anything that needs attention is listed: double-click it to see what it means and what to do.</li>
+    </ul>
+  </div>
+  <figure><img src="guide_images/pane_run.png" alt="The Run tab during a run"><figcaption>The Run tab</figcaption></figure>
+</section>
+
+<section class="card step">
+  <div>
+    <h2><span class="num" style="background:#f28a1a">6</span>Look at the results</h2>
+    <ul>
+      <li>The <b>Results</b> tab shows the pass/fail checks and the key numbers for each load case.</li>
+      <li><span class="btn">Stress</span>, <span class="btn">Displacement</span> and <span class="btn">FoS</span> open
+        a 3-D window (their tooltips repeat what follows):
+        <ul>
+          <li>left drag to rotate, wheel to zoom, right drag to pan, as in SOLIDWORKS; <b>Reset view</b> (or R) goes back;</li>
+          <li><b>click the model</b> to see the part and its stress, displacement and FoS at that point; click
+            the background to clear it;</li>
+          <li><b>&#9654; play</b> ramps the load up and down so you can watch the stress build; click it again to
+            stop at the full load;</li>
+          <li><b>Deformation x</b> exaggerates the deformed shape (0 shows it undeformed), and <b>Undeformed
+            shape</b> adds a grey outline of the original;</li>
+          <li><b>Min / max</b> shows the highest and lowest values; drag their labels anywhere.</li>
+        </ul></li>
+      <li><span class="btn">Open report</span> gives the full Word report; <span class="btn">Open summary</span>
+        a half-page summary. Both need a full run (they are greyed out after a fast run).</li>
+      <li>The pictures follow the way you look at the model in SOLIDWORKS: turn it, then open the results again.</li>
+    </ul>
+  </div>
+  <figure><img src="guide_images/pane_results.png" alt="The Results tab"><figcaption>Results</figcaption></figure>
+  <div class="pair" style="grid-column: 1 / -1">
+    <figure><img src="guide_images/plot_stress.png" alt="Stress plot"><figcaption>Stress (von Mises), with the highest and lowest values marked</figcaption></figure>
+    <figure><img src="guide_images/viewer_displacement.png" alt="The 3-D viewer"><figcaption>The 3-D window: displacement with the undeformed outline, a clicked point and the min / max labels</figcaption></figure>
+  </div>
+</section>
+
+<section class="card step wide">
+  <div>
+    <h2><span class="num" style="background:var(--red)">7</span>Optional: PrePoMax, for a closer look</h2>
+    <p>PrePoMax is a free program for exploring results in detail: section cuts, values at any point, animations.
+      AsmFEA does not need it, but <span class="btn">Open in PrePoMax</span> on the Results tab opens the last run in it.</p>
+    <ol>
+      <li>Download it from <a href="https://prepomax.fs.um.si/downloads/">prepomax.fs.um.si/downloads</a>
+        (version 2.6.0 is the one AsmFEA was tested with).</li>
+      <li>It is a zip file: unzip it anywhere, for example <code>C:\PrePoMax</code>. There is nothing to install.</li>
+      <li>In AsmFEA click <span class="btn">Open in PrePoMax</span> and choose <b>Find PrePoMax.exe...</b> the first time; AsmFEA remembers it.</li>
+    </ol>
+  </div>
+</section>
+
+<section class="card step wide">
+  <div>
+    <h2><span class="num" style="background:#1b7f2a">&#10003;</span>How accurate is AsmFEA?</h2>
+    <p>The <a href="AsmFEA%20verification%20report.html">verification report</a> (also in the Start menu, and as a PDF in
+      the AsmFEA folder) compares AsmFEA with classical hand calculations on four test cases (a cantilever, a beam under
+      its own weight, two members joined end to end, and a buckling column) and checks the CalculiX solver against its
+      own test examples and two NAFEMS benchmarks. Every comparison came within its acceptance criterion, the largest
+      difference being 0.6 %.</p>
+    <p>Satisfy yourself of its accuracy for your own work by running your own tests against hand calculations or
+      other trusted results before relying on it.</p>
+  </div>
+</section>
+
+<section class="card step wide">
+  <div>
+    <h2><span class="num" style="background:#5d6878">8</span>Keep your work</h2>
+    <ul>
+      <li>The study is saved <b>inside the assembly</b>: save the assembly to keep it.</li>
+      <li>Results and reports are in a folder next to the assembly called <code>&lt;assembly name&gt;_FEA</code>.</li>
+      <li>Units are millimetres, newtons and MPa throughout.</li>
+    </ul>
+    <div class="tip warn">Always check its results with engineering judgement and a
+      hand calculation before relying on them for anything that matters.</div>
+  </div>
+</section>
+
+</main>
+<footer>AsmFEA uses CalculiX (solver) and Gmsh (mesher), free software downloaded by the installer; see the licenses folder.</footer>
+</body>
+</html>

@@ -1,0 +1,28 @@
+AsmFEA - third-party software
+
+Installed with AsmFEA (inside the setup file)
+---------------------------------------------
+Python 3.13.5 (embeddable distribution)   Python Software Foundation License   python\LICENSE.txt
+Python libraries in python\Lib\site-packages, each with its licence in its *.dist-info folder, among them:
+  numpy, scipy (BSD), pydantic (MIT), jsonschema (MIT), psutil (BSD), cadquery-ocp / OCP
+  (Apache-2.0; Open CASCADE Technology: LGPL-2.1 with exception), PyVista (MIT), VTK (BSD),
+  matplotlib (PSF-based), python-docx (MIT), Pillow (MIT-CMU).
+
+Downloaded by the installer from the official sources (not part of the setup file)
+---------------------------------------------------------------------------------
+CalculiX 2.22 for Windows (ccx_dynamic.exe)
+  Licence: GNU General Public License version 2 (https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
+  Source:  http://www.dhondt.de/ccx_2.22.src.tar.bz2   (CalculiX home: http://www.calculix.de)
+  Windows binaries by Rafal Brzegowy, from http://www.dhondt.de/calculix_2.22_4win.zip
+  (solver\README_Install).
+
+Gmsh 4.15.2
+  Licence: GNU General Public License version 2 or later, see gmsh\LICENSE.txt
+  Source:  https://gmsh.info/src/gmsh-4.15.2-source.tgz   (home: https://gmsh.info)
+
+Intel oneAPI Math Kernel Library 2022.2.1 and Intel OpenMP runtime 2022.2.1
+  (solver\mkl_*.dll, solver\libiomp5md.dll; from the PyPI packages "mkl" and "intel-openmp")
+  Licence: Intel Simplified Software License, see licenses\Intel MKL and licenses\Intel OpenMP.
+
+AsmFEA runs CalculiX and Gmsh only as separate programs, exchanging files with them; no GPL code
+is part of AsmFEA itself.

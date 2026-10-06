@@ -1,0 +1,303 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://asmfea.local/schema/model/1.0",
+  "title": "asmfea neutral model",
+  "description": "model.json: the only contract between the SolidWorks add-in and the Python pipeline. Units fixed: mm, N, tonne, s, MPa. Positions and directions in the assembly frame unless stated. study.json uses the same schema with every top-level key optional except schema_version, and is merged over model.json at load time.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "materials", "parts"],
+  "properties": {
+    "schema_version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "source": {"$ref": "#/$defs/source"},
+    "materials": {"type": "array", "items": {"$ref": "#/$defs/material"}},
+    "parts": {"type": "array", "items": {"$ref": "#/$defs/part"}},
+    "mates": {"type": "array", "items": {"$ref": "#/$defs/mate"}},
+    "welds": {"type": "array", "items": {"$ref": "#/$defs/weld"}, "description": "Weld beads (SolidWorks cosmetic weld beads), schema 1.1"},
+    "face_refs": {"type": "array", "items": {"$ref": "#/$defs/face_ref"}},
+    "loads": {"type": "array", "items": {"$ref": "#/$defs/load"}},
+    "fixtures": {"type": "array", "items": {"$ref": "#/$defs/fixture"}},
+    "overrides": {"type": "array", "items": {"$ref": "#/$defs/override"}},
+    "study": {"$ref": "#/$defs/study"},
+    "issues": {"type": "array", "items": {"$ref": "#/$defs/issue"}, "description": "Problems the add-in found while extracting; the pipeline reports each as a diagnostic"}
+  },
+  "$defs": {
+    "issue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code"],
+      "properties": {
+        "code": {"enum": ["STEP_EXPORT_FAILED", "STEP_CONFIG_INACTIVE", "MATE_ENTITY_UNMATCHED", "MEMBER_PATH_UNKNOWN", "EXTRACT_ITEM_FAILED", "FACE_REF_REMATCHED", "FACE_REF_LOST", "FACE_REF_CHANGED"]},
+        "where": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "parts": {"type": "array", "items": {"type": "string"}},
+            "faces": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "params": {"type": "object", "description": "Values for the catalogue wording, and evidence"}
+      }
+    },
+    "vec3": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3},
+    "id": {"type": "string", "minLength": 1},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["assembly"],
+      "properties": {
+        "assembly": {"type": "string"},
+        "configuration": {"type": "string"},
+        "sw_version": {"type": "string"},
+        "addin_version": {"type": "string"},
+        "timestamp": {"type": "string"},
+        "view": {
+          "type": "object", "additionalProperties": false, "required": ["toward_viewer", "up"],
+          "description": "The SolidWorks view at export (assembly frame): the report's plots use it as their main view",
+          "properties": {"toward_viewer": {"$ref": "#/$defs/vec3"}, "up": {"$ref": "#/$defs/vec3"}}
+        }
+      }
+    },
+    "material": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "E", "nu", "density", "yield"],
+      "properties": {
+        "name": {"$ref": "#/$defs/id"},
+        "E": {"type": "number", "exclusiveMinimum": 0, "description": "Young's modulus, MPa"},
+        "nu": {"type": "number", "minimum": 0, "exclusiveMaximum": 0.5},
+        "density": {"type": "number", "exclusiveMinimum": 0, "description": "tonne/mm^3"},
+        "yield": {"type": "number", "exclusiveMinimum": 0, "description": "MPa"},
+        "ultimate": {"type": "number", "exclusiveMinimum": 0, "description": "MPa"}
+      }
+    },
+    "body": {
+      "type": "object",
+      "description": "Descriptors of this body in the PART frame, used to find it among the solids of the STEP file.",
+      "additionalProperties": false,
+      "required": ["volume", "centroid", "bbox_min", "bbox_max"],
+      "properties": {
+        "volume": {"type": "number", "exclusiveMinimum": 0},
+        "centroid": {"$ref": "#/$defs/vec3"},
+        "bbox_min": {"$ref": "#/$defs/vec3"},
+        "bbox_max": {"$ref": "#/$defs/vec3"}
+      }
+    },
+    "weld": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "size", "parts", "path"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "size": {"type": "number", "exclusiveMinimum": 0, "description": "Bead size (fillet leg), mm"},
+        "side": {"enum": ["selection", "both_sides", "all_around"]},
+        "parts": {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "Parts owning the path edges or the weld-from/to faces"},
+        "path": {"type": "array", "items": {"type": "array", "items": {"$ref": "#/$defs/vec3"}, "minItems": 2},
+                 "description": "Weld path as polylines, assembly frame, mm"},
+        "intermittent": {"type": "object", "additionalProperties": false,
+                         "properties": {"length": {"type": "number"}, "gap": {"type": "number"}, "pitch": {"type": "number"}, "staggered": {"type": "boolean"}}},
+        "partial": {"type": "object", "description": "A from-to length weld (not supported yet)"}
+      }
+    },
+    "part": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind", "material", "step", "body", "geometry_hash", "transform"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["member", "sheet", "solid", "fastener", "weld_bead"]},
+        "material": {"type": "string"},
+        "step": {"type": "string", "description": "Path relative to the study folder"},
+        "body": {"$ref": "#/$defs/body"},
+        "geometry_hash": {"type": "string"},
+        "transform": {
+          "type": "array", "items": {"type": "number"}, "minItems": 16, "maxItems": 16,
+          "description": "Row-major 4x4, part frame to assembly frame; translation in elements 3, 7, 11"
+        },
+        "fixed": {"type": "boolean"},
+        "subassembly": {"type": "string", "description": "Top-level sub-assembly the part sits in (schema 1.1); a sub-assembly is treated as rigid, like one multi-body part"},
+        "member": {"$ref": "#/$defs/member_data"},
+        "sheet": {"$ref": "#/$defs/sheet_data"},
+        "fastener": {"$ref": "#/$defs/fastener_data"}
+      },
+      "allOf": [
+        {"if": {"properties": {"kind": {"const": "member"}}}, "then": {"required": ["member"]}},
+        {"if": {"properties": {"kind": {"const": "sheet"}}}, "then": {"required": ["sheet"]}},
+        {"if": {"properties": {"kind": {"const": "fastener"}}}, "then": {"required": ["fastener"]}}
+      ]
+    },
+    "member_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "path", "clean_spans"],
+      "properties": {
+        "profile": {
+          "type": "object",
+          "required": ["type"],
+          "properties": {
+            "type": {"enum": ["SHS", "RHS", "CHS", "angle", "channel", "I", "flat", "round", "other"]}
+          },
+          "description": "Profile type plus its dimensions (b, h, t, r_out, d, tw, tf as applicable), part frame, mm; optional source (the weldment profile file)"
+        },
+        "path": {
+          "type": "object",
+          "description": "Part frame, mm; clean span positions s are measured from p0 towards p1",
+          "required": ["type"],
+          "properties": {
+            "type": {"enum": ["line", "arc", "other"]},
+            "p0": {"$ref": "#/$defs/vec3"},
+            "p1": {"$ref": "#/$defs/vec3"},
+            "center": {"$ref": "#/$defs/vec3"}
+          }
+        },
+        "clean_spans": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["s0", "s1"],
+            "properties": {"s0": {"type": "number"}, "s1": {"type": "number"}}
+          }
+        }
+      }
+    },
+    "sheet_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["thickness", "flat"],
+      "properties": {"thickness": {"type": "number", "exclusiveMinimum": 0}, "flat": {"type": "boolean"}}
+    },
+    "fastener_data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "d", "axis"],
+      "properties": {
+        "type": {"type": "string"},
+        "d": {"type": "number", "exclusiveMinimum": 0},
+        "axis": {"$ref": "#/$defs/vec3", "description": "Part frame"}
+      }
+    },
+    "mate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "parts"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"type": "string", "description": "SolidWorks mate type, e.g. coincident, concentric, lock, hinge, slot, width, slider, distance, angle, limit"},
+        "parts": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 2},
+        "entities": {"type": "array", "items": {"type": "string"}, "description": "face_ref ids or reference-geometry names"},
+        "geometry": {"enum": ["plane", "cylinder", "line", "point", "reference", "other"]},
+        "point": {"$ref": "#/$defs/vec3"},
+        "direction": {"$ref": "#/$defs/vec3"},
+        "radius": {"type": "number"}
+      }
+    },
+    "fingerprint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["surface", "area", "centroid"],
+      "properties": {
+        "surface": {"enum": ["plane", "cylinder", "cone", "sphere", "torus", "bspline", "other"]},
+        "area": {"type": "number", "exclusiveMinimum": 0},
+        "centroid": {"$ref": "#/$defs/vec3"},
+        "normal": {"$ref": "#/$defs/vec3", "description": "Outward normal at the centroid projection (planes)"},
+        "axis": {"$ref": "#/$defs/vec3", "description": "Cylinder/cone axis direction"},
+        "radius": {"type": "number"}
+      }
+    },
+    "face_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "part", "fingerprint"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "part": {"type": "string"},
+        "persistent_ref": {"type": "string", "description": "Base64 SolidWorks persistent reference"},
+        "feature": {"type": "string"},
+        "fingerprint": {"$ref": "#/$defs/fingerprint"}
+      }
+    },
+    "load": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "load_case", "type"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "load_case": {"type": "string"},
+        "type": {"enum": ["force", "pressure", "gravity", "remote_force"]},
+        "faces": {"type": "array", "items": {"type": "string"}},
+        "magnitude": {"type": "number", "description": "force, remote_force: N total; pressure: MPa (positive pushes into the face); gravity: mm/s^2"},
+        "direction": {"$ref": "#/$defs/vec3"},
+        "point": {"$ref": "#/$defs/vec3", "description": "remote_force: application point, assembly frame (mm)"},
+        "offset": {"$ref": "#/$defs/vec3", "description": "remote_force: application point as an offset (mm, assembly axes) from the area-weighted centroid of its faces; used when point is absent"},
+        "scale_in_buckling": {"type": "boolean", "description": "false = applied as preload in buckling steps (self-weight)"}
+      },
+      "allOf": [
+        {"if": {"properties": {"type": {"enum": ["force", "pressure", "remote_force"]}}},
+         "then": {"required": ["faces", "magnitude"]}},
+        {"if": {"properties": {"type": {"enum": ["force", "gravity", "remote_force"]}}},
+         "then": {"required": ["direction", "magnitude"]}}
+      ]
+    },
+    "fixture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "type", "faces"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "type": {"enum": ["fixed", "displacement", "pinned"]},
+        "faces": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "dofs": {
+          "type": "array", "items": {"enum": [1, 2, 3]}, "uniqueItems": true,
+          "description": "displacement: constrained global directions (zero displacement). pinned: translations held at the face centroid (default all three)"
+        },
+        "hold_rotations": {
+          "type": "array", "items": {"enum": [1, 2, 3]}, "uniqueItems": true,
+          "description": "pinned: global rotation axes also held (e.g. [3] stops twisting about Z); others are free"
+        }
+      }
+    },
+    "override": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "parts", "connection"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "parts": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2},
+        "interface": {"type": "string", "description": "Interface id from connections.json; absent = applies to every interface between the parts"},
+        "connection": {"enum": ["tie", "contact", "none", "revolute", "sliding", "bolted"]},
+        "friction": {"type": "number", "minimum": 0},
+        "params": {"type": "object", "description": "Type-specific settings, e.g. sliding: {\"direction\": [x, y, z]} (assembly frame; used before a cylinder axis or mate direction); bolted: size, preload ..."},
+        "note": {"type": "string"}
+      }
+    },
+    "study": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "load_cases"],
+      "properties": {
+        "name": {"type": "string"},
+        "analyses": {"type": "array", "items": {"enum": ["static", "buckling"]}, "uniqueItems": true},
+        "load_cases": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        "buckling_cases": {"type": "array", "items": {"type": "string"}},
+        "buckling_modes": {"type": "integer", "minimum": 1},
+        "load_superposition": {"type": "boolean", "description": "Solve each load on its own once; a load case is then the sum of its loads, so changing only load sizes needs no new solve (linear static only; D39)"},
+        "bond_tolerance": {"type": "number", "minimum": 0, "description": "Faces this close (a gap or an overlap, mm) count as touching and are bonded; default 0.5"},
+        "mesh": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fidelity": {"enum": ["coarse", "standard", "fine"]},
+            "size": {"type": "number", "exclusiveMinimum": 0, "description": "Override global element size, mm"},
+            "convergence_check": {"type": "boolean", "description": "Solve again on a refined mesh and report the change (default true)"}
+          }
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_deflection": {"type": "number", "exclusiveMinimum": 0},
+            "min_fos": {"type": "number", "exclusiveMinimum": 0},
+            "min_buckling_factor": {"type": "number", "exclusiveMinimum": 0}
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+AsmFEA - assembly FEA inside SOLIDWORKS
+
+AsmFEA adds a task pane to SOLIDWORKS (2018 or later) that runs a stress analysis of a whole assembly (loads, fixtures, connections between parts, mesh, solve, report) without leaving SOLIDWORKS.
+
+Before you start
+- SOLIDWORKS 2018 or later must be installed. Close it before continuing. If you have several versions, the installer asks which ones AsmFEA should be added to.
+- You need an internet connection: the installer downloads about 310 MB.
+
+What the installer does
+1. Installs AsmFEA and its own private copy of Python into Program Files (it does not touch any other Python on this computer).
+2. Downloads, from their official websites, the free programs AsmFEA uses to calculate:
+   - CalculiX 2.22 (the solver), from www.dhondt.de
+   - the Intel MKL maths library CalculiX needs, from pypi.org
+   - Gmsh 4.15.2 (the mesher), from gmsh.info
+   Every download is checked against a fixed checksum; a changed file is refused.
+3. Registers the AsmFEA add-in with SOLIDWORKS.
+
+Uninstalling (Settings > Apps > AsmFEA) removes all of it again. Your SOLIDWORKS files and analysis results are never touched.
+
+Licences: CalculiX and Gmsh are free software under the GNU General Public License; Intel MKL is free to redistribute under the Intel Simplified Software License. Their licence texts are put in the AsmFEA\licenses folder.
+
+Important: check AsmFEA's results with engineering judgement and hand calculations before relying on them.

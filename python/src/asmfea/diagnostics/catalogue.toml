@@ -1,0 +1,501 @@
+# asmfea diagnostics catalogue: every code, its wording and suggested actions.
+#
+# One table per code. `what` is a template filled from the diagnostic's `params`
+# (Python str.format). `explain` is a longer plain-English paragraph for the task pane's help
+# window. `likely_causes` are ranked, most probable first, and must not
+# state a cause as certain unless the raising code proves it. `actions` are concrete
+# next steps; an action with an `apply` key can be offered as a one-click fix.
+#
+# Adding a code: add it here, raise it with diagnostics.make(code, ...), and add a
+# deliberately broken case in tests/test_diagnostics_cases.py that triggers it and
+# checks its `where`.
+
+[MODEL_FILE_MISSING]
+severity = "blocking"
+stage = "load"
+what = "The study folder has no {file}."
+explain = "Every run starts from the files the add-in exports into the study folder (model.json, study.json and one STEP file per part). One of them is not there, so nothing can be analysed. Exporting again from the AsmFEA pane (Run tab, Export or Run all) normally rewrites it."
+likely_causes = ["The model was never exported into this folder.", "The folder path points at the assembly folder instead of a study folder."]
+actions = ["Run Export from the add-in (or `asmfea extract`) for this study.", "Check the study folder path: it should be <Assembly>_FEA/<study>/."]
+
+[MODEL_SCHEMA_INVALID]
+severity = "blocking"
+stage = "load"
+what = "{file} does not match the neutral-model schema: {detail}"
+explain = "The exported files follow a fixed format so that SolidWorks and the analysis agree on what everything means. This file breaks that format, usually because it was edited by hand or written by a different version of the add-in. Export again; if it persists, the detail names the offending field."
+likely_causes = ["A hand edit to study.json introduced a typo or a wrong type.", "The file was written by a newer or older add-in."]
+actions = ["Fix the field named in the message.", "Re-export the model from the add-in."]
+
+[MODEL_REFERENCE_UNKNOWN]
+severity = "blocking"
+stage = "load"
+what = "{kind} '{ref}' used by {owner} is not defined in the model."
+explain = "Something in the study points at an item (a part, face, material or load case) that is not defined. Nothing is guessed: the run stops so a load or fixture cannot silently land in the wrong place. This usually follows deleting a part or face that a load still used; edit or delete that load in the pane."
+likely_causes = ["A face, part or material was renamed or removed after the load or fixture was defined.", "A typo in study.json."]
+actions = ["Redefine the load or fixture on the current geometry.", "Correct the id in study.json."]
+
+[MATERIAL_MISSING]
+severity = "blocking"
+stage = "load"
+what = "Part {part} has no material properties ('{material}')."
+explain = "Stiffness and strength come from the part's material. This part has none, or its material lacks the elastic modulus, Poisson's ratio or density the analysis needs. Assign a material in SolidWorks (Edit Material) and export again; a custom material must define those properties."
+likely_causes = ["No material is assigned to the part in SolidWorks.", "The material is not in the material list exported with the model."]
+actions = ["Assign a material to the part in SolidWorks and re-export.", "Add the material with E, nu, density and yield to the model's materials."]
+
+[LOAD_CASE_UNDEFINED]
+severity = "blocking"
+stage = "load"
+what = "Load case '{case}' {problem}."
+explain = "Loads are grouped into named load cases, each solved separately. A load names a case the study does not list, or a listed case has no loads. Check the load cases on the Study tab match the ones used on the Loads and fixtures tab."
+likely_causes = ["The load case was renamed in the study but not on its loads.", "A load case was added to the study with no loads yet."]
+actions = ["Assign loads to the load case or remove it from the study."]
+
+[NO_FIXTURES]
+severity = "blocking"
+stage = "load"
+what = "The study has no fixtures, so nothing holds the assembly in space."
+explain = "A static analysis needs something holding the assembly in space; without it the whole model would simply fly away under load and the solver cannot find an answer. Add at least one fixture (select faces, then Fixed or Pinned on the Loads and fixtures tab)."
+likely_causes = ["Fixtures have not been defined yet."]
+actions = ["Add at least one fixture to a face of the assembly."]
+
+[STEP_MISSING]
+severity = "blocking"
+stage = "geometry"
+what = "The STEP file {step} for part {part} is missing or unreadable."
+explain = "Each part's geometry is passed to the mesher as a STEP file written by the add-in. This one is missing or cannot be read, so the part cannot be meshed. Export again; if SolidWorks reported an export problem, that message explains why."
+likely_causes = ["The export was interrupted.", "The file was moved or deleted."]
+actions = ["Re-export the model."]
+
+[BODY_UNMATCHED]
+severity = "blocking"
+stage = "geometry"
+what = "Part {part} could not be matched to a solid in {step}."
+explain = "The add-in describes each part's solid (volume, area, size) so it can be found again in the STEP file. No solid in the file matches, usually because the part changed after the export or the file belongs to another configuration. Export again."
+likely_causes = ["The STEP export changed the body (healing, merged faces).", "The part's descriptors were written for a different configuration."]
+actions = ["Re-export the model.", "Open the STEP file and check the body is present and closed."]
+
+[BODY_VOLUME_DIFFERS]
+severity = "warning"
+stage = "geometry"
+what = "Part {part}: the solid read from {step} has a volume {percent} % different from SolidWorks'."
+explain = "The body was found in the STEP file by its size and position, which match. Its volume as computed from the STEP file differs from the volume SolidWorks reports, usually because the export converted some faces approximately. The analysis uses the STEP solid, so its stiffness and mass follow that volume."
+likely_causes = ["Faces converted approximately in the STEP export (imported or derived bodies, complex surfaces).", "A body with a defect (a gap or a reversed face) that SolidWorks tolerates."]
+actions = ["Check the part's mass on the Results tab against SolidWorks' Mass Properties.", "If it matters, repair the body in SolidWorks (Check, Import Diagnostics) and export again."]
+
+[BODY_AMBIGUOUS]
+severity = "blocking"
+stage = "geometry"
+what = "Part {part} matches {count} solids in {step} equally well."
+explain = "The part's STEP file holds several solids that all match the description equally well, so the tool cannot tell which one is meant. It will not guess. This happens with multibody parts made of identical bodies; make the bodies different or split them into separate parts."
+likely_causes = ["The STEP file holds several identical bodies in the same position.", "A body is duplicated in the part."]
+actions = ["Remove the duplicate body in SolidWorks and re-export."]
+
+[FACE_UNMATCHED]
+severity = "blocking"
+stage = "geometry"
+what = "Face {face} on part {part} matches no face of the part's geometry."
+explain = "Loads, fixtures and mates refer to faces by their shape and position. This face no longer matches any face of the part, so whatever was applied to it has nowhere to go. Usually the part changed since the face was picked; reselect the face for that load or fixture."
+likely_causes = ["The geometry changed since the load or fixture was placed.", "The face was split or merged by the STEP export."]
+actions = ["Re-select the face for the load or fixture.", "Re-export the model."]
+
+[FACE_AMBIGUOUS]
+severity = "blocking"
+stage = "geometry"
+what = "Face {face} on part {part} matches {count} faces equally well."
+explain = "Several faces of the part match this face's shape and position equally well (for example identical holes in a pattern), so the tool cannot tell which one was meant and will not guess. Reselect the face, or make the faces distinguishable."
+likely_causes = ["The part is symmetric and the face fingerprint cannot tell the candidates apart."]
+actions = ["Re-select the face so its fingerprint is stored again.", "Split the face in SolidWorks so the target is unique."]
+
+[PART_FLOATING]
+severity = "blocking"
+stage = "resolve"
+what = "{count} part(s) have no connection path to a fixture: {parts}."
+explain = "These parts are not connected to anything that leads back to a fixture: no touching faces, mates or bolts tie them in. A floating part has no stiffness, so the solver cannot find an answer. Look for small gaps between parts, or set the connection yourself on the Connections tab."
+likely_causes = ["The parts do not touch anything within the gap tolerance.", "A connection was set to 'none' by an override."]
+actions = ["Check the listed parts touch their neighbours, or add a fixture to them.", "Review overrides that remove connections to these parts."]
+
+[PART_EXCLUDED_DISCONNECTED]
+severity = "warning"
+stage = "resolve"
+what = "{count} part(s) are not connected to anything with a fixture and are left out of the analysis: {parts}."
+explain = "These parts have no path, through touching faces, mates or bolts, to a fixture, and no load is applied to them, so they cannot carry anything. They are left out so the rest of the model can be solved; their weight is not included. Click this message to select them in SolidWorks. If they should be part of the structure, look for small gaps, or set the connection on the Connections tab."
+likely_causes = ["A gap between the parts and their neighbours larger than the bond tolerance.", "Duplicate or stray bodies left in a part.", "A connection set to 'none' by an override."]
+actions = ["Select the parts from this message and check how they meet their neighbours.", "Raise the bond tolerance on the Study tab if the gaps are intended to be bonded."]
+
+[LOAD_ON_FLOATING_PART]
+severity = "blocking"
+stage = "resolve"
+what = "Load {load} is applied to part {part}, which has no path to a fixture."
+explain = "A load is applied to a part that is not connected, through any chain of parts, to a fixture. The load has nowhere to go. Connect the part (check for gaps, or set a connection on the Connections tab) or move the load."
+likely_causes = ["The part is not connected to the rest of the assembly."]
+actions = ["Connect the part, or move the load."]
+
+[MESH_PART_FAILED]
+severity = "blocking"
+stage = "mesh"
+what = "Part {part} could not be meshed by any mesher in the fallback chain."
+explain = "Every mesher in the chain tried this part and none produced a usable mesh. Common causes are very small features, sliver faces, or geometry that does not close into a solid. Simplify or repair the part in SolidWorks (Check, small fillets, tiny edges) and run again."
+likely_causes = ["The geometry has tiny faces, slivers or self-intersections.", "The element size is too large for a thin feature of the part."]
+actions = ["Open the part's STEP file in PrePoMax and inspect the geometry.", "Set a finer mesh size for the study.", "Defeature small details (fillets, text, cosmetic holes) in SolidWorks."]
+
+[MESH_INVERTED]
+severity = "blocking"
+stage = "mesh"
+what = "Part {part} has {count} inverted elements after meshing."
+explain = "Some elements in this part's mesh are turned inside out. Results from such elements are meaningless, so the run stops. It usually comes from distorted geometry such as very thin slivers or knife edges; simplify those regions or choose a different mesh fidelity."
+likely_causes = ["Curved second-order nodes on small radii folded over the element."]
+actions = ["Set a finer mesh size.", "Remove small fillets from the part."]
+
+[SOLVER_NOT_FOUND]
+severity = "blocking"
+stage = "solve"
+what = "The CalculiX solver was not found at '{path}'."
+explain = "The analysis is solved by CalculiX, a separate program the tool runs. It is not at the path given in asmfea.toml (in %APPDATA%\\asmfea). Install it (it ships with PrePoMax) and point the [solver] entry at ccx_dynamic.exe."
+likely_causes = ["asmfea.toml does not point at ccx.", "The CalculiX installation was moved."]
+actions = ["Set [solver] ccx in asmfea.toml to the full path of the CalculiX executable (e.g. the one shipped in PrePoMax's Solver folder)."]
+
+[SOLVE_SINGULAR]
+severity = "blocking"
+stage = "solve"
+what = "The stiffness matrix is singular: the model can move without resistance{detail}."
+explain = "The solver found that part of the model can move without any resistance, so there is no single answer. Something is not held: a part not connected, a joint left free to slide or turn, or too few fixtures. The detail names where the solver noticed it."
+likely_causes = ["A part or group of parts is not held against rigid-body motion.", "A connection that should transfer load is missing or set to 'none'."]
+actions = ["Run the preflight checks and look for a mechanism or floating part.", "Add a fixture or a connection to the named part."]
+
+[SOLVE_FAILED_UNKNOWN]
+severity = "blocking"
+stage = "solve"
+what = "CalculiX stopped with an error this tool does not recognise (exit code {exit_code})."
+explain = "CalculiX stopped with an error this tool does not recognise. The raw solver output below shows what it reported. Running the study again rarely helps; open the deck in PrePoMax (Results tab) or send the study folder for investigation."
+likely_causes = []
+actions = ["Read the log excerpt in `raw`.", "Open the run in PrePoMax to inspect the model (`asmfea prepomax`)."]
+
+[SOLVE_OUT_OF_MEMORY]
+severity = "blocking"
+stage = "solve"
+what = "The solver ran out of memory on a model with {dof} degrees of freedom."
+explain = "The model has more unknowns than the computer's memory can hold while solving. Choose a coarser mesh fidelity on the Study tab, turn off the convergence check (it solves a finer mesh as well), or remove detail that does not matter for strength."
+likely_causes = ["The mesh is too fine for the installed RAM."]
+actions = ["Use a coarser mesh fidelity.", "Reduce the number of parts meshed with tets (members and flat sheet use swept elements)."]
+
+[SOLVE_MEMORY_EXCEEDS_RAM]
+severity = "blocking"
+stage = "solve"
+what = "The model is too large to solve here: about {need_gb:.0f} GB of memory for {dof:,} unknowns, on a computer with {ram_gb:.0f} GB."
+explain = "The solver would need more memory than this computer can give it, so it would swap to disk and slow the whole computer to a standstill. It is not started. Large counts usually come from a part meshed far finer than it needs: look for a warning that a part was meshed with tetrahedra instead of being swept, and the mesh line on the Run tab."
+likely_causes = ["A thin part was meshed with small tetrahedra (a sweep was refused).", "The mesh fidelity is fine for a large model."]
+actions = ["Use a coarser mesh fidelity.", "Simplify the part named in a mesh fallback warning (e.g. remove a small recess or step), or suppress parts that do not matter."]
+
+[SOLVER_HYBRID]
+severity = "warning"
+stage = "solve"
+what = "Solved with AsmFEA's hybrid solver, not CalculiX: {dof:,} unknowns would need about {need_gb:.0f} GB in CalculiX on a computer with {ram_gb:.0f} GB. The hybrid solver used {peak_gb:.1f} GB."
+explain = "CalculiX solves the whole model at once and would not fit in this computer's memory. The hybrid solver solves each part on its own and joins them through their interfaces, so it needs only about the largest part's memory. Its joints are smooth fields over each interface rather than node-by-node ties: in tests it agreed with CalculiX within about 1-3 % on displacement and on stresses away from joints, with exact reactions. Peak stresses right at a joint can differ more."
+likely_causes = ["A large model: many parts or a fine mesh.", "A part meshed finer than it needs (look for a mesh fallback warning)."]
+actions = ["Nothing is required: the results are valid for a linear static study.", "To solve with CalculiX instead, use a coarser mesh fidelity or simplify the model until it fits, or run on a computer with more memory."]
+
+[MEMORY_ESTIMATE_HIGH]
+severity = "warning"
+stage = "solve"
+what = "Estimated solver memory {need_gb:.1f} GB exceeds {frac:.0%} of installed RAM ({ram_gb:.1f} GB)."
+explain = "The solver is expected to need a large share of the computer's memory. The run continues, but the computer may slow down badly or the solve may fail. Consider a coarser mesh, or close other large programs while it runs."
+likely_causes = ["The mesh is fine for the size of the model."]
+actions = ["Use a coarser mesh fidelity before solving."]
+
+[REACTION_IMBALANCE]
+severity = "warning"
+stage = "post"
+what = "Reaction totals differ from the applied load by {err:.2%} in load case {case}."
+explain = "The forces at the fixtures should add up to the loads applied. Here they differ by more than round-off, which means some load is being lost or carried somewhere unexpected (for example by a joint or stabilising spring). Treat the results with caution until the cause is understood."
+likely_causes = ["Part of the load acts on a surface that is not connected to the fixtures.", "Ties or couplings lose load because of a large position tolerance."]
+actions = ["Check the connection table for gaps near the loaded parts."]
+
+[JOB_STALLED]
+severity = "warning"
+stage = "job"
+what = "Job {job} has not updated for {age:.0f} s and its worker process is not running."
+explain = "The background job stopped reporting progress and its worker process is gone, usually because it was killed or the computer slept. Start the run again."
+likely_causes = ["The worker process was killed or the machine went to sleep."]
+actions = ["Start the run again."]
+
+[JOB_FAILED]
+severity = "blocking"
+stage = "job"
+what = "Job {job} failed in stage {stage_failed} with an unexpected error: {error}"
+explain = "The analysis hit an unexpected internal error. This is a fault in the tool rather than in your model. The error text and the job folder help find the cause; running again after a change to the model may avoid it."
+likely_causes = ["A defect in asmfea."]
+actions = ["Send the job folder (job.json and log.txt) for investigation."]
+
+[FEATURE_NOT_IMPLEMENTED]
+severity = "blocking"
+stage = "deck"
+what = "The study uses {feature}, which this version of asmfea does not support yet."
+explain = "The study asks for something this version of AsmFEA cannot analyse yet. It stops rather than quietly leaving it out. Remove or change that item, or wait for the release that adds it."
+likely_causes = ["The feature is scheduled for a later milestone."]
+actions = ["Replace it with a supported equivalent, or remove it from the study."]
+
+[DISPLACEMENT_LARGE]
+severity = "warning"
+stage = "post"
+what = "Load case {case}: maximum displacement {disp:.3g} mm is {frac:.1%} of the model size; linear analysis may not be valid."
+explain = "The analysis is linear: it assumes deflections are small compared with the parts. Here the largest deflection is a noticeable fraction of the model's size, so that assumption is doubtful and real behaviour may differ (stiffening, buckling or large rotation). Check the loads and units, then treat the results with care."
+likely_causes = ["The structure is much more flexible than intended (missing member or connection).", "Loads are larger than intended (units or magnitude)."]
+actions = ["Check the load magnitudes.", "Check the connection table for missing ties near the part that moves most."]
+
+[RESULTS_MISSING]
+severity = "blocking"
+stage = "post"
+what = "There is no solved run to post-process in this study."
+explain = "There are no solver results to process yet. Run the whole study (Run all) rather than only the later stages."
+likely_causes = ["The solve stage has not been run, or it failed."]
+actions = ["Run the solve stage first (asmfea run <study> --stages solve post)."]
+
+[DECK_CARD_REJECTED]
+severity = "blocking"
+stage = "solve"
+what = "CalculiX could not interpret the deck card '{card}' and produced no results."
+explain = "CalculiX could not understand one of the instructions in the input file this tool wrote, and it produced no results. This is a fault in the tool, not in your model; the raw output names the instruction."
+likely_causes = ["A defect in asmfea's deck writer (a keyword or option this CalculiX version does not accept)."]
+actions = ["Send the run folder (study.inp, ccx.log) for investigation.", "Open the run in PrePoMax to inspect the deck."]
+
+[MECHANISM]
+severity = "blocking"
+stage = "resolve"
+what = "The model is a mechanism: {count} free motion(s) without straining anything. {motions}."
+explain = "Checked before meshing: some parts can move freely without stretching anything, for example a part on a sliding joint with nothing stopping the slide, or parts touching only through contact. The solver could not find an answer. The listed motions show what is free; add a fixture or change a connection on the Connections tab."
+likely_causes = ["A joint (revolute, sliding, line contact) leaves a motion that no fixture or other connection stops.", "A fixture constrains too few directions.", "Two parts are joined only along a line, which acts as a hinge."]
+actions = ["Add a fixture that stops the named motion.", "Change the joint to a tie with a decision on the connection.", "Check the mates on the named parts."]
+
+[NEAR_MISS]
+severity = "warning"
+stage = "resolve"
+what = "{parts} have faces {gap:.3g} mm apart: just outside the gap tolerance, so they are not connected."
+explain = "Two parts have faces very close together but not touching within the tolerance, so they are not connected. If they are meant to touch in reality, close the gap in the model; if not, nothing needs doing."
+likely_causes = ["The parts are meant to touch but are modelled with a small gap.", "The gap is real (clearance) and no connection is intended."]
+actions = ["Close the gap in SolidWorks if the parts should be joined.", "Or record a decision to tie them."]
+
+[INTERFERENCE]
+severity = "warning"
+stage = "resolve"
+what = "{parts} overlap by {volume:.3g} mm^3."
+explain = "Two parts overlap in the model. Overlapping material cannot be meshed correctly and is not connected. It is usually a modelling error; use Interference Detection in SolidWorks and remove the overlap."
+likely_causes = ["A press fit or a modelling error leaves the solids interpenetrating."]
+actions = ["Remove the interference in SolidWorks.", "Or record a decision to tie the parts."]
+
+[LINE_CONTACT]
+severity = "warning"
+stage = "resolve"
+what = "{parts} touch only along a line or at a point ({kind}); no connection is made."
+explain = "Two parts touch only along a line or at a point (for example a cylinder lying on a flat face). A connection over a line would concentrate all the force there and give meaningless stresses, so none is made. If the parts are bonded in reality, model a contact face; otherwise set the connection on the Connections tab."
+likely_causes = ["A round part rests on a flat or round part with no area contact."]
+actions = ["Decide the connection: none, tie or contact.", "Add a fixture or a mate that defines the joint."]
+
+[MATE_CONFLICT]
+severity = "warning"
+stage = "resolve"
+what = "{parts} touch, but their mates ({mates}) say they can move; no connection is made."
+explain = "The parts touch, but their mates allow them to move relative to each other, so it is not obvious whether they should be joined. No connection is made. Decide on the Connections tab (Fixed, Sliding with friction, Sliding joint or Not connected)."
+likely_causes = ["The parts are a mechanism in SolidWorks but should be fixed together for analysis.", "The touching faces are incidental."]
+actions = ["Decide the connection for this interface (tie, contact or none)."]
+
+[JOINT_WITHOUT_CONTACT]
+severity = "warning"
+stage = "resolve"
+what = "{parts} are mated as a {joint} joint ({why}) but no touching faces were found."
+explain = "The mates describe a joint (a hinge or slide) between these parts, but the parts have no touching faces for the joint to act through. Check the parts actually meet (for example a pin in a hole of the same size)."
+likely_causes = ["The joint has clearance larger than the gap tolerance.", "The mated faces are not the load path."]
+actions = ["Close the clearance in SolidWorks or record a decision for this pair."]
+
+[FASTENER_NO_HOLES]
+severity = "warning"
+stage = "resolve"
+what = "Fastener {part} passes through holes in {count} part(s); a bolted joint needs at least two."
+explain = "A fastener needs to pass through holes in at least two parts to form a bolted joint. This one does not, so it is not treated as a bolt. Check the fastener's position and that the holes line up."
+likely_causes = ["The fastener is not seated in its holes.", "The holes are larger than 1.5 x the fastener diameter.", "The fastener's axis or diameter was exported wrongly."]
+actions = ["Check the fastener's position and the hole sizes."]
+
+[CONTACT_ONLY_SUPPORT]
+severity = "warning"
+stage = "resolve"
+what = "Part {part} is held only by separating contact; it has no stiffness until the contact closes."
+explain = "A separating contact only carries load once the faces press together; until then the part has no stiffness at all and the solver cannot start. To get going, the analysis adds very weak springs holding the part in place, and checks after the solve that they carried almost none of the load. If the part is pressed into its support by the loads this is fine; if not, keep one connection fixed or use a sliding joint."
+likely_causes = ["Every connection to the part was switched to contact."]
+actions = ["Keep at least one tie, or accept the weak stabilising springs the deck will add (stated in the report)."]
+
+[MESH_SIZE_REDUCED]
+severity = "warning"
+stage = "mesh"
+what = "Part {part} would not mesh at its normal element size and was meshed at {factor} x that size ({size} mm)."
+explain = "The mesher could not mesh this part at the size its fidelity asks for, usually because the part has small features (short edges, slivers, thin faces) that larger elements cannot follow. Smaller elements were used for this part only, so the run goes on; its mesh is finer than its neighbours', which costs time but not accuracy."
+likely_causes = ["Small features in the part (short edges, slivers, tiny faces), often from an imported or converted body.", "A STEP export that approximated some faces."]
+actions = ["Nothing is needed for the results.", "If the run is slow, simplify the part (remove tiny features) or repair it in SolidWorks (Check, Import Diagnostics)."]
+
+[MESH_SWEEP_FALLBACK]
+severity = "warning"
+stage = "mesh"
+what = "Part {part}: {regions} could not be swept through the wall and were meshed with tets instead ({reason})."
+explain = "Thin walls and members are normally meshed with layers of elements swept through the thickness, which bend accurately. Some regions of this part could not be swept and were meshed with tetrahedra instead, which are stiffer in thin-wall bending. Results are still produced; local stresses in those regions are less accurate."
+likely_causes = ["The wall thickness is not constant (bosses, ribs, tapered or machined regions).", "The member's cross-section changes inside a clean span."]
+actions = ["Check the part is meant to be thin-walled: tets in thin walls are stiffer in local wall bending (milestone 0: up to 3.6 times at one element per thickness).", "Choose a finer mesh (fidelity fine) if local stresses in this part matter."]
+
+[MESH_TIMEOUT]
+severity = "warning"
+stage = "mesh"
+what = "The {mesher} mesher did not finish part {part} within {seconds:.0f} s and was stopped; the next mesher in the chain was tried."
+explain = "One mesher took too long on this part and was stopped; the next mesher in the chain was used instead. The run continues. If it happens often, the part may have detail that is hard to mesh."
+likely_causes = ["The part is large or detailed for the element size.", "The geometry makes the mesher loop (tiny faces, near-degenerate edges)."]
+actions = ["Check whether a later mesher succeeded (the mesh stage result).", "Defeature small details or set a coarser mesh size for the part."]
+
+[MESH_FACETS_UNTAGGED]
+severity = "warning"
+stage = "mesh"
+what = "{count} boundary facets of part {part} lie on no CAD face within tolerance."
+explain = "Some of the mesh surface on this part could not be matched back to a CAD face. Loads or fixtures on the affected faces may cover slightly less area than intended."
+likely_causes = ["The mesher moved boundary nodes off the CAD surface (healing or a tessellation-based mesher).", "The body file and the mesh come from different geometry."]
+actions = ["Check the faces used by loads, fixtures and connections still have facets (the solve stage fails if one has none).", "Re-run the mesh stage; report the part if it persists."]
+
+[STRESS_SINGULAR]
+severity = "warning"
+stage = "post"
+what = "The peak stress in {parts} rose by more than {rise:.0%} on the finer mesh while the deflection settled: a singular point, not a real stress."
+explain = "Each run solves on a base mesh and a finer one. Here the deflection hardly changed but the peak stress kept rising, the signature of a stress singularity: a sharp corner, or the end of a bonded edge, where linear analysis gives a stress that grows without limit as the mesh is refined. That number is not a real stress, so a factor of safety from it is a warning, not a fail. Read the stress a little away from that point, and check the joint (e.g. the weld) separately."
+likely_causes = ["A sharp corner or a bonded edge ending at a corner (no fillet modelled).", "A plate edge bonded to a tube's corner radius."]
+actions = ["Look at the stress plot away from the marked point.", "Add a fillet in the model if the corner matters, or check the weld or joint by hand."]
+
+[CONVERGENCE_POOR]
+severity = "warning"
+stage = "post"
+what = "Results changed by up to {worst:.1%} between the base and refined meshes (limit {tol:.0%}) in: {parts}."
+explain = "Each run solves on a base mesh and a finer one and compares the results. These parts changed by more than the limit, so their results depend noticeably on the mesh and may not be accurate yet. Use a finer fidelity, or look at whether the peak sits at a sharp corner (a stress singularity that never converges)."
+likely_causes = ["The base mesh is too coarse for these parts (thin walls, small fillets, stress concentrations).", "The peak sits on a singular point (sharp re-entrant corner or fixture edge) that never converges."]
+actions = ["Use a finer mesh fidelity for the study and run again.", "Check where the peak is: a peak on a sharp corner or fixture edge is a singularity, not a real stress."]
+
+[BUCKLING_NO_SCALED_LOAD]
+severity = "blocking"
+stage = "deck"
+what = "Buckling case {case} has no load that the buckling factor can scale; all its loads are preloads."
+explain = "A buckling factor says how many times the load can grow before the structure buckles. This case marks every load as a preload (held constant), so there is nothing to scale. Make at least one load in the case a scaled load."
+likely_causes = ["The load case holds only self-weight, which is applied as a preload by default.", "Every load in the case has scale_in_buckling set to false."]
+actions = ["Add the load that should be scaled to the case, or set scale_in_buckling true on a load."]
+
+[BUCKLING_FACTOR_LOW]
+severity = "warning"
+stage = "post"
+what = "Buckling case {case}: lowest buckling factor {factor:.3g} is below 1 or negative."
+explain = "A buckling factor below 1 means the structure is predicted to buckle before reaching the applied load; a negative factor means it would buckle if the load were reversed. Below 1 is a failure unless the load is reversed in reality."
+likely_causes = ["The structure buckles before the applied load is reached.", "A negative factor means buckling under the reversed load; the preload may be destabilising."]
+actions = ["Check the load magnitudes and the restraint of slender members.", "Treat any factor below the study limit as a failure; linear buckling factors are upper bounds."]
+
+[JOINT_AXIS_UNKNOWN]
+severity = "blocking"
+stage = "deck"
+what = "The {joint} joint between {parts} has no axis or direction: no cylindrical interface and no mate direction."
+explain = "A hinge or sliding joint needs a direction to turn about or slide along. None could be found: the parts do not meet on a cylinder and no mate gives a direction. On the Connections tab choose Sliding joint and pick the direction, or change the connection."
+likely_causes = ["The joint was classified from mates whose geometry was not exported with a direction.", "The parts touch only on flat faces."]
+actions = ["Mate the parts with a concentric or slot mate on a cylindrical face, or decide the connection as a tie."]
+
+[BOLT_NO_BEARING_FACE]
+severity = "blocking"
+stage = "deck"
+what = "Preloaded bolt {bolt}: no bearing face found under the {end}."
+explain = "A preloaded bolt clamps between the face under its head and the face under its nut. One of those could not be found where expected. Check the bolt's position and that a washer or nut sits on a part face."
+likely_causes = ["The outer face of the clamped stack around the hole is not flat or not perpendicular to the bolt.", "The hole is countersunk or counterbored."]
+actions = ["Use the default bolted mode for this joint (bonded), or model a flat bearing face."]
+
+[CONTACT_NOT_CONVERGED]
+severity = "blocking"
+stage = "solve"
+what = "The contact solution did not converge{detail}."
+explain = "Contact problems are solved step by step, and the solver could not settle which faces touch. Common causes are parts that are not held in some direction, very small or distorted contact faces, or loads large enough to make parts slide off. Check the support of the parts in contact, or use a fixed connection where sliding is not needed."
+likely_causes = ["A part is held only by contact and slides or lifts off freely.", "Contact opens and closes repeatedly (chattering) between increments.", "The load is larger than the joint can carry and something slips without limit."]
+actions = ["Check the parts named here are restrained apart from the contact.", "Switch the contact pairs involved back to ties (decide: tie) to confirm the rest of the model.", "Reduce the load or add friction if sliding is expected to stop."]
+
+[WELD_NO_INTERFACE]
+severity = "blocking"
+stage = "resolve"
+what = "Weld bead {weld} on {parts} has no touching faces within its size ({size:g} mm) of its path, so it joins nothing."
+explain = "A weld bead is modelled by bonding the faces where the welded parts touch, within the bead size of the weld path. Here no touching faces were found near the path, so the weld would carry no load; the run stops rather than leave the parts unjoined. This happens when the parts have a gap at the weld (a weld across a gap is not modelled yet), or when the weld path is on an edge away from where the parts meet."
+likely_causes = ["The welded parts do not touch at the weld (a gap, or a weld across a chamfer or root opening).", "The weld path was picked on an edge that is not where the parts meet."]
+actions = ["Make the parts touch where they are welded, or pick the weld path on the edge where they meet.", "If the weld is not structural, suppress the weld bead."]
+
+[STAB_SPRING_LOAD]
+severity = "warning"
+stage = "post"
+what = "Stabilising springs on {parts} carry {share:.1%} of the applied load in load case {case}."
+explain = "Weak stabilising springs were added because some parts are held only by contact. They should carry almost nothing, but here they carry a significant share of the load, which means those parts are not actually held. The results for them are not reliable; add support or change the connection."
+likely_causes = ["The part is not held by its contacts: they are open, or it slides."]
+actions = ["Check the contact status of the part; add a restraint or a tie if it should be held."]
+
+# --- extract: raised by the SolidWorks add-in, carried in model.json "issues" ---------
+
+[STEP_EXPORT_FAILED]
+severity = "blocking"
+stage = "extract"
+what = "SolidWorks could not export {file} (configuration {configuration}) to STEP: {error}."
+explain = "SolidWorks could not write this part as a STEP file, so it cannot be meshed. The error is the one SolidWorks reported. Open the part and check it rebuilds without errors."
+likely_causes = ["The part file is read-only or locked by another program.", "The study folder is not writable.", "The part has rebuild errors."]
+actions = ["Fix any rebuild errors in the part, then export again.", "Check the study folder can be written to."]
+
+[STEP_CONFIG_INACTIVE]
+severity = "blocking"
+stage = "extract"
+what = "{file} is used in configuration {configuration}, but configuration {active} is active in the part; the add-in exports only the active configuration, so it did not export this one."
+explain = "The assembly uses a configuration of this part that is not the part's active one. The add-in never changes your documents, so it does not switch configurations. Open the part, activate the named configuration, save, and export again."
+likely_causes = ["The assembly uses a different configuration of the part from the one last activated in the part."]
+actions = ["Open the part, activate the configuration named here, return to the assembly and export again."]
+
+[MATE_ENTITY_UNMATCHED]
+severity = "warning"
+stage = "extract"
+what = "Mate {mate} refers to {entity}, which could not be traced to a face of an exported part; the mate is exported without its faces."
+explain = "A mate is exported as evidence of how parts are joined. One of its faces could not be traced to an exported part, so the mate is used without it. Connections are still found from touching faces; check the Connections tab."
+likely_causes = ["The mate uses reference geometry (a plane, axis or point) or an edge.", "The mated component is suppressed or is a sub-assembly mate."]
+actions = ["If the mate defines a joint, re-mate it to part faces.", "Otherwise ignore: contact between the parts is found from geometry."]
+
+[MEMBER_PATH_UNKNOWN]
+severity = "warning"
+stage = "extract"
+what = "Structural member {part} has no straight axis the add-in could find; it is meshed with tets along its whole length."
+explain = "Structural members are normally meshed with swept layers along their length, which is fast and accurate. No straight path could be found for this member, so it is meshed with tetrahedra along its whole length: slower, and stiffer in bending."
+likely_causes = ["The member is curved or follows an arc or spline.", "The profile has no two non-parallel side faces."]
+actions = ["No action needed unless the model is too large; straight members are meshed more efficiently."]
+
+[EXTRACT_ITEM_FAILED]
+severity = "blocking"
+stage = "extract"
+what = "The add-in could not read {item} ({step}): {error}. It is missing from the model."
+explain = "The add-in could not read this item from SolidWorks, so it is missing from the exported model rather than guessed. The error comes from SolidWorks; rebuilding the assembly (Ctrl+Q) and exporting again often clears it."
+likely_causes = ["A SolidWorks API call failed on this item (a rebuild error, an unusual feature or a damaged reference).", "A gap in the add-in for this kind of part or mate."]
+actions = ["Rebuild the assembly (Ctrl+Q) and fix any rebuild errors, then export again.", "If it persists, report the item and the step named here."]
+
+[FACE_REF_REMATCHED]
+severity = "warning"
+stage = "extract"
+what = "Face {face} on {part} lost its SolidWorks reference after a change to the model and was found again by its shape (match score {score}). Check that the loads and fixtures on it are still where they should be."
+explain = "Each load and fixture remembers its faces. After a change to the model SolidWorks could no longer identify this face, so it was found again by shape and position. The match is usually right, but check the load or fixture is still on the intended face (select it on the Loads and fixtures tab to highlight it)."
+likely_causes = ["A feature was deleted and recreated, or the face was split or merged, so SolidWorks gave it a new identity."]
+actions = ["Select the study's loads and fixtures in the task pane to highlight their faces and confirm them.", "Re-select the face if it is wrong."]
+
+[FACE_REF_LOST]
+severity = "blocking"
+stage = "extract"
+what = "Face {face} on {part} could not be found after a change to the model: {reason}."
+explain = "A face used by a load or fixture could not be found after a change to the model, for example because it was split or removed. The run stops rather than guess. Delete the load or fixture and add it again on the right faces."
+likely_causes = ["The face was removed or reshaped by a design change.", "The face was split, so two faces now fit its old description."]
+actions = ["Re-select the face for the loads and fixtures that use it, in the task pane.", "Undo the change if the face was removed by mistake."]
+
+[FACE_REF_CHANGED]
+severity = "warning"
+stage = "extract"
+what = "Face {face} on {part} changed size after a change to the model ({old_area} mm2 before, {new_area} mm2 now). Its loads and fixtures follow it; check that is what you intended."
+explain = "A face used by a load or fixture changed size. The load or fixture follows the face; a force stays the same total force spread over the new area, while a pressure now acts over the new area. Check that is what you intended."
+likely_causes = ["A dimension change resized the face.", "A feature cut into or added onto the face."]
+actions = ["Select the loads and fixtures in the task pane to highlight their faces and confirm them.", "Re-select the face if the load should cover a different area."]
+
+[SUPERPOSITION_NOT_USED]
+severity = "info"
+stage = "solve"
+what = "Fast load-size changes is on, but each load case was solved as a whole: {reason}."
+explain = "With Fast load-size changes each load is solved on its own once and a load case is the sum of its loads, so a later change to the size of loads needs no new solve. That is exact only when the results are linear in the loads. This study has something that is not, so its load cases were solved as a whole, as usual. The results are complete and correct; only the shortcut is not available."
+likely_causes = ["The study includes buckling.", "The model has separating contact or preloaded bolts."]
+actions = ["Nothing is needed. To use the shortcut, turn buckling off for this study, or use bonded connections."]

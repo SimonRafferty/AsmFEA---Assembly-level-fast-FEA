@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "asmfea"
+version = "0.3.0"
+description = "Assembly FEA pipeline: SolidWorks neutral model to a solved CalculiX job and report"
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.6",
+    "jsonschema>=4.20",
+    "numpy>=1.26",
+    "cadquery-ocp>=7.7",
+    "scipy>=1.11",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.23,<2"]
+sw = ["pywin32>=306"]
+report = ["python-docx>=1.1", "pyvista>=0.43", "matplotlib>=3.8"]
+fast = ["pypardiso>=0.4"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+asmfea = "asmfea.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+asmfea = ["schema/*.json", "diagnostics/*.toml", "post/*.ico"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "solver: needs the CalculiX binary from asmfea.toml (skipped when absent)",
+    "slow: runs longer than a few seconds",
+]
