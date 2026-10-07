@@ -81,7 +81,7 @@ class Part(_M):
     kind: Literal["member", "sheet", "solid", "fastener", "weld_bead"]
     material: str
     step: str
-    body: Body
+    body: Optional[Body] = None            # None: the STEP file holds this one solid only (D53)
     geometry_hash: str
     transform: list[float]
     fixed: bool = False
@@ -139,7 +139,10 @@ class FaceRef(_M):
     part: str
     persistent_ref: Optional[str] = None
     feature: Optional[str] = None
-    fingerprint: Fingerprint
+    # the add-in writes a fingerprint; a file written without it (layoutcad) may give a point on the face
+    # instead, and resolve_geometry fills the fingerprint in from the face that point lies on (D53)
+    fingerprint: Optional[Fingerprint] = None
+    point: Optional[Vec3] = None
 
 
 class Load(_M):
@@ -190,6 +193,7 @@ class Limits(_M):
     max_deflection: Optional[float] = None
     min_fos: Optional[float] = None
     min_buckling_factor: Optional[float] = None
+    max_stress: Optional[float] = None      # MPa, allowable von Mises away from bonded joints (D53)
 
 
 class Study(_M):

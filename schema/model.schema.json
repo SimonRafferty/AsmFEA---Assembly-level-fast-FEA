@@ -72,7 +72,7 @@
     },
     "body": {
       "type": "object",
-      "description": "Descriptors of this body in the PART frame, used to find it among the solids of the STEP file.",
+      "description": "Descriptors of this body in the PART frame, used to find it among the solids of the STEP file. May be omitted when the part's STEP file holds this one solid only (D53).",
       "additionalProperties": false,
       "required": ["volume", "centroid", "bbox_min", "bbox_max"],
       "properties": {
@@ -101,7 +101,7 @@
     "part": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "kind", "material", "step", "body", "geometry_hash", "transform"],
+      "required": ["id", "kind", "material", "step", "geometry_hash", "transform"],
       "properties": {
         "id": {"$ref": "#/$defs/id"},
         "kind": {"enum": ["member", "sheet", "solid", "fastener", "weld_bead"]},
@@ -210,13 +210,15 @@
     "face_ref": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["id", "part", "fingerprint"],
+      "required": ["id", "part"],
+      "anyOf": [{"required": ["fingerprint"]}, {"required": ["point"]}],
       "properties": {
         "id": {"$ref": "#/$defs/id"},
         "part": {"type": "string"},
         "persistent_ref": {"type": "string", "description": "Base64 SolidWorks persistent reference"},
         "feature": {"type": "string"},
-        "fingerprint": {"$ref": "#/$defs/fingerprint"}
+        "fingerprint": {"$ref": "#/$defs/fingerprint"},
+        "point": {"$ref": "#/$defs/vec3", "description": "A point on the face, assembly frame (mm): the face is the one the point lies on (D53; for files written without the add-in, e.g. layoutcad). Used when fingerprint is absent"}
       }
     },
     "load": {
@@ -312,7 +314,8 @@
           "properties": {
             "max_deflection": {"type": "number", "exclusiveMinimum": 0},
             "min_fos": {"type": "number", "exclusiveMinimum": 0},
-            "min_buckling_factor": {"type": "number", "exclusiveMinimum": 0}
+            "min_buckling_factor": {"type": "number", "exclusiveMinimum": 0},
+            "max_stress": {"type": "number", "exclusiveMinimum": 0, "description": "Allowable von Mises stress, MPa: FAIL when any part's peak away from bonded joints exceeds it (D53)"}
           }
         }
       }

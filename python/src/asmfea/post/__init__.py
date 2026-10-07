@@ -340,6 +340,13 @@ def checks(model: Model, results: dict, open_exceptions: int, mesh_failed: int =
             # a governing peak flagged singular (D32) is not a real stress: a warning, not a fail
             row(f"Min factor of safety [{case}]" + (" (singular peak, see warning)" if sing else ""), v, lim.min_fos,
                 v is not None and v >= lim.min_fos, "WARN" if sing else "FAIL")
+        if lim and lim.max_stress:
+            # the peak away from bonded joints, as min_fos uses (D53); a singular peak warns, as there
+            pk = [(p["peak_vm_excl_ties"], bool(p.get("singular"))) for p in r["parts"].values()
+                  if p.get("peak_vm_excl_ties") is not None]
+            v, sing = max(pk) if pk else (None, False)
+            row(f"Max stress [{case}]" + (" (singular peak, see warning)" if sing else ""), v, lim.max_stress,
+                v is not None and v <= lim.max_stress, "WARN" if sing else "FAIL")
     for case, bk in results.get("buckling", {}).items():
         lim_b = lim.min_buckling_factor if lim and lim.min_buckling_factor else 1.0
         row(f"Lowest buckling factor [{case}]", bk["lowest"], lim_b,

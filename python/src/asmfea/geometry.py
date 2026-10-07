@@ -22,7 +22,8 @@ from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
 from OCP.BRepBndLib import BRepBndLib
-from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform, BRepBuilderAPI_Transform
+from OCP.BRepBuilderAPI import BRepBuilderAPI_GTransform, BRepBuilderAPI_MakeVertex, BRepBuilderAPI_Transform
+from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepGProp import BRepGProp
 from OCP.GeomAbs import (GeomAbs_BezierSurface, GeomAbs_BSplineSurface, GeomAbs_Cone,
                          GeomAbs_Cylinder, GeomAbs_Plane, GeomAbs_Sphere, GeomAbs_Torus)
@@ -37,7 +38,7 @@ from OCP.OCP.collections import IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher 
 
 from . import defaults
 from .diagnostics import Diagnostic, make
-from .model import FaceRef, Model, Part
+from .model import FaceRef, Fingerprint, Model, Part
 
 SURFACE_TYPES = {GeomAbs_Plane: "plane", GeomAbs_Cylinder: "cylinder", GeomAbs_Cone: "cone",
                  GeomAbs_Sphere: "sphere", GeomAbs_Torus: "torus", GeomAbs_BSplineSurface: "bspline",
@@ -424,7 +425,28 @@ def match_solids(parts: list[Part], props: list, step: str) -> tuple[dict[str, i
     return got, diags
 
 
+def faces_at_point(point, faces: list[FaceInfo], tol: float = defaults.FACE_POINT_TOL) -> list[int]:
+    """The faces a point lies on (within tol, mm): one for a point inside a face, two or more on an edge."""
+    v = BRepBuilderAPI_MakeVertex(gp_Pnt(*map(float, point))).Vertex()
+    hits = []
+    for f in faces:
+        if f.bbox and any(point[i] < f.bbox[i] - tol or point[i] > f.bbox[i + 3] + tol for i in range(3)):
+            continue                                   # cheap box test first
+        d = BRepExtrema_DistShapeShape(v, f.shape)
+        if d.IsDone() and d.Value() <= tol:
+            hits.append(f.index)
+    return hits
+
+
+def fingerprint_of(f: FaceInfo) -> Fingerprint:
+    return Fingerprint(surface=f.surface, area=f.area, centroid=tuple(f.centroid),
+                       normal=tuple(f.normal) if f.normal else None, axis=tuple(f.axis) if f.axis else None,
+                       radius=f.radius)
+
+
 def match_face(ref: FaceRef, faces: list[FaceInfo]) -> list[int]:
+    if ref.fingerprint is None:                        # given by a point on the face (D53)
+        return faces_at_point(ref.point, faces)
     fp = ref.fingerprint
     ctol = max(defaults.FACE_CENTROID_TOL, 1e-4 * math.sqrt(fp.area))
     hits = []
@@ -466,6 +488,19 @@ def resolve_geometry(study: Path, model: Model, on_part=None) -> tuple[dict[str,
             diags += [make("STEP_MISSING", where={"parts": [p.id]}, part=p.id, step=step, evidence={"error": str(e)})
                       for p in users]
             continue
+        # a part without a body description (a file not written by the add-in, D53) is the file's only solid
+        bare = [p for p in users if p.body is None]
+        if bare:
+            if len(users) == 1 and len(solids) == 1:
+                chosen[bare[0].id] = (solids[0], 0)
+            else:
+                diags += [make("BODY_UNMATCHED", where={"parts": [p.id]}, part=p.id, step=step,
+                               evidence={"expected": "the file's only solid (no body description)",
+                                         "solids_in_file": len(solids), "parts_using_file": len(users)})
+                          for p in bare]
+            users = [p for p in users if p.body is not None]
+            if not users:
+                continue
         got, d = match_solids(users, solid_props(solids), step)
         diags += d
         chosen.update({pid: (solids[i], i) for pid, i in got.items()})
@@ -493,12 +528,15 @@ def resolve_geometry(study: Path, model: Model, on_part=None) -> tuple[dict[str,
             continue  # the part is already reported
         hits = match_face(ref, g.faces)
         where = {"parts": [ref.part], "faces": [ref.id]}
+        given = ({"fingerprint": ref.fingerprint.model_dump(exclude_none=True)} if ref.fingerprint is not None
+                 else {"point": list(ref.point)})
         if not hits:
-            diags.append(make("FACE_UNMATCHED", where=where, face=ref.id, part=ref.part,
-                              evidence={"fingerprint": ref.fingerprint.model_dump(exclude_none=True)}))
+            diags.append(make("FACE_UNMATCHED", where=where, face=ref.id, part=ref.part, evidence=given))
         elif len(hits) > 1:
             diags.append(make("FACE_AMBIGUOUS", where=where, face=ref.id, part=ref.part, count=len(hits),
                               evidence={"candidates": hits}))
         else:
             face_map[ref.id] = (ref.part, hits[0])
+            if ref.fingerprint is None:                # later stages may read it (classify._sw_axis)
+                ref.fingerprint = fingerprint_of(g.faces[hits[0]])
     return geoms, face_map, diags

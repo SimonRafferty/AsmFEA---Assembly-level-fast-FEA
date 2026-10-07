@@ -275,6 +275,14 @@ def _template(study: Path) -> Optional[Path]:
     return Path(t) if t and Path(t).exists() else None
 
 
+def _geo_volume(study: Path, part: str) -> Optional[float]:
+    """A part's volume from the resolved geometry, for a part the model gives no body description (D53)."""
+    try:
+        return read_json(study / "geometry.json")["parts"][part]["volume"]
+    except (OSError, KeyError, ValueError):
+        return None
+
+
 def _sha1(path: Path) -> str:
     return hashlib.sha1(path.read_bytes()).hexdigest()[:12] if path.exists() else "-"
 
@@ -421,8 +429,8 @@ def build_report(study: Path, pdf: bool = False) -> Path:
             treat += f", {prof.get('type', '')} " + " x ".join(_fmt(prof[k]) for k in ("b", "h", "d", "t") if k in prof)
         if p_.id in removed:
             treat += " (removed: see Connections)"
-        vol = p_.body.volume
-        rows.append([p_.id, treat, p_.material or "-", vol, vol * mat.density * 1000 if mat else None,
+        vol = p_.body.volume if p_.body is not None else _geo_volume(study, p_.id)
+        rows.append([p_.id, treat, p_.material or "-", vol, vol * mat.density * 1000 if mat and vol else None,
                      inst.get(p_.id, {}).get("n_elements", "-")])
     _table(doc, ["Part", "Treated as", "Material", "Volume (mm³)", "Mass (kg)", "Elements"], rows,
            [4.5, 4.2, 2.8, 2.1, 1.6, 1.8])
@@ -730,6 +738,8 @@ def build_summary(study: Path, pdf: bool = False) -> Path:
         limits.append(f"minimum factor of safety {lim.min_fos:g}")
     if lim.max_deflection:
         limits.append(f"maximum deflection {lim.max_deflection:g} mm")
+    if lim.max_stress:
+        limits.append(f"maximum stress {lim.max_stress:g} MPa")
     note = ("Linear elastic analysis; factor of safety = yield strength / von Mises stress, excluding the stress at "
             "tied part interfaces, where it is singular.")
     if limits:

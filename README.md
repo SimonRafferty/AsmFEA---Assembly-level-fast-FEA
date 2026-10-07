@@ -11,7 +11,7 @@ AsmFEA analyses a whole SolidWorks assembly (welded frames, bolted structures, s
 
 ## Download and install
 
-**[Download the installer: AsmFEA-Setup-0.4.0.exe](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases/download/v0.4.0/AsmFEA-Setup-0.4.0.exe)** (Windows 10/11, 64-bit; all releases on the [Releases page](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases)).
+**[Download the installer: AsmFEA-Setup-0.4.1.exe](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases/download/v0.4.1/AsmFEA-Setup-0.4.1.exe)** (Windows 10/11, 64-bit; all releases on the [Releases page](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases)).
 
 The installer contains AsmFEA, the SolidWorks add-in and a private Python runtime. During installation it downloads the solver and mesher from their official sources (about 310 MB), each checked against a pinned SHA-256 hash:
 
@@ -36,7 +36,7 @@ The SolidWorks models of the verification cases are in [`cases/verification`](ca
 ## How it works
 
 1. **The SolidWorks add-in** (`addin/`, C#, .NET Framework 4.8) extracts the model: geometry as one STEP file per part, materials, members, mates, fasteners, loads and fixtures. It does no analysis and never modifies your documents.
-2. **A neutral model** (`model.json` plus the STEP files, defined by `schema/model.schema.json`) is the only thing passed from SolidWorks to the analysis.
+2. **A neutral model** (`model.json` plus the STEP files, defined by `schema/model.schema.json`) is the only thing passed from SolidWorks to the analysis. Other programs can write it too: a face may be given by a point on it, a part's solid taken from its own STEP file, and a study may set an allowable stress.
 3. **The Python pipeline** (`python/src/asmfea`) resolves the connections, meshes each part (Gmsh and AsmFEA's own swept meshers), writes the CalculiX input, solves it, post-processes the results and writes the report. It runs as a background job that the task pane follows.
 
 CalculiX and Gmsh run as separate programs that exchange files with AsmFEA; no GPL code is linked into AsmFEA.

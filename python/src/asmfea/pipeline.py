@@ -269,7 +269,8 @@ def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL) -> tuple[dict, 
     tasks, manifest = {}, {}
     for part in (p for p in model.parts if p.id not in removed):
         g = geo["parts"][part.id]
-        dims = [b - a for a, b in zip(part.body.bbox_min, part.body.bbox_max)]
+        dims = ([b - a for a, b in zip(part.body.bbox_min, part.body.bbox_max)] if part.body is not None
+                else [g["bbox"][k + 3] - g["bbox"][k] for k in range(3)])       # no body description (D53)
         base = element_size(dims, user_size, fidelity)
         route, rx = mesh_route(part)
         if mode == FAST and route == "member":

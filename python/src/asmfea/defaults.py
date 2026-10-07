@@ -11,6 +11,7 @@ BODY_VOLUME_WARN = 0.01        # a matched body whose STEP volume differs from S
 FACE_AREA_RTOL = 1e-3          # guess
 FACE_CENTROID_TOL = 0.05       # mm, guess
 FACE_NORMAL_COS = 0.999        # guess (~2.5 degrees)
+FACE_POINT_TOL = 0.05          # mm, guess: a face_ref point (D53) this close to a face lies on it
 
 # --- Resolver (Connection resolver section) -----------------------------------------
 GAP_TOL = 0.5                  # mm, plan: start value, calibrate on reference assemblies

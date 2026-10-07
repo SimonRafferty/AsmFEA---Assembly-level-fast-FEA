@@ -62,7 +62,8 @@ def _sw_axis(model: Model, entity: str, fallback) -> np.ndarray:
     SolidWorks measures a gear's turn and a screw's hand about each entity's own axis (found live, D51), and
     the STEP geometry's axis may point the other way."""
     fr = model.face_ref(entity)
-    a = fr.fingerprint.axis if fr is not None and fr.fingerprint.axis is not None else fallback
+    a = (fr.fingerprint.axis if fr is not None and fr.fingerprint is not None and fr.fingerprint.axis is not None
+         else fallback)
     a = np.asarray(a, float)
     return a / np.linalg.norm(a)
 
