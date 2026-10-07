@@ -79,11 +79,11 @@ namespace AsmFea.Extract
                 if (!used.Contains(prefix + i.ToString(CultureInfo.InvariantCulture))) return prefix + i.ToString(CultureInfo.InvariantCulture);
         }
 
-        /// <summary>Face refs no load or fixture uses any more are dropped.</summary>
+        /// <summary>Face refs no load, fixture or hinge uses any more are dropped.</summary>
         public static void Prune(JObj study)
         {
             var used = new HashSet<string>();
-            foreach (var key in new[] { "loads", "fixtures" })
+            foreach (var key in new[] { "loads", "fixtures", "hinges" })
                 foreach (JObj item in List(study, key).OfType<JObj>())
                     foreach (var f in (item["faces"] as List<object>) ?? new List<object>())
                         used.Add((string)f);

@@ -46,9 +46,18 @@ def detect_mechanisms(model, geoms, conns: list[dict], face_map: dict, removed: 
         return []
     uf = _UF(bodies)
     rows_spec = []  # (kind, data)
+    couplings = []
     for c in conns:
+        if c["type"] in ("gear", "rack_pinion"):
+            if all(t["part"] in uf.p and t["carrier"] in uf.p for t in c["couples"]):
+                couplings.append(c["couples"])
+            continue
         a, b = (c["parts"] + [None, None])[:2]
         if a not in uf.p or b not in uf.p:
+            continue
+        if c["type"] == "screw" and not c.get("locked"):
+            # relative motion: only the helical twist (turn about the axis with an advance of lead per turn)
+            rows_spec.append(("helical", a, b, [c["axis_point"]], (np.asarray(c["axis"], float), c["lead"])))
             continue
         if c["type"] == "bolted" and c.get("preload"):
             # a preloaded bolt clamps its parts together
@@ -63,7 +72,14 @@ def detect_mechanisms(model, geoms, conns: list[dict], face_map: dict, removed: 
                 uf.union(a, b)
             else:
                 rows_spec.append(("points", a, b, c.get("samples", []), np.eye(3)))
-        elif c["type"] == "revolute" and c.get("axis") is not None:
+        elif c["type"] == "slide":
+            # held only along the face normal (no separation, no penetration); free to slide in its plane
+            nrm = c.get("normal")
+            if nrm is not None and c.get("samples"):
+                rows_spec.append(("points", a, b, c["samples"], np.asarray(nrm, float)[None]))
+        elif c["type"] in ("hinge", "screw") and c.get("locked"):
+            uf.union(a, b)
+        elif c["type"] in ("revolute", "hinge") and c.get("axis") is not None:
             ax = np.asarray(c["axis"], float)
             p0 = np.asarray(c["axis_point"], float)
             half = 0.5 * max(c.get("length", 10.0), 1.0)
@@ -101,9 +117,39 @@ def detect_mechanisms(model, geoms, conns: list[dict], face_map: dict, removed: 
         r[j + 3:j + 6] = sign * np.cross(np.asarray(p) - centre[k], e) / L
         return r
 
+    def rot_row(k, w, sign=1.0):
+        r = np.zeros(n)
+        r[6 * col[k] + 3:6 * col[k] + 6] = sign * np.asarray(w) / L
+        return r
+
+    for terms in couplings:
+        # sum of scale * (motion of the part relative to its carrier) = 0
+        r = np.zeros(n)
+        for t in terms:
+            kp, kc = uf.find(t["part"]), uf.find(t["carrier"])
+            if t["kind"] == "rotation":
+                r += t["scale"] * (rot_row(kp, t["axis"]) - rot_row(kc, t["axis"]))
+            else:
+                e = np.asarray(t["axis"], float)
+                r += t["scale"] * (point_row(kp, t["point"], e) - point_row(kc, t["point"], e))
+        if np.any(r):
+            rows.append(r)
+
     for kind, a, b, pts, extra in rows_spec:
         ka, kb = uf.find(a), uf.find(b)
         if ka == kb:
+            continue
+        if kind == "helical":
+            ax, lead = extra
+            ax = ax / np.linalg.norm(ax)
+            perp = np.linalg.svd(ax[None])[2][1:]
+            p = pts[0]
+            for e in perp:   # no relative turn about, nor shift across, the axis
+                rows.append(rot_row(ka, e) - rot_row(kb, e))
+                rows.append(point_row(ka, p, e) + point_row(kb, p, e, -1.0))
+            # advance along the axis = lead/(2 pi) * turn about it
+            rows.append(point_row(ka, p, ax) + point_row(kb, p, ax, -1.0)
+                        - lead / (2 * np.pi) * (rot_row(ka, ax) - rot_row(kb, ax)))
             continue
         if kind == "points":
             for p in pts:

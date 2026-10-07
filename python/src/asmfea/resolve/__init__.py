@@ -16,19 +16,21 @@ from .mechanism import detect_mechanisms
 from .welds import apply_welds
 
 
-def connectivity(model: Model, conns: list[dict], face_map: dict, removed: list[str]
+def connectivity(model: Model, conns: list[dict], face_map: dict, removed: list[str], skip=()
                  ) -> tuple[set[str], list[Diagnostic], list[str]]:
     """(parts with a path to a fixture, diagnostics for the rest, parts to exclude).
 
     Parts with no path to a fixture are grouped by what joins them. A group that carries a load (on its faces)
     blocks the run: that load would have nowhere to go. A group with no load is left out of the analysis with
-    a warning (the user's choice: a stray or unconnected body should not stop the run), so the rest is solved."""
+    a warning (the user's choice: a stray or unconnected body should not stop the run), so the rest is solved.
+    skip: parts already left out (free to move), through which nothing is carried."""
+    skip = set(skip)
     adj = defaultdict(set)
     for c in conns:
         if c["type"] not in ("none",) and len(c["parts"]) >= 2:
             for a in c["parts"]:
                 for b in c["parts"]:
-                    if a != b:
+                    if a != b and a not in skip and b not in skip:
                         adj[a].add(b)
     roots = {face_map[f][0] for fx in model.fixtures for f in fx.faces if f in face_map}
     seen, stack = set(roots), list(roots)
@@ -91,7 +93,7 @@ def contact_only(model: Model, conns: list[dict], removed: list[str], face_map: 
 def resolve(model: Model, geoms: dict, face_map: dict) -> tuple[list[dict], list[str], list[Diagnostic]]:
     """Returns (connections, removed, diags)."""
     interfaces, near, lines = find_interfaces(geoms, model.study.bond_tolerance)
-    conns, removed, diags = classify(model, geoms, interfaces, lines)
+    conns, removed, diags = classify(model, geoms, interfaces, lines, face_map)
     diags += apply_welds(model, conns, removed)
     touching = {tuple(sorted(c["parts"][:2])) for c in conns}
     for nm in near:
@@ -109,6 +111,50 @@ def resolve(model: Model, geoms: dict, face_map: dict) -> tuple[list[dict], list
     diags += cdiags
     removed += excluded                           # left out of the mesh, the deck and the results
     diags += contact_only(model, conns, removed, face_map)
-    if not any(d.code == "PART_FLOATING" for d in diags):
-        diags += detect_mechanisms(model, geoms, conns, face_map, removed, anchored)
+    if model.fixtures and not any(d.code == "PART_FLOATING" for d in diags):
+        # (with no fixture everything is free: NO_FIXTURES says so, and no part is left out for it)
+        diags += free_parts(model, geoms, conns, face_map, removed, anchored)
     return conns, removed, diags
+
+
+def free_parts(model: Model, geoms: dict, conns: list[dict], face_map: dict, removed: list[str],
+               anchored: set[str]) -> list[Diagnostic]:
+    """The mechanism check, leaving out parts that are free to move instead of stopping the run.
+
+    A part held only by a hinge (or a sliding joint) with nothing stopping that motion would only move out of
+    the way of a load, so it carries nothing: it is left out with a warning naming it, and the rest is solved
+    (the user's choice, against SimSolid's "insufficiently constrained" error). Leaving it out can free others
+    (parts held only through it), so the check runs again. A motion of a part with a fixture means the
+    fixtures themselves are not enough: that still stops the run."""
+    fixed = {face_map[f][0] for fx in model.fixtures for f in fx.faces if f in face_map}
+    out, freed = [], []
+    for _ in range(len(model.parts) + 1):
+        mech = detect_mechanisms(model, geoms, conns, face_map, removed, anchored)
+        moving = set(mech[0].where.parts) if mech else set()
+        if not moving or moving & fixed:
+            out += mech
+            break
+        free = sorted(moving)
+        removed += free
+        freed += free
+        motions = mech[0].evidence.get("free_motions", [])
+        loads = sorted({ld.id for ld in model.loads for fid in ld.faces
+                        if fid in face_map and face_map[fid][0] in moving})
+        out.append(make("PART_EXCLUDED_MECHANISM", where={"parts": free, "loads": loads}, count=len(free),
+                        parts=", ".join(free), motions=mech[0].what.split(". ", 1)[-1].rstrip("."),
+                        loads=", ".join(loads) or "none", evidence={"free_motions": motions}))
+        # parts held only through the ones just left out are now floating
+        anchored, cdiags, excluded = connectivity(model, conns, face_map, removed, skip=freed)
+        out += cdiags
+        removed += excluded
+        if any(d.code == "PART_FLOATING" for d in cdiags):
+            break
+    if freed and model.study is not None:
+        # a load case whose every load is on the parts left out has nothing left to analyse: that stops the run
+        gone = set(freed)
+        for case in model.study.load_cases:
+            lds = [ld for ld in model.loads if ld.load_case == case]
+            if lds and all(ld.faces and all(f in face_map and face_map[f][0] in gone for f in ld.faces) for ld in lds):
+                removed[:] = [r for r in removed if r not in gone]
+                return detect_mechanisms(model, geoms, conns, face_map, removed, anchored | gone)
+    return out

@@ -50,12 +50,18 @@ def _exceptions_doc(diags: list[Diagnostic]) -> dict:
 
 # --------------------------------------------------------------------------- #
 
+STUDY_INCOMPLETE = {"LOAD_CASE_UNDEFINED", "NO_FIXTURES"}
+
+
 def stage_resolve(study: Path, js: JobState) -> None:
     # a view chosen after the last solve (api.replot) gives way to the view this export recorded
     (study / "view.json").unlink(missing_ok=True)
     js.activity("resolve: reading model.json and study.json")
     model, diags = load_checked(study)
-    if model is None or any(d.severity == "blocking" for d in diags):
+    # Missing loads or fixtures stop a run, but not the connection analysis: connections do not depend on them
+    # (found live: a study with only a fixture and a hinge never listed its connections). They are reported,
+    # and raised once the connections are written.
+    if model is None or any(d.severity == "blocking" and d.code not in STUDY_INCOMPLETE for d in diags):
         _write(study / "exceptions.json", _exceptions_doc(diags))
         raise_if_blocking(diags)
     n = len(model.parts)
@@ -510,6 +516,20 @@ def _record_history(dof: int, seconds: float, steps: int) -> None:
     p.write_text(json.dumps(hist[-200:]))
 
 
+def _without_removed(model: Model, removed: set[str], face_map: dict) -> Model:
+    """The model without the loads (and load faces) on parts left out of the analysis: a part free to move
+    on a hinge is left out with its loads, which it could not carry (PART_EXCLUDED_MECHANISM)."""
+    if not removed:
+        return model
+    loads = []
+    for ld in model.loads:
+        faces = [f for f in ld.faces if not (f in face_map and face_map[f][0] in removed)]
+        if ld.faces and not faces:
+            continue
+        loads.append(ld.model_copy(update={"faces": faces}))
+    return model.model_copy(update={"loads": loads})
+
+
 def solve_level(study: Path, js: JobState, model: Model, level: str, cfg) -> dict:
     """Write and solve the decks of one mesh level in run/<job>/<level>/.
 
@@ -521,6 +541,7 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg) -> dic
     geo = read_json(study / "geometry.json")
     conns = read_json(study / "connections.json")["connections"]
     face_map = {k: tuple(v) for k, v in geo["face_map"].items()}
+    model = _without_removed(model, set(read_json(study / "connections.json").get("removed_parts", [])), face_map)
     d = js.dir / level
     d.mkdir(parents=True, exist_ok=True)
     instances = build_instances(study, model, level, mode_of(js))

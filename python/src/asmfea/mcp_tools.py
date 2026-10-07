@@ -75,7 +75,7 @@ class CancelIn(StudyIn):
 
 class DecideIn(StudyIn):
     exception_id: str = Field(..., description="The id of an open exception from asmfea_exceptions")
-    connection: Literal["tie", "contact", "none", "revolute", "sliding", "bolted"] = Field(
+    connection: Literal["tie", "contact", "none", "revolute", "hinge", "slide", "sliding", "bolted", "screw"] = Field(
         ..., description="How the parts named by the exception are connected")
     friction: Optional[float] = Field(None, ge=0, le=2, description="Friction coefficient, for contact")
     note: Optional[str] = Field(None, description="Why; shown in the report's connection table")

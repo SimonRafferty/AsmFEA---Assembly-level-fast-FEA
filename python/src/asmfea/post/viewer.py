@@ -66,7 +66,7 @@ def show(study: Path, case: str, field: str) -> None:
     meta = json.loads(meta_path.read_text())
     array, bar, cmap, what = FIELDS[field]
     base = mesh.copy(deep=True)                    # full-load values and the undeformed shape (probe, animation)
-    if field == "displacement":
+    if "U" in mesh.point_data:                      # every window opens on the deformed shape (the user's choice)
         mesh.points = mesh.points + meta["deform_scale"] * mesh.point_data["U"]
     # the colour range is the full load's, so it stays put while the load animation scales the values
     values = np.asarray(mesh.point_data[array])
@@ -133,7 +133,7 @@ def show(study: Path, case: str, field: str) -> None:
     pl.add_text("Reset view (R)", position=(rx + BUTTON_PX + 8, by + 4), font_size=9, color="black")
     pl.add_key_event("r", reset)
     _camera(pl, centre, size, main)
-    min_max = _Markers(pl, base, marks, meta["deform_scale"] if field == "displacement" else 0.0, centre, size)
+    min_max = _Markers(pl, base, marks, meta["deform_scale"] if "U" in base.point_data else 0.0, centre, size)
     spot = _Probe(pl, surface, mesh, meta, field, base=base)
     anim = _LoadAnimation(pl, mesh, base, meta, field, spot, markers=min_max)
     anim.add_button((bx, by))
@@ -422,10 +422,11 @@ class _LoadAnimation:
     def __init__(self, pl, mesh, base, meta: dict, field: str, probe, markers=None):
         self.pl, self.mesh, self.base, self.meta, self.field, self.probe = pl, mesh, base, meta, field, probe
         self.markers = markers              # the min / max markers (_Markers): follow the shape
-        # the deformation shown: the displacement window starts at the automatic exaggeration (as its plot),
-        # the others undeformed; the slider changes it in any window
+        # the deformation shown: every window starts at the automatic exaggeration, so stress and FoS deform as
+        # the load animation plays, as displacement does (the user's choice, 2026-10-07; they had opened
+        # undeformed); the slider changes it in any window, 0 for the undeformed shape
         self.auto_scale = float(meta.get("deform_scale") or 0.0)
-        self.scale = self.auto_scale if field == "displacement" else 0.0
+        self.scale = self.auto_scale
         self.ghost = None
         self.slider = self.ghost_box = None
         self.array = FIELDS[field][0]

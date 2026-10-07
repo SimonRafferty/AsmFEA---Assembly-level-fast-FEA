@@ -83,6 +83,28 @@ def contact(pairs: list[str], stabilised: list[str] = (), buckling: bool = False
     return out
 
 
+def slides(n: int) -> list[str]:
+    """Faces that slide but do not separate (the touching faces of hinged parts)."""
+    if not n:
+        return []
+    return [f"{n} interface(s) slide without separating: the faces stay in contact along their normal, without "
+            "friction, and move freely in their plane. This is linear: a face that would really lift off is "
+            "still held, so check the reaction there is compressive."]
+
+
+def couplings(gears: int, screws: int) -> list[str]:
+    """Gear, rack and pinion couplings and screw joints (D51)."""
+    out = []
+    if gears:
+        out.append(f"{gears} gear or rack and pinion coupling(s) link the parts' turning (or sliding) by the mate's "
+                   "ratio, as if the teeth meshed rigidly and without friction. The tooth contact itself is not "
+                   "modelled: the teeth carry no stress, and the separating force of the tooth flanks is left out.")
+    if screws:
+        out.append(f"{screws} screw joint(s) turn and advance together by the mate's lead, without friction, so a "
+                   "screw that would self-lock in reality is free to turn back here; the thread itself is not modelled.")
+    return out
+
+
 def joints(revolute: int, sliding: int) -> list[str]:
     out = []
     if revolute:
@@ -117,8 +139,9 @@ def welds(strips: list[str], whole: list[str]) -> list[str]:
 def subassemblies(groups: list[str]) -> list[str]:
     if not groups:
         return []
-    return [f"Sub-assemblies ({', '.join(groups)}) are treated as rigid, like one multi-body part: their touching "
-            "parts are bonded and their own mates are not read, so any flexibility inside them is not modelled."]
+    return [f"The parts of sub-assemblies ({', '.join(groups)}) are analysed as if they were in the top-level "
+            "assembly: their own mates are read, and their touching faces are connected like any other's. A rigid or "
+            "flexible setting in SolidWorks makes no difference to the analysis."]
 
 
 def remote(load_ids: list[str]) -> list[str]:

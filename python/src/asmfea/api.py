@@ -390,7 +390,7 @@ def decide(study: str | Path, exception_id: str, decision: dict,
             override["interface"] = d.where.connections[0]
     override.update(decision)
     if "connection" not in override:
-        raise ValueError("decision needs 'connection': tie, contact, none, revolute, sliding or bolted")
+        raise ValueError("decision needs 'connection': tie, contact, none, revolute, hinge, slide, sliding or bolted")
     if sw_session is not None:
         sw_session.call("AddOverride", p.name, json.dumps(override))
         return DecideResult(study=str(p), exception_id=exception_id, written_to="assembly")

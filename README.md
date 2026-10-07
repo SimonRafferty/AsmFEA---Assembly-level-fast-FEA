@@ -3,7 +3,7 @@
 AsmFEA analyses a whole SolidWorks assembly (welded frames, bolted structures, sheet and machined parts) from a task pane inside SolidWorks. It finds the connections between parts, meshes every part automatically, solves the model and writes a Word/PDF report, with no manual meshing and no re-rigging after a design change.
 
 - **Analyses:** linear static and linear buckling, several load cases per run, optional frictional contact and preloaded bolts.
-- **Connections:** found from the geometry, mates and fasteners (bonded, pinned, sliding or bolted), each listed and editable.
+- **Connections:** found from the geometry, mates and fasteners, each listed and editable: bonded, bolted, sliding, and hinges (from concentric, hinge, screw or profile-center mates, or added on one chosen face) whose parts' other touching faces slide without separating. Gear and rack-and-pinion mates couple the parts' turning and sliding. Sub-assemblies are analysed as if their parts were in the top-level assembly, with their own mates.
 - **Meshing:** members and thin walls are meshed with elements swept along the section or through the wall, so a model is many times smaller than a conventional solid mesh; chunky parts get quadratic tetrahedra.
 - **Results:** stresses, displacements, factors of safety and buckling factors, with weld/joint structural stress and membrane-plus-bending stress that settle as the mesh is refined. Every full run is solved at two mesh sizes and the change is reported.
 - **Speed:** re-runs redo only what changed; a fast run gives an approximate answer for design iterations; models too large for CalculiX's memory are solved by AsmFEA's own hybrid solver, part by part.
@@ -11,7 +11,7 @@ AsmFEA analyses a whole SolidWorks assembly (welded frames, bolted structures, s
 
 ## Download and install
 
-**[Download the installer: AsmFEA-Setup-0.3.0.exe](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases/download/v0.3.0/AsmFEA-Setup-0.3.0.exe)** (Windows 10/11, 64-bit; all releases on the [Releases page](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases)).
+**[Download the installer: AsmFEA-Setup-0.4.0.exe](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases/download/v0.4.0/AsmFEA-Setup-0.4.0.exe)** (Windows 10/11, 64-bit; all releases on the [Releases page](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases)).
 
 The installer contains AsmFEA, the SolidWorks add-in and a private Python runtime. During installation it downloads the solver and mesher from their official sources (about 310 MB), each checked against a pinned SHA-256 hash:
 

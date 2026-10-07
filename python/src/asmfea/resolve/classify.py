@@ -8,6 +8,17 @@ Rules (PLAN.md, Connection resolver, classification table), applied per part pai
 | bodies of the same weldment part touching         | tie                         |
 | weld bead touching parts                          | bead removed, parts tied directly (D7) |
 | lock mate                                         | tie                         |
+| concentric (or hinge) mate between cylinders     | hinge, one per mate on its own axis; it has |
+|   (hole to hole, or a pin surface in a hole)      | priority over the parts' touching faces,    |
+|                                                   | which slide without separating (as SimSolid)|
+|   a distance mate beside it keeps the parts apart: the hinge holds them axially |
+| faces chosen as a hinge by the user (2+ concentric)| hinge from the first part to each other part |
+| ... with Lock rotation (mate or user's hinge)     | hinge locked: bonded across the faces       |
+| profile center on round profiles, not locked      | hinge about the faces' normal (D51)         |
+| screw mate                                        | screw: a hinge whose turn drives an advance |
+| gear, rack and pinion mate                        | coupling of the two parts' joints; their   |
+|                                                   | touching teeth carry nothing (D51)          |
+| a part held only by coaxial hinges (a loose pin)  | its first hinge locked, so it cannot spin   |
 | concentric + coincident, or hinge                 | revolute                    |
 | slot, width or slider mate                        | sliding                     |
 | fastener through coaxial holes in >= 2 parts      | bolted (fastener removed, clamped faces tied) |
@@ -27,6 +38,9 @@ from ..diagnostics import Diagnostic, make
 from ..model import Model
 
 REVOLUTE_MATES = {"hinge"}
+COUPLING_MATES = {"gear", "rackpinion"}
+COUPLINGS = ("gear", "rack_pinion")
+TURNING = ("hinge", "revolute", "screw")   # joints whose free coordinate is a turn (found live: a gear on a screw)
 SLIDING_MATES = {"slot", "width", "slider"}
 FREE_MATES = {"distance", "angle", "limit", "limitdistance", "limitangle"}
 
@@ -35,12 +49,375 @@ def _pair(a, b):
     return tuple(sorted((a, b)))
 
 
-def mate_index(model: Model) -> dict[tuple, list]:
+def mate_index(model: Model, skip=()) -> dict[tuple, list]:
     out = defaultdict(list)
     for m in model.mates:
-        if len(m.parts) == 2:
+        if len(m.parts) == 2 and m.id not in skip:
             out[_pair(*m.parts)].append(m)
     return out
+
+
+def _sw_axis(model: Model, entity: str, fallback) -> np.ndarray:
+    """A mate entity's cylinder axis as SolidWorks orients it (the add-in's fingerprint), else the geometry's.
+    SolidWorks measures a gear's turn and a screw's hand about each entity's own axis (found live, D51), and
+    the STEP geometry's axis may point the other way."""
+    fr = model.face_ref(entity)
+    a = fr.fingerprint.axis if fr is not None and fr.fingerprint.axis is not None else fallback
+    a = np.asarray(a, float)
+    return a / np.linalg.norm(a)
+
+
+def hinges_from_mates(model: Model, geoms, face_map: dict, clamped: dict) -> list[dict]:
+    """A concentric mate between cylindrical faces of two parts (hole to hole, or a pin's surface in a hole)
+    is a hinge there: its own connection on that axis, joining the two cylindrical faces, free to turn about
+    the axis. It is a type of its own, distinct from the revolute joint that concentric + coincident mates
+    make of a touching interface. Found live: two plates with a coincident mate and two concentric mates on
+    parallel hole pairs came out as ONE revolute on the flat face, about its normal through the face's
+    centre, so neither hole was used; the user asked for SimSolid's behaviour, where the hinge has priority
+    and the touching faces slide without separating."""
+    pins = []
+    # the faces of the user's hinges, by face (the study's face_ref ids differ from the mates' ids)
+    taken = {tuple(face_map[fid]) for h in model.hinges for fid in h.faces if fid in face_map}
+    for m in model.mates:
+        # a concentric mate names two cylinders; SolidWorks' hinge mate names two cylinders and two planes
+        if m.type.lower() not in ("concentric", "hinge", "screw") or len(m.parts) != 2 or len(m.entities) < 2:
+            continue
+        if _pair(*m.parts) in clamped:
+            continue                               # a fastener through the holes: the bolted joint governs
+        if any(tuple(face_map.get(e, ())) in taken for e in m.entities):
+            continue                               # the user made a hinge of these faces
+        sides = []
+        for e in m.entities:
+            hit = face_map.get(e)
+            if hit is None or hit[0] not in geoms:
+                continue
+            f = geoms[hit[0]].faces[hit[1]]
+            if f.surface == "cylinder" and f.axis is not None and f.axis_point is not None:
+                sides.append((hit[0], f, e))
+        if len(sides) != 2 or sides[0][0] == sides[1][0]:
+            continue
+        (pa, fa, ea), (pb, fb, eb) = sides
+        kinds = " to ".join("pin surface" if f.convex else "hole" for f in (fa, fb))
+        if m.type.lower() == "screw":
+            if not m.distance_per_rev:
+                continue                           # the lead is unknown (SolidWorks 2018): left to the mates
+            # Found live (D51): SolidWorks' screw is right-handed when its two cylinders' axes point the same
+            # way and Reverse is ticked, or point opposite ways and it is not.
+            same = float(np.dot(_sw_axis(model, ea, fa.axis), _sw_axis(model, eb, fb.axis))) > 0
+            lead = (1.0 if same == m.reverse else -1.0) * float(m.distance_per_rev)
+            c = _hinge(f"S-{m.id}", pa, fa, pb, fb, f"screw mate, {kinds}: turning one part on the other "
+                       f"advances it {abs(lead):g} mm per revolution ({'left' if lead < 0 else 'right'}-handed)",
+                       "mates", [m.id])
+            c["type"], c["lead"] = "screw", lead
+        elif m.lock_rotation:
+            c = _hinge(f"H-{m.id}", pa, fa, pb, fb, f"concentric mate with rotation locked, {kinds}: bonded "
+                       "there (it has priority; the parts' other touching faces slide without separating)",
+                       "mates", [m.id])
+            c["locked"] = True
+        else:
+            c = _hinge(f"H-{m.id}", pa, fa, pb, fb, f"concentric mate, {kinds}: a hinge on that axis (it has "
+                       "priority; the parts' other touching faces slide without separating)", "mates", [m.id])
+        pins.append(c)
+    pins += profile_hinges(model, geoms, face_map, clamped, taken)
+    return pins
+
+
+def profile_hinges(model: Model, geoms, face_map: dict, clamped: dict, taken: set) -> list[dict]:
+    """A profile center mate on round profiles, without Lock rotation: the parts turn about the profiles'
+    common axis, the faces' normal through the round face's centre. Locked, or on other profiles, it only
+    places the parts (their touching faces are bonded as usual)."""
+    out = []
+    for m in model.mates:
+        if (m.type.lower() != "profilecenter" or m.lock_rotation or m.profile != "round" or len(m.parts) != 2
+                or _pair(*m.parts) in clamped or any(tuple(face_map.get(e, ())) in taken for e in m.entities)):
+            continue
+        sides = []
+        for e in m.entities:
+            hit = face_map.get(e)
+            if hit and hit[0] in geoms:
+                f = geoms[hit[0]].faces[hit[1]]
+                if f.surface == "plane" and f.normal is not None:
+                    sides.append((hit[0], f))
+        if len(sides) != 2 or sides[0][0] == sides[1][0]:
+            continue
+        (pa, fa), (pb, fb) = sides
+        if abs(abs(float(np.dot(fa.normal, fb.normal))) - 1) > 1e-3:
+            continue                               # not facing each other: not a profile center to turn on
+        small = fa if fa.area <= fb.area else fb      # the round face: its centroid is the profile's centre
+        n = np.asarray(fa.normal, float)
+        n /= np.linalg.norm(n)
+        out.append({"id": f"H-{m.id}", "type": "hinge", "parts": [pa, pb],
+                    "sides": [{"part": pa, "face": fa.index}, {"part": pb, "face": fb.index}],
+                    "geometry": "plane", "axis": n.tolist(), "axis_point": list(map(float, small.centroid)),
+                    "radius": float(np.sqrt(small.area / np.pi)), "length": float(2 * np.sqrt(small.area / np.pi)),
+                    "gap": 0.0, "area": float(small.area), "samples": list(small.samples), "source": "mates",
+                    "evidence": {"rule": "profile center mate on round profiles, rotation not locked: a hinge about "
+                                         "the faces' normal through the profile's centre", "mates": [m.id]}})
+    return out
+
+
+def _joint_of(conns: list[dict], part: str, axis, point, kinds) -> dict | None:
+    """The free joint of `part` (a hinge or pin; or a slide when axis is None) on the given axis line."""
+    for c in conns:
+        if c["type"] not in kinds or part not in c["parts"][:2] or c.get("locked"):
+            continue
+        if axis is None:
+            return c
+        if c.get("axis") is None or c.get("axis_point") is None:
+            continue
+        a = np.asarray(c["axis"], float)
+        a /= np.linalg.norm(a)
+        if abs(abs(float(np.dot(a, axis))) - 1) > 1e-3:
+            continue
+        d = np.asarray(point, float) - np.asarray(c["axis_point"], float)
+        if np.linalg.norm(d - np.dot(d, a) * a) <= defaults.COAX_TOL + 0.5:
+            return c
+    return None
+
+
+def couplings_from_mates(model: Model, geoms, face_map: dict, conns: list[dict], removed) -> list[Diagnostic]:
+    """Gear and rack & pinion mates couple the free motions of two joints: each gear turns on its own hinge
+    (or pin), the rack slides on its sliding joint. A coupled part whose joint is missing or locked is held,
+    so the other part's joint is locked too. The coupling is written as one linear relation
+    sum(scale_i * motion_i) = 0, motion_i being the part's turn (rad, about `axis`) or slide (mm, along
+    `axis`) relative to the other part of its joint (its carrier)."""
+    diags = []
+    for m in model.mates:
+        kind = m.type.lower()
+        if kind not in COUPLING_MATES or len(m.parts) != 2 or set(m.parts) & set(removed):
+            continue
+        ents = []
+        for e in m.entities:
+            hit = face_map.get(e)
+            if hit and hit[0] in geoms:
+                ents.append((hit[0], geoms[hit[0]].faces[hit[1]], e))
+        cyl = [(p, f, e) for p, f, e in ents if f.surface == "cylinder" and f.axis is not None and f.axis_point is not None]
+        missing = None
+        if kind == "gear":
+            if len(cyl) != 2 or cyl[0][0] == cyl[1][0]:
+                missing = "two cylindrical faces or circular edges, one on each gear"
+            elif not m.ratio or min(m.ratio) <= 0:
+                missing = "the gear ratio (SolidWorks 2018 does not give it to add-ins)"
+        else:
+            pin = [(p, f) for p, f, _ in cyl]
+            if not pin:
+                missing = "the pinion's cylindrical face or circular edge"
+            elif not m.distance_per_rev:
+                missing = "the rack travel per revolution (SolidWorks 2018 does not give it to add-ins)"
+        if missing:
+            diags.append(make("MATE_COUPLING_UNUSED", where={"parts": list(m.parts)}, mate=m.id, kind=kind,
+                              missing=missing))
+            continue
+        terms, held = [], []
+        if kind == "gear":
+            (p1, f1, e1), (p2, f2, e2) = cyl
+            # Found live (D51), with the entities in the mate's order: SolidWorks turns them so that
+            # |phi1| * den = |phi2| * num, each turn measured about that entity's own axis (as SolidWorks orients
+            # it), the two turns of opposite sign unless Reverse is ticked. So den*phi1 + num*phi2 = 0, or
+            # den*phi1 - num*phi2 = 0 reversed: external gears on axes pointing the same way turn opposite ways.
+            a1 = _sw_axis(model, e1, f1.axis)
+            a2 = _sw_axis(model, e2, f2.axis)
+            num, den = (float(x) for x in m.ratio)
+            spec = [(p1, a1, f1.axis_point, den), (p2, a2, f2.axis_point, (-1.0 if m.reverse else 1.0) * num)]
+            for part, ax, pt, scale in spec:
+                j = _joint_of(conns, part, ax, pt, TURNING)
+                (terms if j else held).append({"part": part, "joint": j, "kind": "rotation", "axis": ax.tolist(),
+                                               "point": list(map(float, pt)), "scale": scale})
+            rule = (f"gear mate, ratio {num:g}:{den:g} ({p1} turns {num / den:g} times for each turn of {p2})"
+                    f"{', reversed' if m.reverse else ''}")
+        else:
+            pp, pf, _ = cyl[0]
+            rack = next(p for p in m.parts if p != pp)
+            a = np.asarray(pf.axis, float); a /= np.linalg.norm(a)
+            jr = _joint_of(conns, rack, None, None, ("sliding",))
+            jp = _joint_of(conns, pp, a, pf.axis_point, TURNING)
+            # the rack moves with the pinion's pitch point: s = phi * D/(2 pi) * (a x n).d, n towards the rack
+            g = geoms[rack]
+            rc = (np.asarray(g.bbox[:3]) + np.asarray(g.bbox[3:])) / 2 - np.asarray(pf.axis_point, float)
+            nrm = rc - np.dot(rc, a) * a
+            nrm /= (np.linalg.norm(nrm) or 1.0)
+            d_rack = np.asarray(jr["params"]["direction"] if jr and jr.get("params", {}).get("direction")
+                                else (jr or {}).get("axis") or np.cross(a, nrm), float)
+            d_rack /= np.linalg.norm(d_rack)
+            # Reverse is not used: found live (D51), SolidWorks sets it from its own sense of the rack's edge, and
+            # this geometric rule gave SolidWorks' motion with the rack beside the pinion
+            k = float(m.distance_per_rev) / (2 * np.pi) * float(np.dot(np.cross(a, nrm), d_rack))
+            for part, j, kd, ax, scale in ((pp, jp, "rotation", a, k), (rack, jr, "slide", d_rack, -1.0)):
+                pt = pf.axis_point if kd == "rotation" else list(rc + np.asarray(pf.axis_point, float))
+                (terms if j else held).append({"part": part, "joint": j, "kind": kd, "axis": np.asarray(ax).tolist(),
+                                               "point": list(map(float, pt)), "scale": scale})
+            rule = f"rack and pinion mate, {float(m.distance_per_rev):g} mm of rack travel per revolution"
+        # the touching faces of the coupled parts (gear teeth) carry nothing: the coupling stands for the mesh
+        pair = _pair(*m.parts)
+        for c in conns:
+            if _pair(*c["parts"][:2]) == pair and c["type"] in ("tie", "slide", "contact") and c.get("source") != "override":
+                c["type"] = "none"
+                c["evidence"]["rule"] = f"touching faces of parts coupled by {m.id}: the coupling carries the mesh"
+        if len(terms) == 2:
+            for t in terms:
+                j = t.pop("joint")
+                t["connection"], t["carrier"] = j["id"], next(p for p in j["parts"][:2] if p != t["part"])
+            conns.append({"id": f"G-{m.id}", "type": "gear" if kind == "gear" else "rack_pinion",
+                          "parts": list(m.parts), "couples": terms, "source": "mates",
+                          "evidence": {"rule": rule, "mates": [m.id]}})
+        elif len(terms) == 1:
+            # the other part cannot move: this one is held through the coupling
+            j = terms[0]["joint"]
+            j["locked"] = True
+            j["evidence"]["rule"] += (f"; locked by {m.id}: {held[0]['part']} has no free joint, so the coupling "
+                                      "holds this one")
+            diags.append(make("MATE_COUPLING_HELD", where={"parts": [held[0]["part"], terms[0]["part"]],
+                                                           "connections": [j["id"]]},
+                              mate=m.id, held=held[0]["part"], part=terms[0]["part"]))
+    return diags
+
+
+def _hinge(cid: str, pa: str, fa, pb: str, fb, rule: str, source: str, mates: list[str]) -> dict:
+    """A hinge connection between two cylindrical faces on one axis, placed midway between them."""
+    axis = np.asarray(fa.axis, float)
+    axis /= np.linalg.norm(axis)
+    p0 = np.asarray(fa.axis_point, float)
+    mid = (np.asarray(fa.centroid, float) + np.asarray(fb.centroid, float)) / 2
+    at = p0 + axis * float(np.dot(mid - p0, axis))
+    spans = [abs(f.axial_range[1] - f.axial_range[0]) for f in (fa, fb) if f.axial_range]
+    return {"id": cid, "type": "hinge", "parts": [pa, pb],
+            "sides": [{"part": pa, "face": fa.index}, {"part": pb, "face": fb.index}],
+            "geometry": "cylinder", "axis": axis.tolist(), "axis_point": at.tolist(),
+            "radius": fa.radius, "length": float(sum(spans)) if spans else 10.0,
+            "gap": 0.0, "area": float(fa.area + fb.area),
+            "samples": list(fa.samples) + list(fb.samples), "source": source,
+            "evidence": {"rule": rule, "mates": mates, "radius": fa.radius}}
+
+
+def concentric_faces(geoms, chosen: list[tuple[str, object]], removed=()) -> list[tuple[str, object]]:
+    """The cylindrical faces of every part on the chosen faces' axis, of a radius close to theirs (a pin in its
+    hole, with clearance), that continue the chosen faces along the axis without a gap longer than the radius:
+    the holes and pin surfaces a pin passes through. Found live: a face can be hidden behind another, so the user
+    chooses one and AsmFEA finds the rest."""
+    a0 = np.asarray(chosen[0][1].axis, float)
+    a0 /= np.linalg.norm(a0)
+    p0 = np.asarray(chosen[0][1].axis_point, float)
+    radii = [f.radius for _, f in chosen if f.radius]
+    r0 = float(np.mean(radii)) if radii else 1.0
+    span = lambda f: [float(np.dot(np.asarray(s) - p0, a0)) for s in f.samples] or [0.0]  # noqa: E731
+    lo = min(min(span(f)) for _, f in chosen)
+    hi = max(max(span(f)) for _, f in chosen)
+    gap = max(r0, defaults.HINGE_FIND_GAP)
+    have = {(p, f.index) for p, f in chosen}
+    cands = []
+    for pid, g in geoms.items():
+        if pid in removed:
+            continue
+        for f in g.faces:
+            if (pid, f.index) in have or f.surface != "cylinder" or f.axis is None or f.axis_point is None:
+                continue
+            if abs(abs(float(np.dot(a0, f.axis))) - 1) > 1e-3 or abs((f.radius or 0) - r0) > max(
+                    defaults.HINGE_FIND_RADIUS, defaults.HINGE_FIND_RADIUS_REL * r0):
+                continue
+            d = np.asarray(f.axis_point, float) - p0
+            if np.linalg.norm(d - np.dot(d, a0) * a0) > defaults.COAX_TOL + 0.05 * r0:
+                continue
+            ts = span(f)
+            cands.append((min(ts), max(ts), pid, f))
+    found, grew = [], True
+    while grew:                                     # grow the run along the axis, face by face
+        grew = False
+        for c in list(cands):
+            if c[0] <= hi + gap and c[1] >= lo - gap:
+                lo, hi = min(lo, c[0]), max(hi, c[1])
+                found.append((c[2], c[3]))
+                cands.remove(c)
+                grew = True
+    return found
+
+
+def hinges_from_selection(model: Model, geoms, face_map: dict, removed=()) -> tuple[list[dict], list[Diagnostic]]:
+    """Hinges the user added by choosing one or more concentric cylindrical faces (holes or pin surfaces).
+    The concentric faces of the other parts along the axis are found and added (concentric_faces), so one face
+    is enough. Each part's faces join the first part's on that axis; with three or more parts each turns about
+    the axis on its own, as on a real pin."""
+    out, diags = [], []
+    for h in model.hinges:
+        faces, bad, named = [], [], []
+        for fid in h.faces:
+            hit = face_map.get(fid)
+            if hit is None or hit[0] not in geoms:
+                bad.append(f"face {fid} was not found in the geometry")
+                continue
+            named.append(hit[0])
+            f = geoms[hit[0]].faces[hit[1]]
+            if f.surface != "cylinder" or f.axis is None or f.axis_point is None:
+                bad.append(f"face {fid} on {hit[0]} is not cylindrical ({f.surface})")
+                continue
+            faces.append((hit[0], f))
+        if faces and not bad:
+            a0 = np.asarray(faces[0][1].axis, float)
+            a0 /= np.linalg.norm(a0)
+            p0 = np.asarray(faces[0][1].axis_point, float)
+            for pid, f in faces[1:]:
+                d = np.asarray(f.axis_point, float) - p0
+                off = float(np.linalg.norm(d - np.dot(d, a0) * a0))
+                if abs(abs(float(np.dot(a0, f.axis))) - 1) > 1e-3 or off > defaults.COAX_TOL + 0.05 * (f.radius or 0):
+                    bad.append(f"face {f.index} on {pid} is not concentric with the first face "
+                               f"(axis {off:.3g} mm away)")
+        added = concentric_faces(geoms, faces, removed) if faces and not bad else []
+        faces += added
+        parts = list(dict.fromkeys(p for p, _ in faces))
+        if not bad and len(parts) < 2:
+            bad.append("no concentric hole or pin surface of another part was found along the chosen face's axis")
+        if bad:
+            diags.append(make("HINGE_FACES_INVALID", where={"parts": list(dict.fromkeys(named)), "faces": list(h.faces)},
+                              hinge=h.id, problem="; ".join(bad)))
+            continue
+        hub = parts[0]
+        hub_faces = [f for p, f in faces if p == hub]
+        for other in parts[1:]:
+            mine = [f for p, f in faces if p == other]
+            c = _hinge(f"H-{h.id}" + ("" if len(parts) == 2 else f"-{other}"), hub, hub_faces[0], other, mine[0],
+                       "hinge chosen by the user on concentric faces" + (
+                           f" ({len(added)} more found along the axis)" if added else "") +
+                       " (it has priority; the parts' other touching faces slide without separating)", "user", [])
+            # every chosen face of the pair takes part in the joint
+            c["sides"] = ([{"part": hub, "face": f.index} for f in hub_faces] +
+                          [{"part": other, "face": f.index} for f in mine])
+            c["samples"] = [s for f in hub_faces + mine for s in f.samples]
+            c["area"] = float(sum(f.area for f in hub_faces + mine))
+            c["hinge"] = h.id
+            if h.lock_rotation:
+                c["locked"] = True
+                c["evidence"]["rule"] = "hinge chosen by the user with rotation locked: bonded on these faces"
+            out.append(c)
+    return out, diags
+
+
+def lock_loose_pins(hinges: list[dict], conns: list[dict]) -> None:
+    """A part held only by hinges on one axis (a loose pin through holes) would spin freely about its own
+    axis, leaving the model singular. Its first hinge is locked: the pin is held in the first part it
+    passes through and turns in the others, which changes nothing that matters."""
+    by_part = defaultdict(list)
+    for c in conns:
+        for p in c["parts"][:2]:
+            by_part[p].append(c)
+    done = set()
+    for pid, cs in sorted(by_part.items()):
+        if not cs or any(c["type"] != "hinge" for c in cs if c["type"] != "none"):
+            continue
+        hs = [c for c in cs if c["type"] == "hinge"]
+        if not hs or any(c.get("locked") for c in hs) or any(c["type"] == "screw" for c in cs):
+            continue
+        if len({q for c in hs for q in c["parts"][:2]} - {pid}) < 2:
+            continue                # hinged to one part only: a real swing, left for the mechanism check
+        a0 = np.asarray(hs[0]["axis"], float)
+        p0 = np.asarray(hs[0]["axis_point"], float)
+        coaxial = all(abs(abs(float(np.dot(a0, c["axis"]))) - 1) < 1e-3 and
+                      np.linalg.norm(np.cross(np.asarray(c["axis_point"], float) - p0, a0)) < defaults.COAX_TOL + 0.5
+                      for c in hs)
+        if not coaxial or hs[0]["id"] in done:
+            continue
+        hs[0]["locked"] = True
+        hs[0]["evidence"]["rule"] += (f"; {pid} is held only by hinges on this axis (a loose pin), so this one "
+                                      "is locked: the pin is held here and turns in the other parts")
+        done.add(hs[0]["id"])
 
 
 def joint_from_mates(mates) -> tuple[str | None, str]:
@@ -101,12 +478,12 @@ def bolted_joints(model: Model, geoms) -> tuple[list[dict], list[Diagnostic]]:
     return joints, diags
 
 
-def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict]) -> tuple[list[dict], list[str], list[Diagnostic]]:
+def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
+             face_map: dict | None = None) -> tuple[list[dict], list[str], list[Diagnostic]]:
     """Returns (connections, removed part ids, diagnostics)."""
     diags: list[Diagnostic] = []
     kinds = {p.id: p.kind for p in model.parts}
     steps = {p.id: (p.step, tuple(p.transform)) for p in model.parts}
-    mates = mate_index(model)
 
     joints, bdiags = bolted_joints(model, geoms)
     diags += bdiags
@@ -129,16 +506,26 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict]) -> 
             for b in j["parts"]:
                 if a < b:
                     clamped[(a, b)] = j["id"]
+    # hinges from concentric mates on cylinders; those mates then no longer decide the touching faces' type
+    chosen, hdiags = hinges_from_selection(model, geoms, face_map or {}, removed)
+    diags += hdiags
+    pins = [p for p in chosen + hinges_from_mates(model, geoms, face_map or {}, clamped)
+            if not set(p["parts"]) & set(removed)]
+    mates = mate_index(model, skip={m for p in pins for m in p["evidence"]["mates"]})
+    hinged = {_pair(*p["parts"]) for p in pins}
+    # a face that is part of a hinge belongs to it: touching interfaces on it are left to the hinge
+    hinge_faces = {(s["part"], s["face"]) for p in pins for s in p["sides"]}
+    # beside a hinge, a distance (angle, limit) mate only says where the parts sit: the hinge holds them
+    # apart along its axis, so the mate does not disconnect the hinged parts' touching faces
+    for pair in hinged:
+        if pair in mates:
+            mates[pair] = [m for m in mates[pair] if m.type.lower() not in FREE_MATES]
 
-    groups = {p.id: p.subassembly for p in model.parts}
+    # Parts of sub-assemblies are analysed as if they were in the top level: the add-in reads every
+    # sub-assembly's mates (D52, the user's choice; sub-assemblies were rigid until then)
     for pair, itfs in sorted(by_pair.items()):
         joint, why = joint_from_mates(mates.get(pair, []))
         source = "mates" if joint else "geometry"
-        if groups.get(pair[0]) and groups[pair[0]] == groups.get(pair[1]):
-            # a sub-assembly is rigid, like one multi-body part: its touching parts are bonded
-            # (its own mates are not read, and a flexible sub-assembly is not modelled as such)
-            joint, why = "tie", f"parts of the same sub-assembly {groups[pair[0]]} (rigid: touching faces bonded)"
-            source = "sub-assembly"
         if pair in clamped:
             # Parts clamped by a fastener: default bolted mode ties the clamped faces,
             # whatever hole-to-hole mates say.
@@ -146,8 +533,14 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict]) -> 
             source = "mates"
         same_weldment = steps[pair[0]] == steps[pair[1]]
         for itf in itfs:
+            if any((s["part"], s["face"]) in hinge_faces for s in itf.get("sides", [])):
+                continue                    # a pin surface touching its hole: the hinge stands for it
             c = {k: v for k, v in itf.items()}
-            if joint is None:
+            if joint is None and pair in hinged:
+                # the hinge has priority: the touching faces slide on each other but do not separate
+                c["type"] = "slide"
+                rule = "touching faces of parts joined by a hinge: they slide but do not separate"
+            elif joint is None:
                 c["type"] = "tie"
                 rule = ("bodies of the same weldment part touching" if same_weldment
                         else "touching faces, no mate between the parts (static joint)")
@@ -167,8 +560,9 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict]) -> 
                              "mates": [m.id for m in mates.get(pair, [])]}
             conns.append(c)
 
+    conns += pins
     # Joints from mates where nothing touches (e.g. a pin with clearance) stay unresolved.
-    touching = set(by_pair)
+    touching = set(by_pair) | {_pair(*p["parts"]) for p in pins}
     for pair, ms in mates.items():
         joint, why = joint_from_mates(ms)
         if joint in ("revolute", "sliding", "tie") and pair not in touching and not set(pair) & set(removed):
@@ -199,6 +593,9 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict]) -> 
 
     conns += joints
     _apply_overrides(model, conns, diags)
+    lock_loose_pins(pins, conns)
+    diags += couplings_from_mates(model, geoms, face_map or {}, conns, removed)
+    _apply_overrides(model, [c for c in conns if c["type"] in COUPLINGS], diags)
     _preloaded_bolts(conns)
     return conns, sorted(removed), diags
 
@@ -287,6 +684,8 @@ def _preloaded_bolts(conns: list[dict]) -> None:
 def _apply_overrides(model: Model, conns: list[dict], diags: list[Diagnostic]) -> None:
     for c in conns:
         for ov in model.overrides:
+            if c["type"] in COUPLINGS and (ov.interface != c["id"] or ov.connection != "none"):
+                continue                    # a gear coupling is only switched off, by name
             if set(ov.parts) == set(c["parts"][:2]) and ov.interface in (None, c["id"]):
                 c["type"] = ov.connection
                 c["source"] = "override"

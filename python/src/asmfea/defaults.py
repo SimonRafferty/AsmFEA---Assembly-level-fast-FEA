@@ -80,6 +80,12 @@ OVERLAP_TOL = 0.05             # mm: faces this far into each other still count 
 OVERLAP_VOL_TOL = 1.0          # mm^3: solids overlapping more than this are interference, guess
 TIE_AREA_RATIO = 4.0           # tie sides differing this much in area (an edge on a face): the small one is the slave (D30), guess
 COAX_TOL = 0.1                 # mm: axis offset for coaxial cylinders, guess
+# A hinge from one chosen face (D50): faces found on its axis must be within this radius of it (a pin in a
+# clearance hole), and continue it along the axis without a longer gap than max(radius, HINGE_FIND_GAP). Guesses:
+# loose enough for an H11 clearance hole, tight enough to leave a gear's rim off its bore.
+HINGE_FIND_RADIUS = 1.0        # mm
+HINGE_FIND_RADIUS_REL = 0.15   # of the radius
+HINGE_FIND_GAP = 5.0           # mm
 LINE_BOND_WIDTH = 2.0          # mm: strip bonded along an edge contact inside a weldment (D29), guess
 BUTT_ADJUST = False            # True closes a butt gap by moving nodes (*TIE ADJUST=YES); measured worse on stress (+24 %) than rigid links (-6 %), D31
 BUTT_COVERED_FRACTION = 0.97   # a weldment butting face covered less than this is bonded whole (D29), guess

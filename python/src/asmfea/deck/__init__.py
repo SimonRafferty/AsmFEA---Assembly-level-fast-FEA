@@ -256,14 +256,18 @@ def plan_joints(model: Model, connections: list[dict], by_part: dict, first_node
     diags = []
     groups: dict[tuple, list[dict]] = {}
     for c in connections:
-        if c["type"] in ("revolute", "sliding") and c.get("sides"):
-            groups.setdefault((c["type"], tuple(sorted(c["parts"][:2]))), []).append(c)
+        if c["type"] in ("revolute", "sliding", "hinge", "screw") and c.get("sides"):
+            # a hinge (concentric mate on cylinders) is its own joint on its own axis: two hinges on parallel
+            # axes between the same parts must not merge into one
+            key = c["id"] if c["type"] in ("hinge", "screw") else ""
+            groups.setdefault((c["type"], tuple(sorted(c["parts"][:2])), key), []).append(c)
     mates = {m.id: m for m in model.mates}
     out, nxt = [], first_node
-    for (kind, (pa, pb)), cs in sorted(groups.items()):
+    for (kind, (pa, pb), _), cs in sorted(groups.items()):
         if pa not in by_part or pb not in by_part:
             continue
-        cyl = next((c for c in cs if c.get("geometry") == "cylinder"), None)
+        # the joint's own axis line: a hinge's (on a cylinder, or a round profile's normal), else a cylinder's
+        cyl = next((c for c in cs if c.get("axis") is not None and c.get("axis_point") is not None), None)
         mate_dirs = [mates[m] for c in cs for m in c.get("evidence", {}).get("mates", []) if m in mates
                      and mates[m].direction is not None]
         given = next((c["params"]["direction"] for c in cs if c.get("params", {}).get("direction")), None)
@@ -299,7 +303,9 @@ def plan_joints(model: Model, connections: list[dict], by_part: dict, first_node
         bodies = [(pa, ref_a, rot_a), (pb, None, free)]
         nxt += 3
         out.append({"kind": kind, "parts": [pa, pb], "connections": [c["id"] for c in cs], "axis": axis.tolist(),
-                    "at": at.tolist(), "new_nodes": new, "bodies": bodies, "nodes": sides})
+                    "at": at.tolist(), "new_nodes": new, "bodies": bodies, "nodes": sides,
+                    "locked": any(c.get("locked") for c in cs),
+                    "lead": next((float(c["lead"]) for c in cs if c.get("lead")), 0.0)})
     return out, diags
 
 
@@ -671,6 +677,21 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             adjust = "YES" if butt and defaults.BUTT_ADJUST else "NO"
             f.write(f"*TIE, NAME={name}, POSITION TOLERANCE={tol:.6g}, ADJUST={adjust}\n{name}SLAVE, {name}MASTER\n")
 
+        # Faces that slide but do not separate (a hinge's parts): each slave node keeps the master face's
+        # displacement along the face normal, by one equation, and is free in the face's plane
+        info["slides"] = []
+        for k, c in enumerate(c for c in connections if c["type"] == "slide" and c.get("sides")):
+            (pa, fa), (pb, fb) = [(s["part"], s["face"]) for s in c["sides"]]
+            ia, ib = by_part[pa], by_part[pb]
+            mean = lambda inst, idx: float(np.mean(inst.face_areas(idx)))  # noqa: E731
+            (si, sf), (mi, mf) = ((ia, fa), (ib, fb)) if mean(ia, fa) <= mean(ib, fb) else ((ib, fb), (ia, fa))
+            slave = [int(si.node0 + n) for n in _tie_nodes(si, sf, c)]
+            slave = [n for n in slave if n not in slaved and n not in fixed_nodes]
+            n_eq = _write_slide(f, c, si, mi, mf, slave, bond_tol)
+            slaved.update(slave)
+            info["slides"].append({"connection": c["id"], "slave_part": si.part_id, "master_part": mi.part_id,
+                                   "slave_nodes": n_eq})
+
         for k, p in enumerate(pins, start=1):
             f.write(f"*RIGID BODY, NSET=PIN{k}, REF NODE={p['ref']}, ROT NODE={p['rot']}\n")
 
@@ -680,6 +701,8 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         for inst in instances:
             coords[inst.part_id] = inst
         joint_dummies = []
+        subst = _coupling_substitutions(joints, connections)
+        info["couplings"] = [{"connection": cid, "joints": js} for cid, js in subst.pop("_records", [])]
         for k, j in enumerate(joints, start=1):
             (pa, ra, qa), (pb, _, free) = j["bodies"]
             nodes_a = [n for n in sorted(j["nodes"][pa]) if n not in slaved and n not in fixed_nodes]
@@ -695,7 +718,14 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             for n in nodes_b:
                 r = ib.X[n - ib.node0 - 1] - x_ref
                 # free coordinate: rotation phi about a (u += phi a x r) or slide s along a (u += s a)
-                g = np.cross(a, r) if j["kind"] == "revolute" else a
+                if j["kind"] in ("revolute", "hinge"):
+                    g = np.cross(a, r)
+                elif j["kind"] == "screw":                 # turn plus the advance it drives
+                    g = np.cross(a, r) + j["lead"] / (2 * np.pi) * a
+                else:
+                    g = a
+                # a joint coupled to another (gear, rack and pinion): its free motion is a multiple of that one's
+                fnode, fscale = subst.get(free, (free, 1.0))
                 for i in range(3):
                     # u_n,i - u_ref,i - (theta x r)_i - g_i * free = 0 ; (theta x r)_i = sum_j eps_ijk r_k theta_j
                     terms = [(n, i + 1, 1.0), (ra, i + 1, -1.0)]
@@ -703,21 +733,21 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                         c = sum(_eps(i, jj, kk) * r[kk] for kk in range(3))
                         if abs(c) > 1e-12:
                             terms.append((qa, jj + 1, -c))
-                    if abs(g[i]) > 1e-12:
-                        terms.append((free, 1, -g[i]))
+                    if abs(g[i] * fscale) > 1e-12:
+                        terms.append((fnode, 1, -g[i] * fscale))
                     f.write(f"*EQUATION\n{len(terms)}\n")
                     flat = [f"{nn}, {d}, {c:.12g}" for nn, d, c in terms]
                     for s in range(0, len(flat), 4):  # at most 12 entries (4 terms) per line
                         f.write(", ".join(flat[s:s + 4]) + "\n")
-            joint_dummies.append(free)
+            joint_dummies.append((free, j.get("locked", False) or free in subst))
             info["joints"].append({"kind": j["kind"], "parts": j["parts"], "connections": j["connections"],
                                    "axis": j["axis"], "at": j["at"], "nodes": j["new_nodes"]})
 
         # Boundary conditions (held over all steps)
         if fix_sets or pins or joint_dummies:
             f.write("*BOUNDARY\n")
-            for dn in joint_dummies:  # only DOF 1 of a joint's dummy node is used
-                f.write(f"{dn}, 2, 3\n")
+            for dn, locked in joint_dummies:  # only DOF 1 of a joint's dummy node is used
+                f.write(f"{dn}, {1 if locked else 2}, 3\n")      # a locked hinge (loose pin) holds it too
             for name, fx, _ in fix_sets:
                 dofs = [1, 2, 3] if fx.type == "fixed" else sorted(fx.dofs)
                 for d in dofs:
@@ -930,6 +960,80 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 if not scal:
                     diags.append(make("BUCKLING_NO_SCALED_LOAD", where={"loads": [ld.id for ld in pre]}, case=case))
     return DeckResult(path, info, diags)
+
+
+def _coupling_substitutions(joints: list[dict], connections: list[dict]) -> dict:
+    """{free node: (root free node, scale)} for joints coupled by gear and rack & pinion connections.
+
+    A joint's free coordinate q (DOF 1 of its dummy node) is the motion of its side B relative to side A
+    about/along its axis. A coupling term's motion (of `part` relative to its carrier, about/along the term's
+    axis) is sigma * q, sigma = +-1 from which side the part is and how the axes point. The coupling
+    sum(scale_i * sigma_i * q_i) = 0 is used to write q_2 = -(s_1/s_2) q_1 straight into joint 2's equations:
+    no equation joins the two dummy nodes, so no MPC is chained (CalculiX 2.22 crashes on chained MPCs
+    between rigid-body nodes, milestone 9). Joint 2's own dummy node is then held."""
+    out: dict = {}
+    records = []
+    by_conn = {cid: j for j in joints for cid in j["connections"]}
+    for c in connections:
+        if c["type"] not in ("gear", "rack_pinion"):
+            continue
+        coeffs = []
+        for t in c["couples"]:
+            j = by_conn.get(t["connection"])
+            if j is None:
+                break
+            pb = j["bodies"][1][0]
+            free = j["bodies"][1][2]
+            sigma = (1.0 if t["part"] == pb else -1.0) * float(np.sign(np.dot(j["axis"], t["axis"])) or 1.0)
+            coeffs.append((free, t["scale"] * sigma))
+        if len(coeffs) != 2:
+            continue
+        (q1, s1), (q2, s2) = coeffs
+        r1, k1 = out.get(q1, (q1, 1.0))
+        if q2 in out or r1 == q2:
+            continue                       # a closed gear loop: the second relation is redundant or locking
+        out[q2] = (r1, -s1 / s2 * k1)
+        records.append((c["id"], [q1, q2]))
+    out["_records"] = records
+    return out
+
+
+def _write_slide(f, c: dict, si: Instance, mi: Instance, mf: int, slave: list[int], tol: float) -> int:
+    """*EQUATIONs holding each slave node to the master face along the face normal only. Returns the count."""
+    from ..hybrid.solve import _face_project
+    faces, ids = [], []
+    for _, fn, e, cn in mi.face_elements(mf):
+        fnodes = cn[FACE_NODES[e][fn - 1]]
+        ids.append([int(mi.node0 + n) for n in fnodes])
+        faces.append((e, mi.X[fnodes - 1]))
+    if not faces or not slave:
+        return 0
+    P = np.array([si.X[n - si.node0 - 1] for n in slave])
+    hits = _face_project(P, faces, max(tol, 0.0) + 0.05)
+    given = np.asarray(c["normal"], float) if c.get("normal") is not None else None
+    count = 0
+    for n, h in zip(slave, hits):
+        if h is None:
+            continue
+        j, N, _ = h
+        if given is not None:
+            nrm = given
+        else:
+            X = faces[j][1]
+            nrm = np.cross(X[1] - X[0], X[2] - X[0])
+        nrm = nrm / np.linalg.norm(nrm)
+        d0 = int(np.argmax(np.abs(nrm)))
+        terms = [(n, d0 + 1, float(nrm[d0]))]
+        terms += [(n, d + 1, float(nrm[d])) for d in range(3) if d != d0 and abs(nrm[d]) > 1e-9]
+        for m, w in zip(ids[j], N):
+            if abs(w) > 1e-12:
+                terms += [(m, d + 1, -float(w * nrm[d])) for d in range(3) if abs(nrm[d]) > 1e-9]
+        f.write(f"*EQUATION\n{len(terms)}\n")
+        flat = [f"{nn}, {d}, {cf:.12g}" for nn, d, cf in terms]
+        for s in range(0, len(flat), 4):
+            f.write(", ".join(flat[s:s + 4]) + "\n")
+        count += 1
+    return count
 
 
 def _safe(name: str) -> str:

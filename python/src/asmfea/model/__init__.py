@@ -118,6 +118,11 @@ class Mate(_M):
     point: Optional[Vec3] = None
     direction: Optional[Vec3] = None
     radius: Optional[float] = None
+    lock_rotation: bool = False
+    profile: Optional[str] = None
+    ratio: Optional[list[float]] = None
+    distance_per_rev: Optional[float] = None
+    reverse: bool = False
 
 
 class Fingerprint(_M):
@@ -161,9 +166,17 @@ class Override(_M):
     id: str
     parts: list[str]
     interface: Optional[str] = None
-    connection: Literal["tie", "contact", "none", "revolute", "sliding", "bolted"]
+    connection: Literal["tie", "contact", "none", "revolute", "hinge", "slide", "sliding", "bolted", "screw"]
     friction: Optional[float] = None
     params: dict = {}
+    note: Optional[str] = None
+
+
+class Hinge(_M):
+    """A hinge the user added: concentric cylindrical faces in two or more parts (D50)."""
+    id: str
+    faces: list[str]
+    lock_rotation: bool = False
     note: Optional[str] = None
 
 
@@ -214,6 +227,7 @@ class Model(_M):
     loads: list[Load] = []
     fixtures: list[Fixture] = []
     overrides: list[Override] = []
+    hinges: list[Hinge] = []
     study: Optional[Study] = None
     issues: list[Issue] = []
 
@@ -248,7 +262,7 @@ def check_version(doc: dict, what: str) -> None:
 
 
 # Keys a study.json may carry; list-valued ones are appended, `study` replaces.
-_MERGE_LISTS = ("face_refs", "loads", "fixtures", "overrides", "materials", "mates")
+_MERGE_LISTS = ("face_refs", "loads", "fixtures", "overrides", "hinges", "materials", "mates")
 
 
 def merge_study(model: dict, study: dict) -> dict:

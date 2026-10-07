@@ -45,7 +45,9 @@ STATUS_COLOUR = {"PASS": RGBColor(0x1B, 0x7F, 0x2A), "WARN": RGBColor(0xB2, 0x6B
                  "FAIL": RGBColor(0xB0, 0x1C, 0x1C)}
 KIND_TEXT = {"solid": "Solid body", "sheet": "Sheet", "member": "Structural member", "fastener": "Fastener",
              "weld_bead": "Weld bead"}
-CONN_TEXT = {"tie": "Bonded", "contact": "Contact", "bolted": "Bolt", "revolute": "Hinge (revolute)",
+CONN_TEXT = {"tie": "Bonded", "contact": "Contact", "bolted": "Bolt", "revolute": "Pin (revolute)",
+             "hinge": "Hinge", "slide": "Sliding, no separation", "screw": "Screw",
+             "gear": "Gear coupling", "rack_pinion": "Rack and pinion coupling",
              "sliding": "Sliding", "none": "No connection"}
 
 
@@ -384,7 +386,10 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                  + A.removed(reasons) + A.bolted(joints)
                  + A.contact([c["id"] for c in conns if c["type"] == "contact"], stabilised,
                              bool(res.get("buckling")) and any(c["type"] == "contact" for c in conns))
-                 + A.joints(sum(c["type"] == "revolute" for c in conns), sum(c["type"] == "sliding" for c in conns))
+                 + A.joints(sum(c["type"] in ("revolute", "hinge") for c in conns), sum(c["type"] == "sliding" for c in conns))
+                 + A.slides(sum(c["type"] == "slide" for c in conns))
+                 + A.couplings(sum(c["type"] in ("gear", "rack_pinion") for c in conns),
+                               sum(c["type"] == "screw" for c in conns))
                  + A.buckling("buckling" in (model.study.analyses or []))
                  + A.welds(sorted({c["evidence"]["weld"] for c in conns if c.get("source") == "weld" and c.get("region")}),
                            sorted({w for c in conns if c.get("source") == "weld" and not c.get("region")
@@ -515,7 +520,8 @@ def build_report(study: Path, pdf: bool = False) -> Path:
         rule = c.get("evidence", {}).get("rule", c.get("mode", ""))
         if rule:
             det.append(str(rule))
-        rows.append([("* " if c.get("source") == "override" else "") + c["id"], CONN_TEXT.get(c["type"], c["type"]),
+        kind = CONN_TEXT.get(c["type"], c["type"]) + (", rotation locked" if c.get("locked") else "")
+        rows.append([("* " if c.get("source") == "override" else "") + c["id"], kind,
                      "\n".join(c["parts"][:2]), ", ".join(det)])
     _table(doc, ["Connection", "Type", "Components", "Details"], rows, [3.2, 2.6, 4.5, 6.7])
 

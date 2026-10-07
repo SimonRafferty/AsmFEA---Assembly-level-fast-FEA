@@ -17,6 +17,7 @@
     "loads": {"type": "array", "items": {"$ref": "#/$defs/load"}},
     "fixtures": {"type": "array", "items": {"$ref": "#/$defs/fixture"}},
     "overrides": {"type": "array", "items": {"$ref": "#/$defs/override"}},
+    "hinges": {"type": "array", "items": {"$ref": "#/$defs/hinge"}, "description": "Hinges the user added by choosing concentric cylindrical faces (schema 1.x, D50)"},
     "study": {"$ref": "#/$defs/study"},
     "issues": {"type": "array", "items": {"$ref": "#/$defs/issue"}, "description": "Problems the add-in found while extracting; the pipeline reports each as a diagnostic"}
   },
@@ -185,7 +186,12 @@
         "geometry": {"enum": ["plane", "cylinder", "line", "point", "reference", "other"]},
         "point": {"$ref": "#/$defs/vec3"},
         "direction": {"$ref": "#/$defs/vec3"},
-        "radius": {"type": "number"}
+        "radius": {"type": "number"},
+        "lock_rotation": {"type": "boolean", "description": "concentric, profile center: the mate's Lock rotation option (the hinge is then bonded)"},
+        "profile": {"enum": ["round", "other"], "description": "profile center: round profiles turn about their common axis unless locked"},
+        "ratio": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "gear: ratio numerator and denominator (in the order of the entities)"},
+        "distance_per_rev": {"type": "number", "description": "rack and pinion: rack travel per pinion revolution; screw: lead (mm per revolution)"},
+        "reverse": {"type": "boolean", "description": "gear, rack and pinion, screw: the mate's Reverse option"}
       }
     },
     "fingerprint": {
@@ -253,6 +259,18 @@
         }
       }
     },
+    "hinge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "faces"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "faces": {"type": "array", "items": {"type": "string"}, "minItems": 1,
+                  "description": "face_refs ids: one or more concentric cylindrical faces (holes, pin surfaces); the concentric faces of the other parts along the axis are found"},
+        "lock_rotation": {"type": "boolean", "description": "the parts may not turn about the axis: the hinge is bonded"},
+        "note": {"type": "string"}
+      }
+    },
     "override": {
       "type": "object",
       "additionalProperties": false,
@@ -261,7 +279,7 @@
         "id": {"$ref": "#/$defs/id"},
         "parts": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2},
         "interface": {"type": "string", "description": "Interface id from connections.json; absent = applies to every interface between the parts"},
-        "connection": {"enum": ["tie", "contact", "none", "revolute", "sliding", "bolted"]},
+        "connection": {"enum": ["tie", "contact", "none", "revolute", "hinge", "slide", "sliding", "bolted", "screw"]},
         "friction": {"type": "number", "minimum": 0},
         "params": {"type": "object", "description": "Type-specific settings, e.g. sliding: {\"direction\": [x, y, z]} (assembly frame; used before a cylinder axis or mate direction); bolted: size, preload ..."},
         "note": {"type": "string"}

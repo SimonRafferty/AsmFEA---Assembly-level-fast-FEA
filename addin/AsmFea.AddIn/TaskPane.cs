@@ -21,6 +21,8 @@ namespace AsmFea.AddIn
     public interface IPaneHost
     {
         IModelDoc2 ActiveModel { get; }
+        /// <summary>True while SolidWorks has a document of this path (or title, unsaved) open.</summary>
+        bool IsOpen(string pathOrTitle);
         StudyStore StoreFor(IModelDoc2 doc);
         /// <summary>The assembly's largest bounding-box dimension, mm (0 when unknown).</summary>
         double AssemblySizeMm(IModelDoc2 doc);
@@ -97,7 +99,13 @@ namespace AsmFea.AddIn
         private readonly ListView checksList = MakeList("Check", "Value", "Limit", "Status");
         private readonly TextBox keyFigures = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill };
         private readonly Timer poll = new Timer { Interval = 1000 };
+        // Every second: is the document shown still open and still the active one? SolidWorks' close events
+        // proved unreliable for this (found live twice: the pane kept a closed assembly's study), so the pane
+        // checks for itself and clears or switches when it has changed.
+        private readonly Timer watch = new Timer { Interval = 1000 };
+        private string shownDoc;        // the path (or title) of the document the pane shows, null when none
         private string jobId;
+        private string jobDoc;          // the path of the document whose job is followed (shown only while it is active)
         private string jobFile;        // the running job's job.json, fixed when it starts (not the active document's)
         private static readonly ToolTip tips = new ToolTip { AutoPopDelay = 20000, InitialDelay = 500, ReshowDelay = 200, ShowAlways = true };
 
@@ -210,6 +218,8 @@ namespace AsmFea.AddIn
             studyBox.SelectedIndexChanged += (s, e) => { ShowStudy(); showTab(); };
             tabs.SelectedIndexChanged += (s, e) => showTab();
             poll.Tick += (s, e) => PollJob();
+            watch.Tick += (s, e) => Watch();
+            watch.Start();
         }
 
         // ------------------------------------------------------------------ helpers
@@ -243,7 +253,91 @@ namespace AsmFea.AddIn
             foreach (var l in new[] { activity, connActivity, resActivity, loadsActivity }) tips.SetToolTip(l, text);
         }
 
-        private IModelDoc2 Doc { get { return host.ActiveModel; } }
+        // Documents being closed: SolidWorks still reports a closing document as active when it notifies the
+        // close, so the pane would fill itself again from it (found live: the study, load cases and fixtures
+        // stayed after the assembly closed). A closed file counts as no document until it is opened again.
+        private readonly Dictionary<string, DateTime> closedDocs = new Dictionary<string, DateTime>(StringComparer.OrdinalIgnoreCase);
+
+        private IModelDoc2 Doc
+        {
+            get
+            {
+                var d = host.ActiveModel;
+                if (d == null) return null;
+                string p = d.GetPathName();
+                return !string.IsNullOrEmpty(p) && closedDocs.ContainsKey(p) ? null : d;
+            }
+        }
+
+        /// <summary>The watchdog: refresh when the document shown has closed, or another one is active.</summary>
+        private void Watch()
+        {
+            try
+            {
+                // a closed mark expires when the document is open and visible well after its close (opened again
+                // without a load event): it is shown again
+                foreach (var k in closedDocs.Where(kv => (DateTime.Now - kv.Value).TotalSeconds > 3 && host.IsOpen(kv.Key))
+                                            .Select(kv => kv.Key).ToList())
+                    closedDocs.Remove(k);
+                if (shownDoc != null && !host.IsOpen(shownDoc))
+                {
+                    Trace("watch: " + shownDoc + " is no longer open: pane cleared");
+                    DocumentClosed(shownDoc);
+                    return;
+                }
+                string now = DocPath();
+                if (!string.Equals(now, shownDoc, StringComparison.OrdinalIgnoreCase))
+                {
+                    Trace("watch: active document is now " + (now ?? "(none)") + ", pane showed " + (shownDoc ?? "(none)"));
+                    RefreshDocument();
+                }
+            }
+            catch (Exception e) { Trace("watch failed: " + e.Message); }
+        }
+
+        /// <summary>A file is closing: nothing of it stays in the pane, and a job of it is no longer followed.</summary>
+        public void DocumentClosed(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            Trace("closed: " + path);
+            closedDocs[path] = DateTime.Now;
+            if (jobDoc != null && string.Equals(jobDoc, path, StringComparison.OrdinalIgnoreCase))
+            {
+                jobId = null;
+                jobFile = null;
+                jobDoc = null;
+                poll.Stop();
+            }
+            RefreshDocument();
+        }
+
+        /// <summary>A file was opened (again): it is shown when active.</summary>
+        public void DocumentOpened(string path)
+        {
+            if (!string.IsNullOrEmpty(path)) closedDocs.Remove(path);
+        }
+
+        /// <summary>The active document's file (its title while unsaved), or null.</summary>
+        private string DocPath()
+        {
+            var d = Doc;
+            if (d == null) return null;
+            string p = d.GetPathName();
+            return string.IsNullOrEmpty(p) ? d.GetTitle() : p;
+        }
+
+        /// <summary>The followed job has ended (job.json read directly; unreadable counts as not yet).</summary>
+        private bool JobFinished()
+        {
+            try
+            {
+                if (jobFile == null || !File.Exists(jobFile)) return true;
+                var j = Json.Parse(File.ReadAllText(jobFile, Encoding.UTF8)) as JObj;
+                string state = j == null ? null : (string)j["state"];
+                return state != null && state != "running" && state != "queued";
+            }
+            catch { return false; }
+        }
         private string StudyName { get { return studyBox.SelectedItem as string; } }
         private JObj Study
         {
@@ -316,11 +410,16 @@ namespace AsmFea.AddIn
         public void RefreshDocument()
         {
             var doc = Doc;
-            studyBox.Items.Clear();
+            // Nothing of the last document stays: its connections, problems, checks, results and log are
+            // cleared on every change, and filled again from this document's study, if it has one (found live:
+            // a part with no study showed the last assembly's results). A job still running for another
+            // document is followed, but shown only while its document is the active one (jobDoc).
+            ClearAll();
+            shownDoc = DocPath();
+            Trace("refresh: showing " + (shownDoc ?? "(no document)"));
             if (doc == null)
             {
-                // no assembly or part active (closed, or a drawing in front): nothing of the last one stays
-                ClearAll();
+                // no assembly or part active (closed, or a drawing in front)
                 asmLabel.Text = "Open an assembly or a part to set up a study.";
                 Enabled = true;
                 return;
@@ -348,8 +447,15 @@ namespace AsmFea.AddIn
                 caseBox.Items.Clear();
                 solveCase.Items.Clear();
                 plotCase.Items.Clear();
-                foreach (var tb in new[] { maxDefl, minFos, minBuck, bondTol }) tb.Text = "";
-                caseBuckling.Checked = convergence.Checked = fastLoads.Checked = false;
+                // every field back to blank or its default, as on a document with no study (the user's request)
+                foreach (var tb in new[] { maxDefl, minFos, minBuck, bondTol }) { tb.Text = ""; tb.BackColor = SystemColors.Window; }
+                caseBuckling.Checked = fastLoads.Checked = fullRun.Checked = false;
+                convergence.Checked = true;                       // the study default (mesh.convergence_check)
+                fidelity.SelectedItem = "standard";
+                bucklingModes.Value = 5;
+                bucklingModes.Enabled = minBuck.Enabled = true;
+                fastBanner.Visible = false;
+                asmLabel.Text = "";
                 progress.Style = ProgressBarStyle.Continuous;
                 progress.Value = 0;
                 Say("");
@@ -1051,6 +1157,7 @@ namespace AsmFea.AddIn
             // the same as Check only on the Run tab: export, then resolve (the list refills when it finishes)
             bar.Controls.Add(Btn("Analyse connections", () => Run("resolve")));
             bar.Controls.Add(exceptionsOnly);
+            bar.Controls.Add(Btn("Add hinge...", AddHinge));
             bar.Controls.Add(Btn("?", ExplainConnection));
             exceptionsOnly.CheckedChanged += (s, e) => LoadConnections();
             connList.DoubleClick += (s, e) => ExplainConnection();
@@ -1060,6 +1167,7 @@ namespace AsmFea.AddIn
             edit.Controls.Add(Btn("Fixed", () => SetConnection("tie", null, null)));
             edit.Controls.Add(Btn("Sliding with friction...", SetContact));
             edit.Controls.Add(Btn("Sliding joint...", SetSliding));
+            edit.Controls.Add(Btn("Sliding, no separation", () => SetConnection("slide", null, null)));
             edit.Controls.Add(Btn("Not connected (delete)", () => SetConnection("none", null, null)));
             edit.Controls.Add(Btn("Automatic", ClearConnection));
             connList.SelectedIndexChanged += (s, e) =>
@@ -1122,6 +1230,10 @@ namespace AsmFea.AddIn
             sb.AppendLine("  Fixed: the touching faces are bonded together and move as one. The usual choice for welded, glued or tightly clamped parts.");
             sb.AppendLine("  Sliding with friction: the faces press on each other and can slide once friction is overcome, or lift apart. Most realistic for parts resting on each other, but slower to solve; a part held only this way gets weak stabilising springs (stated in the report).");
             sb.AppendLine("  Sliding joint: the parts stay together but slide freely along one direction. Something else must stop the slide, or the model is a mechanism.");
+            sb.AppendLine("  Sliding, no separation: the faces stay in contact and slide freely over each other, without friction; they can neither part nor press into each other. The default for the touching faces of parts joined by a hinge.");
+            sb.AppendLine();
+            sb.AppendLine("Gear and rack and pinion mates couple the turning (or sliding) of two parts, each free on its own hinge or sliding joint, by the mate's ratio; the teeth themselves carry nothing. A screw mate makes a screw joint: turning advances the part by the lead. A profile center mate on round profiles, without Lock rotation, is a hinge about the faces' normal.");
+            sb.AppendLine("Hinges: a concentric mate between holes (or a pin's surface in a hole) of two parts is a hinge on that axis, and it has priority over the parts' touching faces, which slide without separating. With the mate's Lock rotation option the hinge is bonded. To add a hinge without a mate, select a hole or pin surface of it and click Add hinge: AsmFEA finds the concentric holes and pin surfaces of the other parts along that axis (select more if it should take faces it would not find). Tick Lock rotation to bond it. Setting a hinge you added to Not connected deletes it.");
             sb.AppendLine("  Not connected: no load passes through this interface.");
             sb.AppendLine("  Automatic: AsmFEA decides from the geometry and mates (the default).");
             sb.AppendLine();
@@ -1161,6 +1273,11 @@ namespace AsmFea.AddIn
                     var d = prms == null ? null : prms["direction"] as List<object>;
                     return "Sliding" + (d == null ? "" : " " + AxisName(d));
                 case "revolute": return "Pin";
+                case "hinge": return "Hinge";
+                case "slide": return "Sliding, no separation";
+                case "screw": return "Screw";
+                case "gear": return "Gear coupling";
+                case "rack_pinion": return "Rack & pinion";
                 case "bolted": return "Bolted";
                 case "none": return "Not connected";
                 default: return Humanise(type);
@@ -1178,6 +1295,8 @@ namespace AsmFea.AddIn
                 case "geometry": return (string)c["geometry"] == "line" ? "edge contact" : "touching faces";
                 case "sub-assembly": return "rigid sub-assembly";
                 case "override": return "your choice";
+                case "user": return "your hinge";
+                case "mates": return "mates";
                 case "weld": return "weld bead";
                 case "mate": return "mate";
                 default: return Fmt(c["source"]);
@@ -1202,6 +1321,9 @@ namespace AsmFea.AddIn
                 return "sliding joint" + (d == null ? "" : " along " + AxisName(d));
             }
             if (type == "none") return "not connected";
+            if (type == "hinge") return "hinge";
+            if (type == "slide") return "sliding, no separation";
+            if (type == "revolute") return "pin (revolute)";
             return type;
         }
 
@@ -1261,6 +1383,7 @@ namespace AsmFea.AddIn
             {
                 var row = new ConnRow { Parts = ((c["parts"] as List<object>) ?? new List<object>()).Cast<string>().ToList(), Interface = (string)c["id"], Connection = c };
                 string type = ShortType((string)c["type"], c["friction"], c["params"] as JObj);
+                if (c["locked"] is bool && (bool)c["locked"]) type += " (rotation locked)";
                 string source = FoundBy(c);
                 if ((string)c["source"] == "weld")
                 {
@@ -1312,6 +1435,19 @@ namespace AsmFea.AddIn
             if (row.Parts.Count != 2) { Say("That problem does not concern one pair of parts; select a connection between two parts.", true); return; }
             if (row.Connection != null && (string)row.Connection["source"] == "weld")
             { Say("That connection is a weld bead: edit or suppress the weld bead in SolidWorks.", true); return; }
+            string kind = row.Connection == null ? null : (string)row.Connection["type"];
+            if ((kind == "gear" || kind == "rack_pinion") && type != "none")
+            { Say("A gear or rack and pinion coupling can only be switched off (Not connected), or changed by its mate in SolidWorks.", true); return; }
+            if (type == "none" && row.Connection != null && (string)row.Connection["source"] == "user" && row.Connection["hinge"] != null)
+            {
+                // a hinge the user added: "not connected" deletes it
+                string hid = (string)row.Connection["hinge"];
+                StudyStore.List(st, "hinges").RemoveAll(o => o is JObj && (string)((JObj)o)["id"] == hid);
+                Changed();
+                LoadConnections();
+                Say("Hinge " + hid + " deleted. Click Analyse connections to update the list.");
+                return;
+            }
             var ovs = StudyStore.List(st, "overrides");
             ovs.RemoveAll(o => o is JObj && OverrideMatches((JObj)o, row));
             var ov = new JObj { { "id", "OV-" + (row.Interface ?? string.Join("-", row.Parts)) }, { "parts", row.Parts.Cast<object>().ToList() } };
@@ -1323,6 +1459,53 @@ namespace AsmFea.AddIn
             Changed();
             LoadConnections();
             Say("Connection set to " + Describe(type, friction, prms) + ". Run the study to use it.");
+        }
+
+        /// <summary>
+        /// A hinge on the concentric faces selected in SolidWorks (holes or pin surfaces in two or more parts),
+        /// optionally with rotation locked (bonded). Stored in the study; the pipeline checks the faces.
+        /// </summary>
+        private void AddHinge()
+        {
+            var st = Study;
+            if (st == null) { Say("Create a study first (New).", true); return; }
+            if (host.SelectedFaces(Doc).Count < 1)
+            {
+                MessageBox.Show(this, "Select a hole or pin surface of the hinge (one is enough: AsmFEA finds the concentric faces of the other parts), then click Add hinge again.",
+                                "AsmFEA", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            bool? locked = AskLockRotation();
+            if (locked == null) return;
+            try
+            {
+                var h = new JObj { { "id", StudyStore.NextId(st, "hinges", "HG") }, { "faces", FacesFromSelection(st) } };
+                if (locked.Value) h["lock_rotation"] = true;
+                StudyStore.List(st, "hinges").Add(h);
+                Changed();
+                Say("Hinge " + (string)h["id"] + " added" + (locked.Value ? ", rotation locked" : "") + ": analysing the connections to show it.");
+                Run("resolve");          // the list shows the last analysis: refresh it so the hinge appears
+            }
+            catch (Exception e) { Say(e.Message, true); }
+        }
+
+        /// <summary>The hinge dialog: a Lock rotation check box. Null when cancelled.</summary>
+        private bool? AskLockRotation()
+        {
+            using (var f = new Form { Text = "AsmFEA: Add hinge", Width = 380, Height = 170, FormBorderStyle = FormBorderStyle.FixedDialog,
+                                      StartPosition = FormStartPosition.CenterParent, MinimizeBox = false, MaximizeBox = false, ShowIcon = false })
+            {
+                f.Controls.Add(new Label { Text = "The parts turn about the axis of the selected faces.", Left = 10, Top = 10, Width = 350 });
+                var lockBox = new CheckBox { Text = "Lock rotation (bonded: the parts cannot turn)", Left = 10, Top = 40, Width = 350 };
+                f.Controls.Add(lockBox);
+                var ok = new Button { Text = "OK", DialogResult = DialogResult.OK, Left = 190, Top = 92 };
+                var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel, Left = 272, Top = 92 };
+                f.Controls.Add(ok);
+                f.Controls.Add(cancel);
+                f.AcceptButton = ok;
+                f.CancelButton = cancel;
+                return f.ShowDialog(this) == DialogResult.OK ? lockBox.Checked : (bool?)null;
+            }
         }
 
         private void ClearConnection()
@@ -1405,6 +1588,7 @@ namespace AsmFea.AddIn
                 if (err != null) { Say(err, true); return; }
                 jobId = (string)((JObj)r)["job_id"];
                 jobFile = Path.Combine(folder, "run", jobId, "job.json");
+                jobDoc = DocPath();
                 Say("Job " + jobId + " started.");
                 poll.Start();
             });
@@ -1425,6 +1609,12 @@ namespace AsmFea.AddIn
             // The job's file was fixed when it started: switching SolidWorks to a part or drawing window
             // must not stop the progress display (it froze for the rest of a run, found live).
             if (jobId == null || jobFile == null) { poll.Stop(); return; }
+            // another document in front: its pane is not this job's; the job is shown again on its return
+            if (!string.Equals(DocPath(), jobDoc, StringComparison.OrdinalIgnoreCase))
+            {
+                if (JobFinished()) { jobId = null; jobFile = null; poll.Stop(); }
+                return;
+            }
             try { PollJobFile(); }
             catch (Exception e) { Say("Progress display fault: " + e.Message, true); }
         }
@@ -1648,6 +1838,7 @@ namespace AsmFea.AddIn
                 if (err != null) { replotting = false; afterJob = null; Say(err, true); if (then != null) then(); return; }
                 jobId = (string)((JObj)r)["job_id"];
                 jobFile = Path.Combine(folder, "run", jobId, "job.json");
+                jobDoc = DocPath();
                 poll.Start();
             });
         }

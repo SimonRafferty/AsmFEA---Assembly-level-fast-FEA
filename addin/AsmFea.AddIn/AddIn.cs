@@ -15,8 +15,8 @@ using SolidWorks.Interop.swconst;
 using SolidWorks.Interop.swpublished;
 
 [assembly: AssemblyTitle("AsmFEA SolidWorks add-in")]
-[assembly: AssemblyVersion("0.3.0.0")]
-[assembly: AssemblyFileVersion("0.3.0.0")]
+[assembly: AssemblyVersion("0.4.0.0")]
+[assembly: AssemblyFileVersion("0.4.0.0")]
 
 namespace AsmFea.AddIn
 {
@@ -160,23 +160,30 @@ namespace AsmFea.AddIn
 
         private int OnDocumentLoad(string title, string path)
         {
+            try { pane?.DocumentOpened(path); } catch { }
             foreach (var d in ((object[])sw.GetDocuments() ?? new object[0]).OfType<IModelDoc2>())
                 if (string.Equals(d.GetPathName(), path, StringComparison.OrdinalIgnoreCase)) registry.Attach(d);
             return 0;
         }
 
         // Closing the last assembly fires no active-document change, so the pane kept showing it (found live).
-        // Refresh a moment after a close, once SolidWorks has dropped the document.
+        // The closing file is dropped from the pane at once (SolidWorks still reports it active at this point, so a
+        // plain refresh filled the pane again from it: found live), then refreshed twice more as SolidWorks lets go.
         private int OnFileClose(string fileName, int reason)
         {
+            StudyPane.Trace("FileCloseNotify: " + fileName + " (reason " + reason + ")");
             try
             {
                 if (pane == null || !pane.IsHandleCreated) return 0;
                 pane.BeginInvoke(new Action(() =>
                 {
-                    var t = new System.Windows.Forms.Timer { Interval = 400 };
-                    t.Tick += (s, e) => { t.Stop(); t.Dispose(); try { ShowArrow(null, null, null, false); pane.RefreshDocument(); } catch { } };
-                    t.Start();
+                    try { ShowArrow(null, null, null, false); pane.DocumentClosed(fileName); } catch { }
+                    foreach (int ms in new[] { 400, 1500 })
+                    {
+                        var t = new System.Windows.Forms.Timer { Interval = ms };
+                        t.Tick += (s, e) => { t.Stop(); t.Dispose(); try { pane.RefreshDocument(); } catch { } };
+                        t.Start();
+                    }
                 }));
             }
             catch { }
@@ -351,6 +358,18 @@ namespace AsmFea.AddIn
         // ------------------------------------------------------------------ IPaneHost
 
         /// <summary>The active assembly or part (a part is studied as an assembly of its bodies).</summary>
+        public bool IsOpen(string pathOrTitle)
+        {
+            if (string.IsNullOrEmpty(pathOrTitle) || sw == null) return false;
+            foreach (var d in ((object[])sw.GetDocuments() ?? new object[0]).OfType<IModelDoc2>())
+            {
+                string p = d.GetPathName();
+                if (string.Equals(string.IsNullOrEmpty(p) ? d.GetTitle() : p, pathOrTitle, StringComparison.OrdinalIgnoreCase)
+                    && d.Visible) return true;          // an invisible document is one SolidWorks keeps for an assembly
+            }
+            return false;
+        }
+
         public IModelDoc2 ActiveModel
         {
             get

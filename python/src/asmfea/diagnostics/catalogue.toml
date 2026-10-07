@@ -122,6 +122,14 @@ explain = "These parts have no path, through touching faces, mates or bolts, to 
 likely_causes = ["A gap between the parts and their neighbours larger than the bond tolerance.", "Duplicate or stray bodies left in a part.", "A connection set to 'none' by an override."]
 actions = ["Select the parts from this message and check how they meet their neighbours.", "Raise the bond tolerance on the Study tab if the gaps are intended to be bonded."]
 
+[PART_EXCLUDED_MECHANISM]
+severity = "warning"
+stage = "resolve"
+what = "The assembly is not fully constrained: {count} part(s) are free to move and are left out of the analysis: {parts} ({motions}). Loads on them, not carried: {loads}."
+explain = "These parts can move without straining anything, for example a part held only by a hinge that nothing stops turning. Under a load they would just move out of the way, so they carry nothing: they are left out so the rest of the model can be solved, and their loads and weight are not included. Click this message to select them in SolidWorks. If they should carry load, add a fixture, another connection, or lock the hinge's rotation."
+likely_causes = ["A part on a hinge (concentric mate) with nothing else holding it.", "A sliding joint with nothing stopping the slide.", "A connection set to 'none' or 'sliding, no separation' that was the part's only hold."]
+actions = ["Select the parts from this message and check how they should be held.", "Tick Lock rotation on the hinge (or the concentric mate) if the parts should not turn.", "Add a fixture or a connection that stops the named motion."]
+
 [LOAD_ON_FLOATING_PART]
 severity = "blocking"
 stage = "resolve"
@@ -305,6 +313,30 @@ what = "{parts} are mated as a {joint} joint ({why}) but no touching faces were 
 explain = "The mates describe a joint (a hinge or slide) between these parts, but the parts have no touching faces for the joint to act through. Check the parts actually meet (for example a pin in a hole of the same size)."
 likely_causes = ["The joint has clearance larger than the gap tolerance.", "The mated faces are not the load path."]
 actions = ["Close the clearance in SolidWorks or record a decision for this pair."]
+
+[HINGE_FACES_INVALID]
+severity = "blocking"
+stage = "resolve"
+what = "Hinge {hinge} cannot be made: {problem}."
+explain = "A hinge you add joins concentric cylindrical faces (holes, or a pin's surface) in two or more parts; each part turns about their common axis. The faces chosen for this hinge do not allow that, so it is left out until it is fixed."
+likely_causes = ["A flat face or an edge was picked with the holes.", "The holes are not on one axis.", "All the faces are on one part.", "A face has changed in SolidWorks since the hinge was added."]
+actions = ["Delete the hinge on the Connections tab and add it again, choosing only the concentric holes or pin surfaces in two or more parts."]
+
+[MATE_COUPLING_UNUSED]
+severity = "warning"
+stage = "resolve"
+what = "The {kind} mate {mate} is not used: AsmFEA needs {missing}."
+explain = "Gear and rack and pinion mates couple the turning (or sliding) of two parts, each of which must be free on its own joint: a hinge from a concentric mate for a gear or pinion, a sliding joint for a rack. This mate could not be used, so the parts it joins are not coupled: a part left free to turn is then left out of the analysis with a warning, and its teeth carry nothing."
+likely_causes = ["The mate was made on edges or faces the add-in could not trace.", "SolidWorks 2018 does not give add-ins the gear ratio or rack travel.", "The mate names a straight edge for a gear."]
+actions = ["Make the mate on the gears' cylindrical faces or circular edges.", "Lock the gear's hinge (Lock rotation on its concentric mate) if it should not turn."]
+
+[MATE_COUPLING_HELD]
+severity = "warning"
+stage = "resolve"
+what = "{held} cannot move, so the {mate} mate holds {part} as well: it is analysed locked."
+explain = "A gear or rack and pinion mate couples the turning (or sliding) of two parts. Here one of them has no free joint: it is bonded to its neighbours (AsmFEA bonds touching faces unless a mate or your choice frees them), so the coupling locks the other one too. In SolidWorks it may move, because SolidWorks only positions parts. If it should move, give it a joint: a sliding joint for a rack (Connections tab, Sliding joint, along the rack), or a hinge (a concentric mate) for a gear."
+likely_causes = ["A rack resting on a guide with only a coincident mate: its faces are bonded.", "A gear fixed to its shaft or held by a fixture."]
+actions = ["Set the held part's touching connection to a sliding joint along its travel, or give it a hinge.", "Leave it if the mechanism is meant to be locked in this analysis."]
 
 [FASTENER_NO_HOLES]
 severity = "warning"

@@ -56,6 +56,9 @@ namespace AsmFea.Extract
         }
 
         private readonly List<BodyEntry> bodies = new List<BodyEntry>();
+        // every component by its path in the top assembly ("Sub-1/Bar-1"): a sub-assembly's mates name its own
+        // components, which are found here under the sub-assembly's path (D52)
+        private Dictionary<string, IComponent2> compsByName = new Dictionary<string, IComponent2>();
         private readonly List<JObj> faceRefs = new List<JObj>();
         private readonly List<JObj> issues = new List<JObj>();
 
@@ -110,6 +113,7 @@ namespace AsmFea.Extract
                 asm.ResolveAllLightWeightComponents(false);
                 var comps = ((object[])asm.GetComponents(false) ?? new object[0]).Cast<IComponent2>()
                             .OrderBy(c => c.Name2, StringComparer.Ordinal).ToList();
+                compsByName = comps.GroupBy(c => c.Name2).ToDictionary(g => g.Key, g => g.First());
                 foreach (var comp in comps)
                 {
                     // one component's failure is reported and the rest still export
@@ -594,37 +598,66 @@ namespace AsmFea.Extract
 
         // ------------------------------------------------------------------ mates and faces
 
+        /// <summary>
+        /// The mates of the assembly and of every sub-assembly in it, at any depth: the parts of a sub-assembly
+        /// are analysed as if they were in the top level (D52, the user's choice; until then a sub-assembly was
+        /// rigid and its mates were not read). A sub-assembly's mates are read from its own document, so they name
+        /// its components; each is mapped to the component's path in the top assembly.
+        /// </summary>
         private List<JObj> Mates(IModelDoc2 doc)
         {
             var mates = new List<JObj>();
-            for (var feat = doc.FirstFeature() as IFeature; feat != null; feat = feat.GetNextFeature() as IFeature)
+            MatesOf(doc, doc, null, mates);
+            foreach (var c in compsByName.Values.OrderBy(c => c.Name2, StringComparer.Ordinal))
             {
-                if (feat.GetTypeName2() != "MateGroup") continue;
-                for (var sub = feat.GetFirstSubFeature() as IFeature; sub != null; sub = sub.GetNextSubFeature() as IFeature)
-                {
-                    stage = "mate " + sub.Name;
-                    try { CollectMate(doc, sub, mates); }
-                    catch (Exception e)
-                    {
-                        issues.Add(Issue("EXTRACT_ITEM_FAILED", null, new JObj {
-                            { "item", "mate " + sub.Name }, { "step", stage }, { "error", e.Message } }));
-                        log.Add("FAILED at " + stage + ": " + e.Message);
-                    }
-                }
+                if (c.IsSuppressed()) continue;
+                var sd = c.GetModelDoc2() as IModelDoc2;
+                if (sd != null && sd.GetType() == (int)swDocumentTypes_e.swDocASSEMBLY) MatesOf(doc, sd, c, mates);
             }
             return mates;
         }
 
-        private void CollectMate(IModelDoc2 doc, IFeature feat, List<JObj> mates)
+        /// <summary>The mates in one assembly document (`owner`), with `ctx` the sub-assembly's component in the
+        /// top assembly (null for the top assembly itself).</summary>
+        private void MatesOf(IModelDoc2 doc, IModelDoc2 owner, IComponent2 ctx, List<JObj> mates)
+        {
+            for (var feat = owner.FirstFeature() as IFeature; feat != null; feat = feat.GetNextFeature() as IFeature)
+            {
+                if (feat.GetTypeName2() != "MateGroup") continue;
+                for (var sub = feat.GetFirstSubFeature() as IFeature; sub != null; sub = sub.GetNextSubFeature() as IFeature)
+                {
+                    stage = "mate " + (ctx == null ? "" : ctx.Name2 + "/") + sub.Name;
+                    try { CollectMate(doc, sub, mates, ctx); }
+                    catch (Exception e)
+                    {
+                        issues.Add(Issue("EXTRACT_ITEM_FAILED", null, new JObj {
+                            { "item", stage }, { "step", stage }, { "error", e.Message } }));
+                        log.Add("FAILED at " + stage + ": " + e.Message);
+                    }
+                }
+            }
+        }
+
+        /// <summary>A mate entity's component in the top assembly: itself at the top level, else the sub-assembly's
+        /// component of that name under the sub-assembly's path (null when it is not exported).</summary>
+        private IComponent2 TopComponent(IComponent2 rc, IComponent2 ctx)
+        {
+            if (rc == null || ctx == null) return rc;
+            IComponent2 top;
+            return compsByName.TryGetValue(ctx.Name2 + "/" + rc.Name2, out top) ? top : null;
+        }
+
+        private void CollectMate(IModelDoc2 doc, IFeature feat, List<JObj> mates, IComponent2 ctx = null)
         {
             var mate = feat.GetSpecificFeature2() as IMate2;
             if (mate == null)
             {
                 // a mate folder: walk into it
                 for (var sub = feat.GetFirstSubFeature() as IFeature; sub != null; sub = sub.GetNextSubFeature() as IFeature)
-                    CollectMate(doc, sub, mates);
+                    CollectMate(doc, sub, mates, ctx);
                 return;
             }
+            string mateName = (ctx == null ? "" : ctx.Name2 + "/") + feat.Name;
             var supp = feat.IsSuppressed2((int)swInConfigurationOpts_e.swThisConfiguration, null) as Array;
             if (supp != null && supp.Length > 0 && Convert.ToBoolean(supp.GetValue(0))) return;
             string type = MateTypeName(mate.Type);
@@ -636,13 +669,14 @@ namespace AsmFea.Extract
                 var rc = mate.MateEntity(i).ReferenceComponent as IComponent2;
                 if (rc == null || rc.IsRoot())
                 {
-                    log.Add("mate " + feat.Name + " places a component on the assembly's own reference geometry: left out");
+                    log.Add("mate " + mateName + " places a component on the assembly's own reference geometry: left out");
                     return;
                 }
                 // a mate to a suppressed component joins nothing in this configuration (found live)
-                if (rc.IsSuppressed())
+                var top = TopComponent(rc, ctx);
+                if (rc.IsSuppressed() || top == null || top.IsSuppressed())
                 {
-                    log.Add("mate " + feat.Name + " involves suppressed " + rc.Name2 + ": left out");
+                    log.Add("mate " + mateName + " involves suppressed or missing " + rc.Name2 + ": left out");
                     return;
                 }
             }
@@ -652,10 +686,19 @@ namespace AsmFea.Extract
             for (int i = 0; i < mate.GetMateEntityCount(); i++)
             {
                 var me = mate.MateEntity(i);
-                var comp = me.ReferenceComponent as IComponent2;
+                var local = me.ReferenceComponent as IComponent2;      // in the mate's own assembly
+                var comp = TopComponent(local, ctx);                     // in the top assembly
+                var via = ctx == null ? null : local;                    // traces a sub-assembly's face in its context
                 string fid = null, owner = null;
                 if (comp != null && me.Reference is IFace2)
-                    fid = FaceRefFor(doc, comp, (IFace2)me.Reference, out owner);
+                    fid = FaceRefFor(doc, comp, (IFace2)me.Reference, out owner, via);
+                else if (comp != null && me.Reference is IEdge)
+                {
+                    // a circular edge (gear, screw, profile center, concentric): the face it bounds stands
+                    // for it, the cylinder for a turning mate, the flat face for a profile center
+                    var face = EdgeFace((IEdge)me.Reference, type == "profilecenter");
+                    if (face != null) fid = FaceRefFor(doc, comp, face, out owner, via);
+                }
                 if (fid != null)
                 {
                     entities.Add(fid);
@@ -669,7 +712,7 @@ namespace AsmFea.Extract
                     string who = own.Count == 1 ? own[0].Id : own.Count > 1 ? comp.Name2 : null;
                     if (own.Count == 1 && !partIds.Contains(who)) partIds.Add(who);
                     issues.Add(Issue("MATE_ENTITY_UNMATCHED", who == null ? null : new[] { who }, new JObj {
-                        { "mate", feat.Name }, { "entity", EntityLabel(me) } }));
+                        { "mate", mateName }, { "entity", EntityLabel(me) } }));
                 }
                 if (geom == null)
                 {
@@ -680,10 +723,100 @@ namespace AsmFea.Extract
                 }
             }
             if (partIds.Count == 0) return;
-            var o = new JObj { { "id", feat.Name }, { "type", type }, { "parts", partIds.Take(2).ToList() } };
+            var o = new JObj { { "id", mateName }, { "type", type }, { "parts", partIds.Take(2).ToList() } };
             if (entities.Count > 0) o["entities"] = entities;
             if (geom != null) foreach (var kv in geom) o[kv.Key] = kv.Value;
+            if ((type == "concentric" || type == "profilecenter") && ConcentricLocked(feat)) o["lock_rotation"] = true;
+            if (type == "profilecenter") o["profile"] = RoundProfile(mate) ? "round" : "other";
+            MateData(feat, type, o);
             mates.Add(o);
+        }
+
+        /// <summary>The face an edge entity stands for: of its two faces, a plane (flat) or a cylinder (turning).</summary>
+        private static IFace2 EdgeFace(IEdge edge, bool flat)
+        {
+            var faces = edge.GetTwoAdjacentFaces2() as object[];
+            if (faces == null) return null;
+            var all = faces.OfType<IFace2>().ToList();
+            foreach (var f in all)
+            {
+                var s = f.IGetSurface();
+                if (s != null && (flat ? s.IsPlane() : s.IsCylinder())) return f;
+            }
+            return all.FirstOrDefault();
+        }
+
+        /// <summary>A profile center mate on round profiles (circular edges, or faces bounded by one circle).</summary>
+        private static bool RoundProfile(IMate2 mate)
+        {
+            try
+            {
+                for (int i = 0; i < mate.GetMateEntityCount(); i++)
+                {
+                    object r = mate.MateEntity(i).Reference;
+                    if (r is IEdge && !((IEdge)r).IGetCurve().IsCircle()) return false;
+                    if (r is IFace2)
+                    {
+                        var loops = ((object[])((IFace2)r).GetLoops() ?? new object[0]).OfType<ILoop2>().Where(l => l.IsOuter()).ToList();
+                        if (loops.Count != 1) return false;
+                        var edges = ((object[])loops[0].GetEdges() ?? new object[0]).OfType<IEdge>().ToList();
+                        if (edges.Count == 0 || edges.Any(e => !e.IGetCurve().IsCircle())) return false;
+                    }
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Gear ratio, rack travel and screw lead (mm per revolution), and Reverse. Read by late binding: the
+        /// mate feature data interfaces are newer than the SolidWorks 2018 API this add-in is built on (D26).
+        /// In 2018 they cannot be read, and the resolver reports what is missing. Confirmed in SolidWorks 2026
+        /// (D51): the ratio, travel and lead read back as SolidWorks moves the parts.
+        /// </summary>
+        private static void MateData(IFeature feat, string type, JObj o)
+        {
+            if (type != "gear" && type != "rackpinion" && type != "screw") return;
+            try
+            {
+                object def = feat.GetDefinition();
+                if (def == null) return;
+                Func<string, object> get = n => def.GetType().InvokeMember(n, System.Reflection.BindingFlags.GetProperty, null, def, null);
+                if (Convert.ToBoolean(get("Reverse"))) o["reverse"] = true;
+                if (type == "gear")
+                    o["ratio"] = new List<object> { Convert.ToDouble(get("GearRatioNumerator")), Convert.ToDouble(get("GearRatioDenominator")) };
+                else if (type == "rackpinion")
+                {
+                    // swRackPinionMateDistanceOptions_e: 0 pinion pitch diameter, 1 rack travel per revolution (metres)
+                    double v = Convert.ToDouble(get("DiameterVal")) * 1000.0;
+                    o["distance_per_rev"] = Convert.ToInt32(get("DiameterType")) == 0 ? Math.PI * v : v;
+                }
+                else
+                {
+                    // swScrewMateDistanceOptions_e: 0 revolutions per mm (found live: not per metre, and not in the
+                    // document's units), 1 distance per revolution (metres)
+                    double v = Convert.ToDouble(get("RevolutionVal"));
+                    o["distance_per_rev"] = Convert.ToInt32(get("RevolutionType")) == 0 ? (v > 0 ? 1.0 / v : 0.0) : v * 1000.0;
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// A concentric mate's "Lock rotation" option. Read by late binding: ConcentricMateFeatureData is
+        /// newer than the SolidWorks 2018 API this add-in is compiled against (D26), so in 2018 the option
+        /// cannot be seen and the mate counts as a free hinge (LIVE-T: confirm in 2026).
+        /// </summary>
+        private static bool ConcentricLocked(IFeature feat)
+        {
+            try
+            {
+                object def = feat.GetDefinition();
+                if (def == null) return false;
+                object v = def.GetType().InvokeMember("LockRotation", System.Reflection.BindingFlags.GetProperty, null, def, null);
+                return v != null && Convert.ToBoolean(v);
+            }
+            catch { return false; }
         }
 
         /// <summary>"swMateCOINCIDENT" -> "coincident": the names the resolver expects.</summary>
@@ -738,13 +871,20 @@ namespace AsmFea.Extract
         /// to its part-document face (part frame) so the fingerprint is computed there and moved
         /// to the assembly frame with the component transform.
         /// </summary>
-        private string FaceRefFor(IModelDoc2 asmDoc, IComponent2 comp, IFace2 asmFace, out string owner)
+        /// <summary>
+        /// The face_ref id of an assembly face of `comp` (a component of the top assembly). `via`: the same
+        /// component as a sub-assembly's mate names it, when the face is in that sub-assembly's context: the face
+        /// is traced there, and its reference is made from the top assembly's face (D52).
+        /// </summary>
+        private string FaceRefFor(IModelDoc2 asmDoc, IComponent2 comp, IFace2 asmFace, out string owner, IComponent2 via = null)
         {
             owner = null;
-            var hit = Trace(comp, asmFace, bodies.Where(b => b.CompName == comp.Name2));
+            var hit = Trace(via ?? comp, asmFace, bodies.Where(b => b.CompName == comp.Name2));
             if (hit == null) return null;
             owner = hit.Item1.Id;
-            var fr = MakeFaceRef(asmDoc, hit.Item1, hit.Item2, asmFace, "F" + (faceRefs.Count + 1));
+            var topFace = via == null ? asmFace : comp.GetCorresponding(hit.Item2) as IFace2;
+            if (topFace == null) return null;
+            var fr = MakeFaceRef(asmDoc, hit.Item1, hit.Item2, topFace, "F" + (faceRefs.Count + 1));
             foreach (var old in faceRefs)
                 if ((string)old["part"] == owner && fr["persistent_ref"] != null && (string)old["persistent_ref"] == (string)fr["persistent_ref"])
                     return (string)old["id"];
