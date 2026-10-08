@@ -132,6 +132,8 @@ namespace AsmFea.AddIn
                        + "To make it act at a point off the faces (a lever arm, a torque), give that point's X, Y, Z distance from the faces' centre; 0, 0, 0 = on the faces." },
             { "Pressure", "A pressure in MPa pushing into the selected faces." },
             { "Gravity", "Self-weight of the whole assembly: the acceleration as X, Y, Z components in mm/s² (no faces needed)." },
+            { "Hydrostatic", "Fluid pressure on the selected faces, rising with depth below the top of the fluid: the fluid's density, "
+                           + "the pressure on its top, and where its top is (a point shown with a ball and triad, from the faces' centre)." },
             { "Analyse connections", "Export the model and find how the parts connect (the same as Check only on the Run tab). The list fills when it finishes." },
             { "Sliding with friction...", "Separating contact with a friction coefficient: the faces can slide when friction is overcome, and can lift apart. Slower to solve." },
             { "Sliding joint...", "The parts stay together but slide freely (no friction) along one direction you choose." },
@@ -160,6 +162,8 @@ namespace AsmFea.AddIn
             return c;
         }
         private List<JObj> shownDiagnostics = new List<JObj>();
+        // Run tab: warnings (and info notes) are hidden unless ticked, like a compiler's; what stops a run always shows
+        private readonly CheckBox showWarnings = new CheckBox { Text = "Show warnings", AutoSize = true, Padding = new Padding(8, 3, 0, 0) };
 
         public StudyPane(IPaneHost host)
         {
@@ -446,6 +450,8 @@ namespace AsmFea.AddIn
 
         public void RefreshDocument()
         {
+            // a load dialog open for the document shown before is cancelled: its study is no longer the pane's
+            if (openLoadDialog != null) openLoadDialog.Close();
             var doc = Doc;
             // Nothing of the last document stays: its connections, problems, checks, results and log are
             // cleared on every change, and filled again from this document's study, if it has one (found live:
@@ -479,6 +485,7 @@ namespace AsmFea.AddIn
                 connList.Items.Clear();
                 problems.Items.Clear();
                 shownDiagnostics = new List<JObj>();
+                showWarnings.Text = "Show warnings";
                 checksList.Items.Clear();
                 keyFigures.Text = logBox.Text = "";
                 caseBox.Items.Clear();
@@ -745,6 +752,9 @@ namespace AsmFea.AddIn
         {
             string type = (string)ld["type"];
             if (type == "pressure") return Fmt(ld["magnitude"]) + " MPa";
+            if (type == "hydrostatic")
+                return Fmt(ld["density"] ?? 1000.0) + " kg/m³, " + Fmt(ld["surface_pressure"] ?? 0.101325) + " MPa on top, top "
+                       + Fmt(ld["offset"] ?? new List<object> { 0.0, 0.0, 0.0 }) + " mm from the faces' centroid";
             var c = Components(ld);
             if (c == null) return Fmt(ld["magnitude"]);
             string unit = type == "gravity" ? " mm/s²" : " N";
@@ -900,6 +910,7 @@ namespace AsmFea.AddIn
             bar.Controls.Add(Btn("Force", () => AddLoad("force")));
             bar.Controls.Add(Btn("Pressure", () => AddLoad("pressure")));
             bar.Controls.Add(Btn("Gravity", () => AddLoad("gravity")));
+            bar.Controls.Add(Btn("Hydrostatic", () => AddLoad("hydrostatic")));
             var delete = Btn("Delete", DeleteLoad);
             delete.Margin = new Padding(18, delete.Margin.Top, delete.Margin.Right, delete.Margin.Bottom);   // a gap: harder to hit by accident
             bar.Controls.Add(delete);
@@ -951,26 +962,67 @@ namespace AsmFea.AddIn
             catch (Exception e) { Say(e.Message, true); }
         }
 
+        private LoadDialog openLoadDialog;     // the load dialog open beside SolidWorks, if any
+
+        /// <summary>
+        /// The load dialog, beside SolidWorks rather than in front of it (modeless): the model can be turned and
+        /// zoomed while it is open, and the load's arrow (with the ball and triad of a remote force or of the top
+        /// of a fluid) is drawn before anything is typed and follows the values as they change (the user's
+        /// request). The pane's tabs are greyed out meanwhile, so nothing else changes the study.
+        /// </summary>
+        private void OpenLoadDialog(JObj st, JObj draft, JObj existing, Action<LoadDialog> onOk, Action onCancel)
+        {
+            if (openLoadDialog != null) { openLoadDialog.Activate(); Say("Finish the load dialog that is open first.", true); return; }
+            var dlg = new LoadDialog((string)draft["type"], (string)draft["load_case"], existing) { Draft = draft };
+            dlg.Preview = shown =>
+            {
+                try { ShowLoadArrow(st, shown, true); }
+                catch (Exception e) { Trace("preview failed: " + e.Message); }
+            };
+            openLoadDialog = dlg;
+            tabs.Enabled = false;
+            dlg.FormClosed += (s, e) =>
+            {
+                openLoadDialog = null;
+                tabs.Enabled = true;
+                try
+                {
+                    if (dlg.Accepted) onOk(dlg);
+                    else onCancel?.Invoke();
+                }
+                catch (Exception ex) { Say(ex.Message, true); }
+                dlg.Dispose();
+            };
+            dlg.Show(this);
+        }
+
         private void AddLoad(string type)
         {
             var st = Study;
             if (st == null) { Say("Create a study first (New).", true); return; }
             if (type != "gravity" && !FacesSelected()) return;
             string lc = CurrentCaseName ?? Cases(st)[0];
-            using (var dlg = new LoadDialog(type, lc, null))
+            try
             {
-                if (dlg.ShowDialog(this) != DialogResult.OK) return;
-                try
+                // the faces are taken now, so the arrow can be drawn on them while the values are typed
+                var draft = new JObj { { "id", "(new)" }, { "load_case", lc }, { "type", type } };
+                if (type != "gravity") draft["faces"] = FacesFromSelection(st);
+                OpenLoadDialog(st, draft, null, dlg =>
                 {
                     var ld = new JObj { { "id", StudyStore.NextId(st, "loads", "LD") }, { "load_case", lc }, { "type", type } };
-                    if (type != "gravity") ld["faces"] = FacesFromSelection(st);
+                    if (draft["faces"] != null) ld["faces"] = draft["faces"];
                     dlg.WriteTo(ld);
                     StudyStore.List(st, "loads").Add(ld);
                     Changed();
                     Reselect((string)ld["id"]);
-                }
-                catch (Exception e) { Say(e.Message, true); }
+                }, () =>
+                {
+                    StudyStore.Prune(st);                       // the face refs taken for the cancelled load
+                    host.ShowArrow(Doc, null, null, false);
+                    Say("");
+                });
             }
+            catch (Exception e) { Say(e.Message, true); }
         }
 
         /// <summary>Double-click: edit the selected load (values, case) or fixture (type, held directions); the faces stay.</summary>
@@ -992,11 +1044,14 @@ namespace AsmFea.AddIn
                 }
                 else
                 {
-                    using (var dlg = new LoadDialog((string)item["type"], (string)item["load_case"], item))
+                    var draft = (JObj)Json.Parse(Json.Write(item));
+                    OpenLoadDialog(st, draft, item, dlg =>
                     {
-                        if (dlg.ShowDialog(this) != DialogResult.OK) return;
                         dlg.WriteTo(item);
-                    }
+                        Changed();
+                        Reselect((string)item["id"]);
+                    }, () => ShowLoadArrow(st, item, true));            // back to the load as it was
+                    return;
                 }
                 Changed();
                 Reselect((string)item["id"]);
@@ -1125,8 +1180,9 @@ namespace AsmFea.AddIn
                 }
                 var c = sum * (1.0 / area);
                 tip = c.ToArray();
-                if (type == "remote_force")
+                if (type == "remote_force" || type == "hydrostatic")
                 {
+                    // a remote force's point, or the top of the fluid: a ball and triad there
                     var p = item["point"] != null ? V(item["point"]) : c + (item["offset"] != null ? V(item["offset"]) : new Vec3(0, 0, 0));
                     markTip = true;
                     tip = p.ToArray();
@@ -1138,6 +1194,8 @@ namespace AsmFea.AddIn
                 double m = Convert.ToDouble(item["magnitude"] ?? 1.0, CultureInfo.InvariantCulture);
                 dir = pushIn * Math.Sign(m);                  // a negative pressure pulls the faces out
             }
+            else if (type == "hydrostatic")
+                dir = item["direction"] != null ? V(item["direction"]) : new Vec3(0, -1, 0);   // the fluid's down, from its top
             else
             {
                 var comp = Components(item);
@@ -1565,10 +1623,13 @@ namespace AsmFea.AddIn
                            Btn("Cancel", CancelJob));
             var files = Row(Caption("Model files:"), Btn("Export", () => Export()),
                             Btn("Open folder", () => { if (Doc != null && StudyName != null) OpenPath(host.StudyFolder(Doc, StudyName)); }));
-            var probBar = Row(Caption("Problems", true),
+            var probBar = Row(Caption("Problems", true), showWarnings,
                               Btn("More Info", () => { if (problems.SelectedItems.Count > 0) ShowHelp((JObj)problems.SelectedItems[0].Tag); else Say("Select a problem first.", true); }));
             problems.DoubleClick += (s, e) => { if (problems.SelectedItems.Count > 0) ShowHelp((JObj)problems.SelectedItems[0].Tag); };
             problems.SelectedIndexChanged += (s, e) => HighlightProblem();
+            showWarnings.CheckedChanged += (s, e) => FillProblems();
+            tips.SetToolTip(showWarnings, "List the warnings too. Problems that stop a run always show; warnings are often noise "
+                                        + "(things AsmFEA handled itself) but sometimes worth a look.");
             var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 120 };
             split.Panel1.Controls.Add(problems);
             split.Panel2.Controls.Add(logBox);
@@ -1590,6 +1651,22 @@ namespace AsmFea.AddIn
                 return true;
             }
             catch (Exception e) { Say("Export failed: " + e.Message, true); return false; }
+        }
+
+        /// <summary>The problems list from the job's diagnostics: what stops a run always, warnings and info notes
+        /// only with Show warnings ticked; the tick box counts what it hides.</summary>
+        private void FillProblems()
+        {
+            problems.Items.Clear();
+            int hidden = 0;
+            foreach (var d in shownDiagnostics)
+            {
+                if (!showWarnings.Checked && (string)d["severity"] != "blocking") { hidden++; continue; }
+                problems.Items.Add(new ListViewItem(new[] { (string)d["severity"], (string)d["code"], (string)d["what"] }) { Tag = d });
+            }
+            int warnings = shownDiagnostics.Count(d => (string)d["severity"] != "blocking");
+            showWarnings.Text = warnings > 0 ? "Show warnings (" + warnings + ")" : "Show warnings";
+            Fit(problems);
         }
 
         private void Run(string stages, bool fast = false)
@@ -1668,10 +1745,7 @@ namespace AsmFea.AddIn
             if (diags.Count != shownDiagnostics.Count)
             {
                 shownDiagnostics = diags;
-                problems.Items.Clear();
-                foreach (var d in diags)
-                    problems.Items.Add(new ListViewItem(new[] { (string)d["severity"], (string)d["code"], (string)d["what"] }) { Tag = d });
-                Fit(problems);
+                FillProblems();
             }
             if (state != "running" && state != "queued")
             {
@@ -2163,6 +2237,12 @@ namespace AsmFea.AddIn
         private readonly string type;
         private readonly TextBox magnitude = new TextBox { Width = 80 };
         private readonly TextBox[] comp = Boxes(), offset = Boxes();
+        private readonly TextBox density = new TextBox { Width = 80 }, surface = new TextBox { Width = 80 };
+        // the live preview: the pane draws the load (Draft, its faces, with the values typed) a moment after a change
+        public JObj Draft;
+        public Action<JObj> Preview;
+        public bool Accepted { get; private set; }
+        private readonly Timer previewTimer = new Timer { Interval = 250 };
         private readonly Label resultant = new Label { AutoSize = true, Padding = new Padding(0, 6, 0, 0) };
         private readonly ToolTip tips = new ToolTip { AutoPopDelay = 20000, InitialDelay = 400 };
 
@@ -2223,6 +2303,14 @@ namespace AsmFea.AddIn
             var off = existing == null ? null : Vec(existing["offset"]);
             for (int i = 0; i < 3; i++) offset[i].Text = G(off == null ? 0 : off[i]);
             magnitude.Text = existing != null ? G(m) : "0.1";
+            if (type == "hydrostatic")
+            {
+                // down, defaulting to -Y (SolidWorks' up is +Y); density of water; 1 atmosphere on top
+                var down = d ?? new List<double> { 0, -1, 0 };
+                for (int i = 0; i < 3; i++) comp[i].Text = G(down[i]);
+                density.Text = G(existing?["density"] == null ? 1000.0 : Convert.ToDouble(existing["density"], CultureInfo.InvariantCulture));
+                surface.Text = G(existing?["surface_pressure"] == null ? 0.101325 : Convert.ToDouble(existing["surface_pressure"], CultureInfo.InvariantCulture));
+            }
 
             var t = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Location = new Point(0, 0), Padding = new Padding(6) };
             Action<string, Control> add = (label, c) =>
@@ -2234,6 +2322,20 @@ namespace AsmFea.AddIn
             {
                 add("Pressure, MPa", magnitude);
                 tips.SetToolTip(magnitude, "Positive pushes into the faces; negative pulls them out.");
+            }
+            else if (type == "hydrostatic")
+            {
+                add("Fluid density, kg/m³", density);
+                add("Pressure on top of the fluid, MPa (absolute)", surface);
+                add("Top of the fluid, mm from the faces' centre", Xyz(offset));
+                add("Down (the fluid's gravity), X Y Z", Xyz(comp));
+                tips.SetToolTip(density, "The fluid's density: water 1000, sea water 1025, hydraulic oil about 870, diesel about 840 kg/m³.");
+                tips.SetToolTip(surface, "Absolute pressure on the fluid's surface: 0.101325 MPa (1 atmosphere) for an open tank. "
+                                       + "1 atmosphere is taken to act outside, so only the difference loads the faces.");
+                foreach (var b in offset)
+                    tips.SetToolTip(b, "Where the top of the fluid is: X, Y, Z distances (assembly axes) from the area-weighted centre of the selected faces. "
+                                     + "It shows on the model as a ball and triad. Faces below it carry the fluid's pressure; faces above it, only the pressure on top.");
+                foreach (var b in comp) tips.SetToolTip(b, "The direction gravity pulls the fluid (assembly axes): 0, -1, 0 when SolidWorks' up is +Y.");
             }
             else
             {
@@ -2259,9 +2361,18 @@ namespace AsmFea.AddIn
             }
 
             var buttons = new FlowLayoutPanel { AutoSize = true };
-            var ok = new Button { Text = "OK", DialogResult = DialogResult.None };
-            var cancel = new Button { Text = "Cancel", DialogResult = DialogResult.Cancel };
-            ok.Click += (s, e) => { if (Check()) DialogResult = DialogResult.OK; };
+            var ok = new Button { Text = "OK" };
+            var cancel = new Button { Text = "Cancel" };
+            // shown beside SolidWorks (modeless), so the buttons close it themselves
+            ok.Click += (s, e) => { if (Check()) { Accepted = true; Close(); } };
+            cancel.Click += (s, e) => Close();
+            ShowInTaskbar = false;
+            TopMost = true;                                             // stays in view while the model is turned
+            previewTimer.Tick += (s, e) => { previewTimer.Stop(); FirePreview(); };
+            foreach (var b in comp.Concat(offset).Concat(new[] { magnitude, density, surface }))
+                b.TextChanged += (s, e) => { previewTimer.Stop(); previewTimer.Start(); };
+            Shown += (s, e) => FirePreview();                           // drawn before anything is typed
+            FormClosed += (s, e) => previewTimer.Dispose();
             buttons.Controls.Add(ok);
             buttons.Controls.Add(cancel);
             add("", buttons);
@@ -2278,13 +2389,40 @@ namespace AsmFea.AddIn
             resultant.Text = v == null ? "(not a number)" : G(Math.Sqrt(v.Sum(x => x * x))) + " " + unit;
         }
 
+        /// <summary>Draw the load as typed so far (nothing while a value is not yet a valid number).</summary>
+        private void FirePreview()
+        {
+            if (Preview == null || Draft == null || Problem() != null) return;
+            var shown = (JObj)Json.Parse(Json.Write(Draft));
+            WriteTo(shown);
+            Preview(shown);
+        }
+
         private bool Check()
+        {
+            string problem = Problem();
+            if (problem != null) MessageBox.Show(this, problem, "AsmFEA");
+            return problem == null;
+        }
+
+        /// <summary>What is wrong with the values, or null.</summary>
+        private string Problem()
         {
             string problem = null;
             if (type == "pressure")
             {
                 var p = Parse(magnitude.Text);
                 if (p == null || p == 0) problem = "Give a non-zero pressure.";
+            }
+            else if (type == "hydrostatic")
+            {
+                var rho = Parse(density.Text);
+                var ps = Parse(surface.Text);
+                var down = Read(comp);
+                if (rho == null || rho <= 0) problem = "Give the fluid's density, more than zero (kg/m³).";
+                else if (ps == null || ps < 0) problem = "Give the absolute pressure on top of the fluid, zero or more (MPa).";
+                else if (Read(offset) == null) problem = "Each distance to the top of the fluid must be a number (blank counts as zero).";
+                else if (down == null || Math.Sqrt(down.Sum(x => x * x)) == 0) problem = "Give the down direction (not all zero).";
             }
             else
             {
@@ -2293,8 +2431,7 @@ namespace AsmFea.AddIn
                 else if (Math.Sqrt(v.Sum(x => x * x)) == 0) problem = "At least one component must be non-zero.";
                 else if ((type == "force" || type == "remote_force") && Read(offset) == null) problem = "Each distance must be a number (blank counts as zero).";
             }
-            if (problem != null) MessageBox.Show(this, problem, "AsmFEA");
-            return problem == null;
+            return problem;
         }
 
         /// <summary>Store the values in the load: magnitude = the resultant, direction = its unit vector.</summary>
@@ -2304,6 +2441,18 @@ namespace AsmFea.AddIn
             {
                 ld["magnitude"] = Parse(magnitude.Text).Value;
                 ld.Remove("direction");
+                return;
+            }
+            if (type == "hydrostatic")
+            {
+                var down = Read(comp);
+                double len = Math.Sqrt(down.Sum(x => x * x));
+                ld["magnitude"] = 1.0;                                    // a load factor: the load is as defined
+                ld["direction"] = down.Select(x => (object)(x / len)).ToList();
+                ld["density"] = Parse(density.Text).Value;
+                ld["surface_pressure"] = Parse(surface.Text).Value;
+                ld["offset"] = Read(offset).Select(x => (object)x).ToList();
+                ld.Remove("point");
                 return;
             }
             var v = Read(comp);

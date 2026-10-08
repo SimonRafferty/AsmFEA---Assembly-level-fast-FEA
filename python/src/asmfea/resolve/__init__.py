@@ -95,11 +95,9 @@ def resolve(model: Model, geoms: dict, face_map: dict) -> tuple[list[dict], list
     interfaces, near, lines = find_interfaces(geoms, model.study.bond_tolerance)
     conns, removed, diags = classify(model, geoms, interfaces, lines, face_map)
     diags += apply_welds(model, conns, removed)
-    touching = {tuple(sorted(c["parts"][:2])) for c in conns}
-    for nm in near:
-        if tuple(sorted(nm["parts"])) not in touching:
-            diags.append(make("NEAR_MISS", where={"parts": nm["parts"]}, parts=" and ".join(nm["parts"]),
-                              gap=nm["gap"], evidence={"gap": nm["gap"], "area": nm["area"], "normal": nm["normal"]}))
+    # Faces just beyond the bond tolerance are not reported (NEAR_MISS removed, the user's choice 2026-10-08):
+    # the tolerance is the user's decision on which gaps are joined. A part left with no connection at all is
+    # still reported (PART_FLOATING, PART_EXCLUDED_DISCONNECTED).
     # solids overlapping within the bond tolerance were bonded across the overlap on purpose
     overlapped = {tuple(sorted(c["parts"][:2])) for c in conns if c["type"] == "tie" and c.get("gap", 0.0) < 0}
     for itf in find_interferences({k: v for k, v in geoms.items() if k not in removed}):

@@ -22,7 +22,9 @@ Rules (PLAN.md, Connection resolver, classification table), applied per part pai
 | concentric + coincident, or hinge                 | revolute                    |
 | slot, width or slider mate                        | sliding                     |
 | fastener through coaxial holes in >= 2 parts      | bolted (fastener removed, clamped faces tied) |
-| distance / angle / limit mate, or to ref geometry | none; exception if touching |
+| distance / angle mate                             | positions only: touching faces bonded (D55) |
+| limit distance / angle mate, or to ref geometry   | none; exception if touching |
+| concentric hole mate the parts cannot turn about  | bonded: no hinge (checked on all mates, D55) |
 | line or point contact only                        | none; always an exception   |
 
 User overrides always win.
@@ -42,7 +44,14 @@ COUPLING_MATES = {"gear", "rackpinion"}
 COUPLINGS = ("gear", "rack_pinion")
 TURNING = ("hinge", "revolute", "screw")   # joints whose free coordinate is a turn (found live: a gear on a screw)
 SLIDING_MATES = {"slot", "width", "slider"}
-FREE_MATES = {"distance", "angle", "limit", "limitdistance", "limitangle"}
+FREE_MATES = {"limit", "limitdistance", "limitangle"}   # and distance / angle mates with limits (free_mate)
+POSITIONING_MATES = {"distance", "angle"}                 # without limits they only place a part (D55)
+
+
+def free_mate(m) -> bool:
+    """A mate that lets its parts move: a limit mate, or a distance or angle mate with limits set."""
+    t = m.type.lower()
+    return t in FREE_MATES or (t in POSITIONING_MATES and m.limits is not None)
 
 
 def _pair(a, b):
@@ -68,7 +77,7 @@ def _sw_axis(model: Model, entity: str, fallback) -> np.ndarray:
     return a / np.linalg.norm(a)
 
 
-def hinges_from_mates(model: Model, geoms, face_map: dict, clamped: dict) -> list[dict]:
+def hinges_from_mates(model: Model, geoms, face_map: dict, clamped: dict, locked_holes=None) -> list[dict]:
     """A concentric mate between cylindrical faces of two parts (hole to hole, or a pin's surface in a hole)
     is a hinge there: its own connection on that axis, joining the two cylindrical faces, free to turn about
     the axis. It is a type of its own, distinct from the revolute joint that concentric + coincident mates
@@ -77,6 +86,7 @@ def hinges_from_mates(model: Model, geoms, face_map: dict, clamped: dict) -> lis
     centre, so neither hole was used; the user asked for SimSolid's behaviour, where the hinge has priority
     and the touching faces slide without separating."""
     pins = []
+    locked_holes = set() if locked_holes is None else locked_holes   # concentric hole mates found bonded (D55)
     # the faces of the user's hinges, by face (the study's face_ref ids differ from the mates' ids)
     taken = {tuple(face_map[fid]) for h in model.hinges for fid in h.faces if fid in face_map}
     for m in model.mates:
@@ -99,6 +109,10 @@ def hinges_from_mates(model: Model, geoms, face_map: dict, clamped: dict) -> lis
             continue
         (pa, fa, ea), (pb, fb, eb) = sides
         kinds = " to ".join("pin surface" if f.convex else "hole" for f in (fa, fb))
+        if m.type.lower() == "concentric" and not m.lock_rotation and not free_to_turn(model, m, fa, pa, pb):
+            # the parts cannot turn about these holes for the assembly's other mates (D55): bonded, no hinge
+            locked_holes.add(m.id)
+            continue
         if m.type.lower() == "screw":
             if not m.distance_per_rev:
                 continue                           # the lead is unknown (SolidWorks 2018): left to the mates
@@ -421,9 +435,97 @@ def lock_loose_pins(hinges: list[dict], conns: list[dict]) -> None:
         done.add(hs[0]["id"])
 
 
+def _mate_rows(model, mate, ix: dict, ncol: int, scale: float) -> list:
+    """Constraint rows of one mate on the parts' rigid motions (6 per part: velocity at the origin, then
+    rotation x scale), relative motion of its second part against its first. Mates that do not fix a
+    relative motion this simple model can describe give none."""
+    if len(mate.parts) != 2 or mate.parts[0] not in ix or mate.parts[1] not in ix:
+        return []
+    i, j = ix[mate.parts[0]], ix[mate.parts[1]]
+    fps = [model.face_ref(e).fingerprint for e in mate.entities if model.face_ref(e) is not None
+           and model.face_ref(e).fingerprint is not None]
+    t = mate.type.lower()
+
+    def row(lin, ang):
+        r = np.zeros(ncol)
+        lin, ang = np.asarray(lin, float), np.asarray(ang, float) / scale
+        r[6 * j:6 * j + 3], r[6 * j + 3:6 * j + 6] = lin, ang
+        r[6 * i:6 * i + 3], r[6 * i + 3:6 * i + 6] = -lin, -ang
+        n = np.linalg.norm(r)
+        return r / n if n > 0 else None
+
+    def perp(n):
+        return np.linalg.svd(np.asarray(n, float)[None])[2][1:]
+
+    rows = []
+    if t == "lock":
+        for e in np.eye(3):
+            rows += [row(e, np.zeros(3)), row(np.zeros(3), e)]
+    elif t in ("coincident", "distance") and len(fps) == 2 and all(f.surface == "plane" and f.normal for f in fps):
+        if t == "distance" and mate.limits is not None:
+            return []
+        n = np.asarray(fps[0].normal, float)
+        p = np.asarray(fps[0].centroid, float)
+        rows.append(row(n, np.cross(p, n)))
+        rows += [row(np.zeros(3), e) for e in perp(n)]
+    elif t == "parallel" and len(fps) == 2 and all(f.normal or f.axis for f in fps):
+        rows += [row(np.zeros(3), e) for e in perp(fps[0].normal or fps[0].axis)]
+    elif t in ("perpendicular", "angle") and len(fps) == 2 and all(f.normal or f.axis for f in fps):
+        if t == "angle" and mate.limits is not None:
+            return []
+        n1, n2 = (np.asarray(f.normal or f.axis, float) for f in fps)
+        k = np.cross(n2, n1)
+        if np.linalg.norm(k) > 1e-9:
+            rows.append(row(np.zeros(3), k / np.linalg.norm(k)))
+    elif t == "concentric" and len(fps) == 2 and all(f.surface == "cylinder" and f.axis for f in fps):
+        a = np.asarray(fps[0].axis, float)
+        a /= np.linalg.norm(a)
+        p = np.asarray(fps[0].centroid, float)
+        rows += [row(e, np.cross(p, e)) for e in perp(a)] + [row(np.zeros(3), e) for e in perp(a)]
+    return [r for r in rows if r is not None]
+
+
+def free_to_turn(model, mate, face, pa: str, pb: str) -> bool:
+    """Can the two parts of a concentric hole mate turn relative to each other about its axis, for all the
+    assembly's mates? Parts are rigid; parts fixed in SolidWorks are held; the other concentric and hinge mates
+    (pins) are left out, so two pins between the same parts stay hinges (the user's choice, D55: a part free to
+    turn about a hole is hinged there, one held by other mates is bonded)."""
+    parts = sorted({p for m in model.mates for p in m.parts} | {pa, pb})
+    ix = {p: k for k, p in enumerate(parts)}
+    ncol = 6 * len(parts)
+    lo = [np.asarray(model.part(p).body.bbox_min) for p in parts if model.part(p) and model.part(p).body]
+    hi = [np.asarray(model.part(p).body.bbox_max) for p in parts if model.part(p) and model.part(p).body]
+    scale = float(np.linalg.norm(np.max(hi, axis=0) - np.min(lo, axis=0))) if lo else 1000.0
+    rows = []
+    for m in model.mates:
+        t = m.type.lower()
+        if m.id != mate.id and t in ("concentric", "hinge", "screw"):
+            continue                                 # the other pins
+        rows += _mate_rows(model, m, ix, ncol, scale)
+    for p in parts:
+        if model.part(p) is not None and model.part(p).fixed:
+            for k in range(6):
+                r = np.zeros(ncol)
+                r[6 * ix[p] + k] = 1.0
+                rows.append(r)
+    a = np.asarray(face.axis, float)
+    a /= np.linalg.norm(a)
+    s = np.zeros(ncol)
+    s[6 * ix[pb] + 3:6 * ix[pb] + 6], s[6 * ix[pa] + 3:6 * ix[pa] + 6] = a, -a
+    if not rows:
+        return True
+    C = np.asarray(rows)
+    _, sv, vt = np.linalg.svd(C, full_matrices=True)
+    rank = int(np.sum(sv > 1e-9 * sv[0]))
+    null = vt[rank:]
+    return bool(len(null)) and float(np.linalg.norm(null @ s)) > 1e-6 * np.linalg.norm(s)
+
+
 def joint_from_mates(mates) -> tuple[str | None, str]:
     """(joint type or None, evidence text) for the mates between one part pair."""
-    types = {m.type.lower() for m in mates}
+    types = {m.type.lower() for m in mates if not (m.type.lower() in POSITIONING_MATES and m.limits is None)}
+    if any(free_mate(m) for m in mates):
+        types.add("limit")
     if "lock" in types:
         return "tie", "lock mate"
     if types & REVOLUTE_MATES or {"concentric", "coincident"} <= types:
@@ -431,7 +533,7 @@ def joint_from_mates(mates) -> tuple[str | None, str]:
     if types & SLIDING_MATES:
         return "sliding", f"{sorted(types & SLIDING_MATES)[0]} mate"
     if types & FREE_MATES or any(m.geometry == "reference" for m in mates):
-        return "none", "distance/angle/limit mate or mate to reference geometry"
+        return "none", "limit mate (distance or angle with limits) or mate to reference geometry"
     return None, ""
 
 
@@ -510,9 +612,10 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
     # hinges from concentric mates on cylinders; those mates then no longer decide the touching faces' type
     chosen, hdiags = hinges_from_selection(model, geoms, face_map or {}, removed)
     diags += hdiags
-    pins = [p for p in chosen + hinges_from_mates(model, geoms, face_map or {}, clamped)
+    locked_holes: set = set()
+    pins = [p for p in chosen + hinges_from_mates(model, geoms, face_map or {}, clamped, locked_holes)
             if not set(p["parts"]) & set(removed)]
-    mates = mate_index(model, skip={m for p in pins for m in p["evidence"]["mates"]})
+    mates = mate_index(model, skip={m for p in pins for m in p["evidence"]["mates"]} | locked_holes)
     hinged = {_pair(*p["parts"]) for p in pins}
     # a face that is part of a hinge belongs to it: touching interfaces on it are left to the hinge
     hinge_faces = {(s["part"], s["face"]) for p in pins for s in p["sides"]}
@@ -520,7 +623,7 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
     # apart along its axis, so the mate does not disconnect the hinged parts' touching faces
     for pair in hinged:
         if pair in mates:
-            mates[pair] = [m for m in mates[pair] if m.type.lower() not in FREE_MATES]
+            mates[pair] = [m for m in mates[pair] if not free_mate(m)]
 
     # Parts of sub-assemblies are analysed as if they were in the top level: the add-in reads every
     # sub-assembly's mates (D52, the user's choice; sub-assemblies were rigid until then)
@@ -598,7 +701,38 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
     diags += couplings_from_mates(model, geoms, face_map or {}, conns, removed)
     _apply_overrides(model, [c for c in conns if c["type"] in COUPLINGS], diags)
     _preloaded_bolts(conns)
+    _hide_incidental_lines(conns, diags)
     return conns, sorted(removed), diags
+
+
+def _hide_incidental_lines(conns: list[dict], diags: list[Diagnostic]) -> None:
+    """Edge contacts between parts that are already joined through the structure (any chain of other
+    connections) are incidental: a bend or flange edge resting on a neighbour that the load reaches anyway. They
+    are dropped with their LINE_CONTACT warning (the user's choice, 2026-10-08: the water tank listed 985, all
+    between parts already bonded through the foam strips and flanges). An edge contact that is the only link
+    between two groups of parts is kept: it may be the load path, and the user decides."""
+    parent: dict[str, str] = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for c in conns:
+        if c["type"] != "none":                     # any connection that carries load joins its parts
+            ps = c["parts"]
+            for q in ps[1:]:
+                parent[find(ps[0])] = find(q)
+    hidden = set()
+    for c in conns:
+        if c["type"] == "none" and c.get("geometry") == "line" and len(c["parts"]) >= 2 and c.get("source") != "override":
+            if find(c["parts"][0]) == find(c["parts"][1]):
+                hidden.add(c["id"])
+    if hidden:
+        conns[:] = [c for c in conns if c["id"] not in hidden]
+        diags[:] = [d for d in diags if not (d.code == "LINE_CONTACT" and set(d.where.connections) <= hidden)]
 
 
 def in_one_weldment(a: str, b: str) -> bool:

@@ -213,6 +213,14 @@ def mesh_route(part) -> tuple[str, dict]:
         return "skin", {"thickness": wall}
     if part.kind == "sheet" and part.sheet is not None:
         return "skin", {"thickness": part.sheet.thickness}
+    if part.kind == "solid" and part.body is not None:
+        # plate- or bar-like solids swept through their thickness (D56); the sweep finds the thickness, and a
+        # part it cannot sweep falls back to tets as sheet does
+        d = sorted(abs(b - a) for a, b in zip(part.body.bbox_min, part.body.bbox_max))
+        fill = part.body.volume / (d[0] * d[1] * d[2]) if d[0] > 0 else 0.0
+        if fill >= defaults.SOLID_SKIN_FILL and (d[1] >= defaults.SOLID_SKIN_ASPECT * d[0]
+                                                 or d[2] >= defaults.SOLID_SKIN_ASPECT * d[1]):
+            return "skin", {"thickness": None, "max_size": d[2] / defaults.SOLID_SKIN_SPAN_DIV}
     return "tet", {}
 
 
@@ -273,6 +281,11 @@ def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL) -> tuple[dict, 
                 else [g["bbox"][k + 3] - g["bbox"][k] for k in range(3)])       # no body description (D53)
         base = element_size(dims, user_size, fidelity)
         route, rx = mesh_route(part)
+        if route == "skin" and part.kind == "solid" and any(
+                c["type"] == "tie" and c.get("geometry") == "line" and part.id in c["parts"] for c in conns):
+            # a solid bonded along an edge (a weldment's edge contact): one wedge through its thickness gave the
+            # bond's narrow strip a single row of nodes, a near-hinge (6.5 % of the load lost on m11); tets, as before
+            route, rx = "tet", {}
         if mode == FAST and route == "member":
             # long layers are exact only on truly clean spans: cut the spans at every bonded footprint the
             # resolver found (the add-in's clean spans missed 22 of 34 on a welded chassis: tubes butting into
@@ -489,10 +502,37 @@ def tie_zone_nodes(instances: list[Instance], conns: list[dict], model: Model | 
     return zones
 
 
-def _history_path() -> Path:
+def _history_path(name: str = "solve_history.json") -> Path:
     base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "asmfea"
     base.mkdir(parents=True, exist_ok=True)
-    return base / "solve_history.json"
+    return base / name
+
+
+DECK_HISTORY = "deck_history.json"
+
+
+def estimate_deck_s(dof: int) -> float | None:
+    """How long writing a deck of this size takes on this machine: the nearest earlier deck (by DOF), scaled by
+    (dof ratio)^1.1 (the deck's tie, joint and load work grows a little faster than its size). None before the
+    first deck is recorded."""
+    try:
+        hist = json.loads(_history_path(DECK_HISTORY).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not hist:
+        return None
+    best = min(hist, key=lambda h: abs(np.log(h["dof"] / dof)))
+    return max(best["seconds"] * (dof / best["dof"]) ** 1.1, 1.0)
+
+
+def _record_deck_history(dof: int, seconds: float) -> None:
+    p = _history_path(DECK_HISTORY)
+    try:
+        hist = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        hist = []
+    hist.append({"dof": dof, "seconds": round(seconds, 2), "when": time.time()})
+    p.write_text(json.dumps(hist[-200:]))
 
 
 def estimate_solve_s(dof: int) -> float | None:
@@ -574,12 +614,16 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg) -> dic
         rd = d / spec["dir"]
         rd.mkdir(parents=True, exist_ok=True)
         label = f"{level}" + ("" if spec["dir"] == "." else f" {spec['dir']}")
-        js.activity(f"solve ({label}): assembling the deck")
-        with perf.span("deck", level=level, dof=dof) as pinfo:
+        # elapsed time against an estimate from earlier decks on this machine (the user's request: the step
+        # reports no progress of its own and can take minutes on a large model)
+        t_deck = time.time()
+        with js.timed(f"solve ({label}): assembling the deck", estimate_deck_s(dof)), \
+                perf.span("deck", level=level, dof=dof) as pinfo:
             deck = write_deck(rd / "study.inp", spec.get("model", model), instances, spec["conns"], face_map, spec["cases"],
                               bolts=[dict(b) for b in spec["bolts"]], stabilise=stabilise if spec["kind"] == "contact" else [],
                               buckling=spec["buckling"])
             pinfo["inp_bytes"] = sum(f.stat().st_size for f in rd.glob("*") if f.suffix in (".inp", ".nam", ".sur", ".equ"))
+        _record_deck_history(dof, time.time() - t_deck)
         if deck.diagnostics:
             js.add_diags(deck.diagnostics)
             raise_if_blocking(deck.diagnostics)

@@ -798,6 +798,8 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         info["total_mass"] = total_mass
         remote_points: dict[str, dict] = {}      # remote loads: their faces' centroid, point, moment
         info["remote_loads"] = remote_points
+        hydro_points: dict[str, dict] = {}       # hydrostatic loads: their faces' centroid, the top of the fluid
+        info["hydrostatic_loads"] = hydro_points
 
         def build_loads(loads):
             """(cload {node: force}, dload lines, applied total, share applied onto held DOFs)."""
@@ -854,15 +856,56 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                     applied += F
                     remote_points[ld.id] = {"centroid": C.tolist(), "point": P.tolist(), "moment": M.tolist()}
                 elif ld.type == "pressure":
+                    # written as the consistent nodal forces of the pressure on each element face (the face's
+                    # force shared by TRACTION_WEIGHTS), not *DLOAD P: the same load for flat faces, and one the
+                    # hybrid solver reads (it refused a tank's pressure, D56)
                     for fid in ld.faces:
                         inst, idx = faces_of(fid)
                         for eid, fn, e, cn in inst.face_elements(idx):
                             a, n, nodes = _face_geom(inst, e, cn, fn)
-                            dload_lines.append(f"{eid}, P{fn}, {ld.magnitude:.9g}")
                             fvec = -ld.magnitude * a * n
                             applied += fvec
                             for nd, wi in zip(nodes, TRACTION_WEIGHTS[len(nodes) // 2]):
-                                supports += into_supports(int(inst.node0 + nd), fvec * wi)
+                                gid = int(inst.node0 + nd)
+                                cload[gid] = cload.get(gid, np.zeros(3)) + fvec * wi
+                elif ld.type == "hydrostatic":
+                    # Fluid pressure (D54): on each element face, at its centre, p = (p_surface - 1 atm) +
+                    # rho g depth, the depth measured along the fluid's down direction from the top of the
+                    # fluid (exact for the linear rise over each flat face). 1 atm is taken to act outside,
+                    # so an open tank (the default surface pressure) loads its faces with rho g h alone; faces
+                    # above the top carry only the gas pressure over the fluid. magnitude: a load factor.
+                    down = np.asarray(ld.direction if ld.direction is not None else defaults.HYDRO_DOWN, float)
+                    down = down / np.linalg.norm(down)
+                    rho = (ld.density if ld.density is not None else defaults.WATER_DENSITY) * 1e-12   # t/mm^3
+                    p0 = (ld.surface_pressure if ld.surface_pressure is not None else defaults.ATMOSPHERE_MPA) \
+                        - defaults.ATMOSPHERE_MPA
+                    factor = 1.0 if ld.magnitude is None else float(ld.magnitude)
+                    wetted = []
+                    for fid in ld.faces:
+                        inst, idx = faces_of(fid)
+                        for eid, fn, e, cn in inst.face_elements(idx):
+                            a, n, nodes = _face_geom(inst, e, cn, fn)
+                            wetted.append((inst, eid, fn, a, n, nodes, inst.X[np.asarray(nodes) - 1].mean(axis=0)))
+                    area = sum(w[3] for w in wetted) or 1.0
+                    C = sum(w[3] * w[6] for w in wetted) / area
+                    top = np.asarray(ld.point, float) if ld.point is not None else \
+                        C + np.asarray(ld.offset if ld.offset is not None else (0.0, 0.0, 0.0), float)
+                    below = 0
+                    for inst, eid, fn, a, n, nodes, c in wetted:
+                        depth = float(np.dot(c - top, down))
+                        below += depth > 0
+                        p = factor * (p0 + rho * defaults.GRAVITY_MM_S2 * max(depth, 0.0))
+                        if abs(p) < 1e-15:
+                            continue
+                        fvec = -p * a * n                      # as nodal forces, as a pressure load is
+                        applied += fvec
+                        for nd, wi in zip(nodes, TRACTION_WEIGHTS[len(nodes) // 2]):
+                            gid = int(inst.node0 + nd)
+                            cload[gid] = cload.get(gid, np.zeros(3)) + fvec * wi
+                    hydro_points[ld.id] = {"centroid": C.tolist(), "top": top.tolist(), "down": down.tolist()}
+                    if below == 0 and abs(p0) < 1e-15:
+                        diags.append(make("LOAD_HYDROSTATIC_DRY", where={"loads": [ld.id]}, load=ld.id,
+                                          evidence={"top": top.tolist(), "centroid": C.tolist(), "down": down.tolist()}))
                 elif ld.type == "gravity":
                     d = np.asarray(ld.direction, float)
                     d = d / np.linalg.norm(d)

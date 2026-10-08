@@ -38,10 +38,16 @@ GLOBAL_RESIDUAL_MAX = 0.1          # relative residual of the global joint syste
                                    # 1e-7 x PENALTY_SCALE, round-off of the stiff agreement rows
 PENALTY_SCALE = 1e3                # agreement rows between joint fields, as a penalty (see solve): rows held
                                    # to 3e-8 on srleg, residual 2e-4 (1e4: 7e-9 but residual 2e-3)
-MEMORY_RESERVE_FRACTION = 0.25     # of the RAM available at the start, left free for everything else
+GLOBAL_REFINE_STEPS = 2            # refinement of the scaled joint solve (Factor): the water tank's residual went
+                                   # 1.0 -> 1.7e-5 -> 8e-6, flat after
+MEMORY_RESERVE_FRACTION = 0.25    # of the RAM available at the start, left free for everything else
 GLOBAL_BYTES_PER_ENTRY = 100       # the global joint system's memory per condensed entry (Bench truss L: 60 left
                                    # its solve 5 GB over the budget)
 DISK_RESERVE = 5 * 2 ** 30         # disk left free when interior responses wait on disk
+XT_SPILL_MAX = 2 * 2 ** 30         # a part's interior response larger than this is not kept (not even on disk):
+                                   # recovery factorises the part again, one factorisation and one solve against
+                                   # writing and reading it back (found: a 1 m tank panel's was 14 GB, and its
+                                   # disk writes held the solve to one core for hours)
 RHS_BLOCK = 256                    # joint modes solved for at once when condensing a part
 SCHUR_MIN_MODES = 200              # a part with more joint modes is condensed by PARDISO's Schur complement
 SCHUR_MAX_BDOF = 30000             # ... when its joint DOF fit a dense block (30000: 7.2 GB). Bench truss L's
@@ -322,6 +328,16 @@ def _pardiso():
     return _PARDISO[0]
 
 
+def _remove_stale_spills() -> None:
+    """Spill folders of solves whose process is gone (a cancelled job's process is ended, so its temporary folder
+    is never removed: 24 GB was left behind on a water tank). The folder name carries its process number."""
+    import re
+    for d in Path(tempfile.gettempdir()).glob("asmfea_hybrid_*"):
+        m = re.match(r"asmfea_hybrid_(\d+)_", d.name)
+        if m is None or not psutil.pid_exists(int(m.group(1))):
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def _mkl_threads_local(n: int) -> None:
     """MKL threads for the calling thread only, so parts solved side by side share the cores."""
     if _pardiso() is None:
@@ -367,6 +383,9 @@ def schur_complement(A, ns: int, budget: "MemoryBudget | None" = None) -> np.nda
                     x.ctypes.data_as(f64p), ctypes.byref(err))
     held = 0
     if budget is not None:
+        # the threads are fixed before analysis: PARDISO sizes its per-thread work there, and changing them
+        # between phases crashed it (access violation, found the first time this was tried)
+        _mkl_threads_local(budget.threads())
         call(11)                                              # analysis: the factor's memory, then reserve it
         if err.value == 0:
             held = 1024 * max(int(iparm[14]), int(iparm[15]) + int(iparm[16])) + 8 * ns * ns
@@ -390,8 +409,9 @@ class MemoryBudget:
     waits forever. ``try_keep`` takes bytes until recovery (results kept in memory) only when they fit
     with room left for the largest part."""
 
-    def __init__(self, total: int):
+    def __init__(self, total: int, cores: int = 1):
         self.total = max(int(total), 1)
+        self.cores = max(int(cores), 1)
         self.held = 0
         self.kept = 0
         self.peak = 0
@@ -415,6 +435,13 @@ class MemoryBudget:
                 self.holders += 1
             self.held += n
             self.peak = max(self.peak, self.kept + self.held)
+
+    def threads(self) -> int:
+        """MKL threads for a part's next factorisation (set before its analysis and kept until it is freed): the
+        cores shared by the parts working now (holding memory and not waiting for more). Fixed per part when the solve started, they left a part that memory let
+        run alone on one thread while the other cores sat idle (a water tank's Schur complements, D57)."""
+        with self._cv:
+            return max(1, self.cores // max(1, self.holders - self.topping_up))
 
     def release(self, n: int, last: bool = True) -> None:
         """Give back n bytes; ``last``: the caller's whole reservation ends here (False for a top-up)."""
@@ -461,10 +488,25 @@ class Factor:
         A = sp.csr_matrix(A)
         self.n = A.shape[0]
         self._pardiso = None
+        self._scale = None
         self._budget, self._held = budget, 0
         pypardiso = _pardiso()
+        if pypardiso is not None and self.n and not definite:
+            # The joint system is factorised scaled to a unit diagonal, with pivots perturbed at 1e-13 rather
+            # than PARDISO's 1e-8 for this matrix type, and solved with refinement (solve). Unscaled, the
+            # agreement penalty (PENALTY_SCALE x the stiffest unknown) put entries 1e12 above the softest
+            # joint unknowns, the 1e-8 perturbation swamped their pivots and a 13 M DOF water tank's joint
+            # system came back with a relative residual of 1.3 (D58). Scaled: 1.7e-5 after one refinement.
+            d = A.diagonal()
+            self._scale = 1.0 / np.sqrt(np.where(d > 0, d, 1.0))
+            S = sp.diags(self._scale)
+            A = (S @ A @ S).tocsr()
         if pypardiso is not None and self.n:
             s = pypardiso.PyPardisoSolver(mtype=2 if definite else -2)   # real symmetric (indefinite)
+            if not definite:
+                s.set_iparm(1, 1)                                 # own settings: METIS ordering,
+                s.set_iparm(2, 2)
+                s.set_iparm(10, 13)                               # pivots perturbed at 1e-13
             # PARDISO reads the upper triangle, with every diagonal entry stored even when zero (the
             # multiplier block of a constrained system)
             U = sp.triu(A, format="coo")
@@ -478,6 +520,7 @@ class Factor:
             else:
                 s._check_A(self._A)
                 b = np.zeros((self.n, 1))
+                _mkl_threads_local(budget.threads())             # fixed for this factor, from analysis on
                 s.set_phase(11)                                   # analysis: reports the memory to come
                 s._call_pardiso(self._A, b)
                 self._held = 1024 * max(int(s.iparm[14]), int(s.iparm[15]) + int(s.iparm[16]))
@@ -493,7 +536,18 @@ class Factor:
         B = np.asarray(B, dtype=float)
         if not self.n:
             return np.zeros_like(B)
-        if self._pardiso is not None:
+        if self._pardiso is not None and self._scale is not None:
+            # scaled: solve S A S z = S b and refine on that system, whose full matrix is the stored upper
+            # triangle U as U + U' - diag(U), so no second copy is held
+            S = self._scale.reshape(-1, *([1] * (B.ndim - 1)))
+            bs = S * B
+            dU = self._A.diagonal().reshape(S.shape)
+            z = self._pardiso.solve(self._A, bs).reshape(B.shape)
+            for _ in range(GLOBAL_REFINE_STEPS):
+                r = bs - (self._A @ z + self._A.T @ z - dU * z)
+                z = z + self._pardiso.solve(self._A, r).reshape(B.shape)
+            X = S * z
+        elif self._pardiso is not None:
             X = self._pardiso.solve(self._A, B)
         else:
             X = self._lu.solve(B)
@@ -653,6 +707,7 @@ def joint_terms(deck: Deck, external_ties: list, settings: Settings, held: set, 
     offset = 0
     n_exact = n_modes = 0
     by_modes = []                                          # (slave nodes, master nodes) of joints by modes
+    agree = []                                  # [(new terms, earlier terms, node)] per shared or fixed node
     for tie in external_ties:
         snodes, mnodes, weights = tie_footprint(deck, tie, deck.nodes)
         if not snodes or not mnodes:
@@ -668,21 +723,36 @@ def joint_terms(deck: Deck, external_ties: list, settings: Settings, held: set, 
                 terms[m] = [(offset, 1.0)]
                 offset += 3
         for s in sorted(snodes):
-            if s in terms or s in held:
+            if s in held:
                 continue
-            # a fixed master node moves nothing, so it adds no term but keeps its weight
-            ws = [(m, w) for m, w in weights[s] if m in gnode or m in held]
+            # Chains, resolved as CalculiX resolves chained ties (D57): a master that an earlier joint already
+            # moves (a slave there) brings its own terms; a fixed master moves nothing, so it adds no term but
+            # keeps its weight. Dropping such masters and skipping slaves already moved lost 64 000 master
+            # weights and 29 000 slave nodes on a sectional tank (foam strips are slave to one panel and master
+            # to the next), and the model came apart ("the joints do not hold the model together").
+            ws = [(m, w) for m, w in weights[s] if m in terms or m in held]
             tot = sum(w for _, w in ws)
-            if ws and abs(tot) > 1e-9:
-                terms[s] = [(gnode[m], w / tot) for m, w in ws if m in gnode]
-                transfer[s] = [(m, w / tot) for m, w in ws]
+            if not ws or abs(tot) <= 1e-9:
+                continue
+            acc: dict = {}
+            for m, w in ws:
+                for base, ww in terms.get(m, ()):
+                    acc[base] = acc.get(base, 0.0) + w / tot * ww
+            mine = list(acc.items())
+            if s in terms:
+                # a node already moved by an earlier joint: both joints hold it, so the two must agree there
+                # (a penalty row, as where fields share nodes)
+                if mine != terms[s]:
+                    agree.append((mine, terms[s], s))
+                continue
+            terms[s] = mine
+            transfer[s] = [(m, w / tot) for m, w in ws]
     # each joint by modes moves its footprint with its own smooth field. A node can follow only one field:
     # where joints share nodes (three bodies meeting at a weld) a node keeps the field that took it first,
     # and the later joint's field is made to agree with it there (a constraint row each: Lagrange
     # multipliers in the global system). Left out, a joint whose nodes on one side were all taken joined
     # nothing (the 297-body weldment fell apart: 1e9 mm); merging such joints into one field put a single
     # polynomial round the corner (a welded chassis' worst node 7 % off).
-    agree = []                                  # [(new terms, earlier terms, node)] per shared or fixed node
     for sn, mn in by_modes:
         n_modes += 1
         nodes = sorted(sn | mn)
@@ -703,7 +773,7 @@ def joint_terms(deck: Deck, external_ties: list, settings: Settings, held: set, 
                 terms[nd] = mine
         offset += 3 * phi.shape[1]
     nq = offset
-    log(f"joints: {n_exact} exact, {n_modes} by modes; {nq} global unknowns")
+    log(f"joints: {n_exact} exact, {n_modes} by modes; {nq} global unknowns; {len(agree)} nodes where two joints agree")
     return terms, transfer, agree, nq
 
 
@@ -746,11 +816,38 @@ def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Sett
                     terms[n] = [(nq, 1.0)]
                     nq += 3
 
+    # The joint terms and the nodal loads as flat arrays, built once here: the part threads look them up with
+    # NumPy, which leaves the GIL free (Python loops over them held it, and four part threads shared one core:
+    # a 13 M DOF water tank, D57). term_nodes sorted; a node's terms are term_base/term_w[term_ptr[k]:term_ptr[k+1]].
+    term_nodes = np.array(sorted(terms), dtype=np.int64)
+    term_cnt = np.array([len(terms[int(nd)]) for nd in term_nodes], dtype=np.int64)
+    term_ptr = np.concatenate([[0], np.cumsum(term_cnt)]).astype(np.int64)
+    term_base = np.fromiter((b for nd in term_nodes for b, _ in terms[int(nd)]), dtype=np.int64, count=int(term_ptr[-1]))
+    term_w = np.fromiter((w for nd in term_nodes for _, w in terms[int(nd)]), dtype=float, count=int(term_ptr[-1]))
+    load_nodes = np.array(sorted(cload), dtype=np.int64)
+    load_vals = np.array([cload[int(nd)] for nd in load_nodes]).reshape(len(load_nodes), 3, nsteps) \
+        if len(load_nodes) else np.zeros((0, 3, nsteps))
+    fixed_ids = np.array(sorted(fixed_nodes), dtype=np.int64)
+    fixed_mask = np.array([[d in fixed_nodes[int(nd)] for d in (1, 2, 3)] for nd in fixed_ids], dtype=bool).reshape(-1, 3)
+
+    def node_terms(nodes):
+        """For each node: where its terms are (a row of the term arrays), -1 for a node with none."""
+        k = np.searchsorted(term_nodes, nodes)
+        k = np.minimum(k, max(len(term_nodes) - 1, 0))
+        hit = (term_nodes[k] == nodes) if len(term_nodes) else np.zeros(len(nodes), bool)
+        return np.where(hit, k, -1)
+
     def loads(part, index):
         K, F = assemble(deck, part.blocks, index, gravity)
-        for nd, v in cload.items():
-            if nd in index and (part.loads_here or nd not in part.shared):
-                F[3 * index[nd]:3 * index[nd] + 3] += v
+        if len(load_nodes):
+            here = np.isin(load_nodes, part.nodes)
+            if not part.loads_here and part.shared:
+                here &= ~np.isin(load_nodes, np.fromiter(part.shared, dtype=np.int64))
+            if here.any():
+                order = np.argsort(part.nodes)
+                at = order[np.searchsorted(part.nodes[order], load_nodes[here])]
+                F3 = F.reshape(len(part.nodes), 3, -1)          # a view: F is (3 x nodes) x load steps
+                np.add.at(F3, at, load_vals[here])
         return K, F
 
     kr, kc, kv = [], [], []                               # the global system: triplets of the latest parts,
@@ -762,9 +859,10 @@ def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Sett
             kr.clear(), kc.clear(), kv.clear()
         return Kq
     Fq = np.zeros((nq, nsteps))
-    budget = MemoryBudget(memory_budget(settings))
-    spill = tempfile.TemporaryDirectory(prefix="asmfea_hybrid_", ignore_cleanup_errors=True)
     cores = psutil.cpu_count(logical=False) or 1
+    budget = MemoryBudget(memory_budget(settings), cores)
+    _remove_stale_spills()
+    spill = tempfile.TemporaryDirectory(prefix=f"asmfea_hybrid_{os.getpid()}_", ignore_cleanup_errors=True)
     _pardiso()                                            # found once, before the threads start
 
     def prepare(part):
@@ -774,20 +872,28 @@ def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Sett
         C, free = constraint_matrix(len(part.nodes), index, ties)
         free_nodes = part.nodes[free]
         n = 3 * len(free_nodes)
-        fixed = np.zeros(n, bool)
-        for i, nd in enumerate(free_nodes):
-            for d in fixed_nodes.get(int(nd), ()):
-                fixed[3 * i + d - 1] = True
-        bnode = np.array([int(nd) in terms for nd in free_nodes], dtype=bool)
-        bdof = np.repeat(bnode, 3) & ~fixed
+        fixed = np.zeros((len(free_nodes), 3), bool)
+        if len(fixed_ids):
+            k = np.minimum(np.searchsorted(fixed_ids, free_nodes), len(fixed_ids) - 1)
+            hit = fixed_ids[k] == free_nodes
+            fixed[hit] = fixed_mask[k[hit]]
+        fixed = fixed.ravel()
+        tk = node_terms(free_nodes)
+        bdof = np.repeat(tk >= 0, 3) & ~fixed
         idof = ~bdof & ~fixed
         I, B = np.nonzero(idof)[0], np.nonzero(bdof)[0]
-        rows, cols, vals = [], [], []
-        for r, b in enumerate(B):
-            c = b % 3
-            for base, w in terms[int(free_nodes[b // 3])]:
-                rows.append(r), cols.append(base + c), vals.append(w)
-        T = sp.csr_matrix((vals, (rows, cols)), shape=(len(B), nq)) if rows else sp.csr_matrix((len(B), nq))
+        # each boundary DOF's row: its node's terms, the base shifted by its direction (vectorised, see above)
+        rk = tk[B // 3]
+        cnt = term_cnt[rk]
+        if len(B) and cnt.sum():
+            start = np.repeat(term_ptr[rk], cnt)
+            offs = np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+            idx = start + offs
+            rows = np.repeat(np.arange(len(B)), cnt)
+            cols = term_base[idx] + np.repeat(B % 3, cnt)
+            T = sp.csr_matrix((term_w[idx], (rows, cols)), shape=(len(B), nq))
+        else:
+            T = sp.csr_matrix((len(B), nq))
         used = np.unique(T.indices) if len(B) else np.zeros(0, np.int64)
         return index, C, free, I, B, T[:, used], used, n
 
@@ -804,8 +910,12 @@ def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Sett
         (found: Bench truss S's chords, 1530 modes on 158k DOF, held 8 GB each and outran everything else)."""
         _mkl_threads_local(threads)
         index, C, free, I, B, Tu, used, n = prepare(part)
-        need = estimate(3 * len(part.nodes), len(I), len(used), len(B) if len(used) > SCHUR_MIN_MODES else 0)
+        # the dense Schur block only for a part that will build one: a tank panel (more joint DOF than
+        # SCHUR_MAX_BDOF) was reserved 29 GB it never used, so parts ran one at a time on two threads
+        schur = len(used) > SCHUR_MIN_MODES and len(B) <= SCHUR_MAX_BDOF
+        need = estimate(3 * len(part.nodes), len(I), len(used), len(B) if schur else 0)
         budget.acquire(need)
+        _mkl_threads_local(budget.threads())
         try:
             K, F = loads(part, index)
             Kf = (C.T @ K @ C).tocsr()
@@ -828,7 +938,7 @@ def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Sett
                 Fpart = Tu.T @ Ff[B] - KIB_T.T @ Xf
             elif len(used) and len(I) and budget.try_keep(8 * len(I) * len(used), largest):
                 XT = np.empty((len(I), len(used)))
-            elif len(used) and len(I) and shutil.disk_usage(spill.name).free > 8 * len(I) * len(used) + DISK_RESERVE:
+            elif len(used) and len(I) and 8 * len(I) * len(used) <= XT_SPILL_MAX and                     shutil.disk_usage(spill.name).free > 8 * len(I) * len(used) + DISK_RESERVE:
                 # no room in memory: the response goes to disk as it is solved, and recovery reads it back
                 # (Bench truss L: 292 lacing parts refactorised at recovery took it from 66 s to 279 s)
                 XT = np.lib.format.open_memmap(Path(spill.name) / f"{id(part)}.npy", mode="w+",
@@ -874,11 +984,14 @@ def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Sett
     # a core's share of the whole runs alone on all cores first; the rest share the cores one each
     modes_of = []
     for part in parts:
-        bases = set()
-        for nd in part.nodes.tolist():
-            for base, _ in terms.get(nd, ()):
-                bases.add(base)
-        modes_of.append(3 * len(bases))
+        tk = node_terms(part.nodes)
+        tk = tk[tk >= 0]
+        cnt = term_cnt[tk]
+        if cnt.sum():
+            idx = np.repeat(term_ptr[tk], cnt) + np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+            modes_of.append(3 * len(np.unique(term_base[idx])))
+        else:
+            modes_of.append(0)
     work = [3 * len(p.nodes) * (m + nsteps) for p, m in zip(parts, modes_of)]
     share = sum(work) / cores
     heavy = sorted((k for k in range(len(parts)) if work[k] > share), key=lambda k: -work[k])
@@ -896,6 +1009,9 @@ def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Sett
     timings.update(workers=workers, heavy_parts=len(heavy), memory_budget_gb=budget.total / 2 ** 30)
     log(f"parts: {len(heavy)} heavy one at a time on {cores} threads, then {workers} at once, {threads} thread(s) "
         f"each; memory budget {budget.total / 2 ** 30:.1f} GB")
+    top = sorted(range(len(parts)), key=lambda k: -modes_of[k])[:5]
+    log("most joint modes: " + ", ".join(f"{parts[k].name} {modes_of[k]} on {3 * len(parts[k].nodes)} DOF "
+                                          f"({8 * modes_of[k] ** 2 / 2 ** 30:.1f} GB condensed)" for k in top))
     recovery = [None] * len(parts)
     done = 0
     for k in heavy:
@@ -982,6 +1098,7 @@ def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Sett
         if K is None or (XT is None and len(used) and len(I)):
             need = estimate(3 * len(part.nodes), len(I), 0)
             budget.acquire(need)
+            _mkl_threads_local(budget.threads())
         if K is None:
             K, F = loads(part, index)                      # assembled again: memory was short
         try:

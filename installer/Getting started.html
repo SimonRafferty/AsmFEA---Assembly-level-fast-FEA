@@ -112,12 +112,16 @@
         <span class="btn">Pinned</span> (can rotate).</li>
       <li>Loads belong to a <b>load case</b> (a set of loads solved together). Pick one at the top of the tab, or
         click <span class="btn">New load case</span>; every case is solved in the same run. Fixtures apply to all cases.
-        Tick <b>Buckling</b> to check a case for buckling too (runs take longer).</li>
+        Tick <b>Include buckling in load case</b> to check a case for buckling too (runs take longer).</li>
       <li>Select faces and click <span class="btn">Force</span> or <span class="btn">Pressure</span>, or click
         <span class="btn">Gravity</span> for self-weight. Give the force as X, Y and Z components; the
         resultant shows as you type.</li>
       <li>For a force acting away from the faces (a lever arm, a torque), also give how far from the faces' centre it
         acts, in X, Y and Z (leave 0, 0, 0 for a force on the faces).</li>
+      <li>For fluid in a tank, select the wetted faces and click <span class="btn">Hydrostatic</span>. Give the fluid's
+        density (water 1000 kg/m³), the absolute pressure on its top (1 atmosphere, 0.101325 MPa, for an open tank;
+        the air outside balances it), and where the top of the fluid is, in X, Y and Z from the faces' centre; a ball
+        and triad marks it on the model. The pressure rises with depth below it; faces above it are not loaded.</li>
     </ol>
     <p>Click a row in the list to highlight its faces on the model; a load also shows an arrow pointing at
       where it acts. Double-click a row to change it.</p>

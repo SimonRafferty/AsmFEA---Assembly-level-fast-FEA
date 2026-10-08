@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asmfea"
-version = "0.4.2"
+version = "0.5.0"
 description = "Assembly FEA pipeline: SolidWorks neutral model to a solved CalculiX job and report"
 requires-python = ">=3.11"
 dependencies = [

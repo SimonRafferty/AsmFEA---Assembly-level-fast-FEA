@@ -776,6 +776,21 @@ namespace AsmFea.Extract
         /// </summary>
         private static void MateData(IFeature feat, string type, JObj o)
         {
+            if (type == "distance" || type == "angle")
+            {
+                // a limit mate: the parts may move between its limits (D55); a plain one only positions them
+                try
+                {
+                    object def = feat.GetDefinition();
+                    if (def == null) return;
+                    Func<string, double> get = n => Convert.ToDouble(def.GetType().InvokeMember(n, System.Reflection.BindingFlags.GetProperty, null, def, null));
+                    double lo = type == "distance" ? get("MinimumDistance") * 1000.0 : get("MinimumAngle") * 180.0 / Math.PI;
+                    double hi = type == "distance" ? get("MaximumDistance") * 1000.0 : get("MaximumAngle") * 180.0 / Math.PI;
+                    if (Math.Abs(hi - lo) > 1e-6) o["limits"] = new List<object> { Math.Round(lo, 6), Math.Round(hi, 6) };
+                }
+                catch { }
+                return;
+            }
             if (type != "gear" && type != "rackpinion" && type != "screw") return;
             try
             {

@@ -144,6 +144,17 @@ def subassemblies(groups: list[str]) -> list[str]:
             "flexible setting in SolidWorks makes no difference to the analysis."]
 
 
+def hydrostatic(load_ids: list[str]) -> list[str]:
+    """Hydrostatic loads (D54)."""
+    if not load_ids:
+        return []
+    return [f"Hydrostatic loads ({', '.join(load_ids)}): the pressure on each element face is the pressure over the "
+            "fluid less 1 atmosphere, plus ρ·g·depth below the top of the fluid (g = 9810 mm/s²), taken at the face's "
+            "centre. 1 atmosphere is taken to act on the outside, so an open tank's faces carry ρ·g·depth alone. "
+            "Faces above the top of the fluid carry only the gas pressure over it. The fluid's own mass is not added "
+            "to the model: it acts only through this pressure."]
+
+
 def remote(load_ids: list[str]) -> list[str]:
     if not load_ids:
         return []

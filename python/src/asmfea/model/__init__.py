@@ -123,6 +123,7 @@ class Mate(_M):
     ratio: Optional[list[float]] = None
     distance_per_rev: Optional[float] = None
     reverse: bool = False
+    limits: Optional[list[float]] = None      # a limit distance or angle mate: (min, max)
 
 
 class Fingerprint(_M):
@@ -148,12 +149,14 @@ class FaceRef(_M):
 class Load(_M):
     id: str
     load_case: str
-    type: Literal["force", "pressure", "gravity", "remote_force"]
+    type: Literal["force", "pressure", "gravity", "remote_force", "hydrostatic"]
     faces: list[str] = []
     magnitude: float = 0.0
     direction: Optional[Vec3] = None
     point: Optional[Vec3] = None
-    offset: Optional[Vec3] = None       # remote_force: from the area-weighted centroid of its faces, mm
+    offset: Optional[Vec3] = None       # remote_force, hydrostatic (top of the fluid): from the faces' area-weighted centroid, mm
+    density: Optional[float] = None     # hydrostatic: kg/m^3 (None: defaults.WATER_DENSITY)
+    surface_pressure: Optional[float] = None   # hydrostatic: absolute, MPa (None: defaults.ATMOSPHERE_MPA)
     scale_in_buckling: Optional[bool] = None
 
 

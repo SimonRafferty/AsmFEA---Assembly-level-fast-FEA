@@ -44,7 +44,9 @@ class NativeSweepBackend:
         return self.gmsh.available()          # 2D meshes come from the Gmsh executable
 
     def version(self) -> str:
-        return f"asmfea-sweep-2/gmsh-{self.gmsh.version()}"
+        # 3: caps keep small sizes local, solids' length cap (D56); the version is in every mesh's cache key, so a
+        # change here re-meshes swept parts (found live: the tank reused its old panel meshes when it stayed 2)
+        return f"asmfea-sweep-3/gmsh-{self.gmsh.version()}"
 
     def mesh(self, req: MeshRequest, on_line: Callable[[str], None] = lambda s: None) -> MeshResult:
         from ...geometry import read_step
@@ -91,6 +93,9 @@ class NativeSweepBackend:
                 f"Mesh.MeshSizeMax = {size:.9g};",
                 f"Mesh.MeshSizeMin = {size * defaults.MESH_SIZE_MIN_FRACTION:.9g};",
                 f"Mesh.MeshSizeFromCurvature = {defaults.MESH_CURVATURE_POINTS};",
+                # edges still follow curvature (holes, bends), but their small sizes do not spread across the
+                # faces (D56: a 1 m tank panel with 88 bolt holes took 140 000 cap triangles, 47 000 without)
+                "Mesh.MeshSizeExtendFromBoundary = 0;",
                 "Mesh.Algorithm = 6;",            # Frontal-Delaunay 2D
                 "Mesh.ElementOrder = 2;",
                 "Mesh.MshFileVersion = 2.2;",
@@ -363,7 +368,8 @@ def skin_sweep(solid, req: MeshRequest, mesh2d) -> tuple[np.ndarray, list, float
     e = req.extra
     faces, A, B, t = pair_skins(solid, e.get("thickness"))
     factor = float(e.get("factor", 1.0))
-    size2d = min(defaults.SKIN_SIZE_T * t * factor, req.size_max if e.get("cap_size") else math.inf)
+    size2d = min(defaults.SKIN_SIZE_T * t * factor, req.size_max if e.get("cap_size") else math.inf,
+                 float(e["max_size"]) * factor if e.get("max_size") else math.inf)   # a solid's length / 20 (D56)
     shell = TopoDS_Shell()
     bld = BRep_Builder()
     bld.MakeShell(shell)

@@ -67,6 +67,7 @@ SCL_LIGAMENT_T = 20.0          # thin parts: an in-plane SCL is cut at 20 x the 
 SINGULAR_RISE = 0.15           # a peak rising > 15 % on the finer mesh while deflection settles: a singular point (D32), guess         # plan: within 10 %
 
 # --- Jobs (Interfaces section) --------------------------------------------------------
+CANCEL_GRACE_S = 10.0          # Cancel: seconds a job has to stop on request before its process tree is ended
 HEARTBEAT_S = 1.0              # plan: heartbeat every second or two
 STALE_HEARTBEAT_S = 30.0       # heartbeat older than this with no live worker = stalled
 
@@ -81,6 +82,11 @@ OVERLAP_TOL = 0.05             # mm: faces this far into each other still count 
 OVERLAP_VOL_TOL = 1.0          # mm^3: solids overlapping more than this are interference, guess
 TIE_AREA_RATIO = 4.0           # tie sides differing this much in area (an edge on a face): the small one is the slave (D30), guess
 COAX_TOL = 0.1                 # mm: axis offset for coaxial cylinders, guess
+# Hydrostatic loads (D54)
+WATER_DENSITY = 1000.0         # kg/m^3, fresh water (the user's default)
+ATMOSPHERE_MPA = 0.101325      # MPa, one standard atmosphere: the default surface pressure, and taken to act outside
+GRAVITY_MM_S2 = 9810.0         # mm/s^2: as the task pane's gravity default (standard gravity is 9806.65)
+HYDRO_DOWN = (0.0, -1.0, 0.0)  # the fluid's down direction when a load gives none: SolidWorks' up is +Y
 # A hinge from one chosen face (D50): faces found on its axis must be within this radius of it (a pin in a
 # clearance hole), and continue it along the axis without a longer gap than max(radius, HINGE_FIND_GAP). Guesses:
 # loose enough for an H11 clearance hole, tight enough to leave a gear's rim off its bore.
@@ -114,6 +120,14 @@ SWEEP_LAYER_T = 5.0
 # and 4 t all give 0.989-0.990 of the hex reference (tets at h = t: 0.27 on flat walls);
 # 3 t keeps some resolution of stress gradients for 78k DOF on that case.
 SKIN_SIZE_T = 3.0
+# A solid part shaped like a plate or a bar (a box dimension at least SOLID_SKIN_ASPECT x the next smaller one)
+# is swept through its thickness like sheet (D56: a 10 x 20 x 993 foam strip took 427 000 tet nodes; swept, about
+# 1 300). Its in-plane size is also held to its length / SOLID_SKIN_SPAN_DIV, so a short bar is not left with a
+# handful of elements along it. Guesses, checked on the m1 blocks and the verification cases.
+SOLID_SKIN_ASPECT = 4.0
+SOLID_SKIN_SPAN_DIV = 20.0
+SOLID_SKIN_FILL = 0.6          # ... and only a solid that fills most of its box: a plate or bar, not a frame of tubes
+                               # (a fused tee of two SHS passed the aspect test and was skin-swept through its walls)
 SKIN_FALLBACK_SIZE_T = 1.0     # a sheet tet-meshed instead (sweep refused): tet size = thickness (D30), guess
 SKIN_THICKNESS_RTOL = 0.03     # skin pairs must be this close to one thickness, guess
 SKIN_MIN_ASPECT = 4.0          # a skin-swept wall: largest face at least 4 x the thickness across (sqrt area), guess (D30)

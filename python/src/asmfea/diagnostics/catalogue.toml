@@ -130,6 +130,14 @@ explain = "These parts can move without straining anything, for example a part h
 likely_causes = ["A part on a hinge (concentric mate) with nothing else holding it.", "A sliding joint with nothing stopping the slide.", "A connection set to 'none' or 'sliding, no separation' that was the part's only hold."]
 actions = ["Select the parts from this message and check how they should be held.", "Tick Lock rotation on the hinge (or the concentric mate) if the parts should not turn.", "Add a fixture or a connection that stops the named motion."]
 
+[LOAD_HYDROSTATIC_DRY]
+severity = "warning"
+stage = "solve"
+what = "Hydrostatic load {load} puts no pressure on its faces: they are all above the top of the fluid, and the pressure over the fluid is 1 atmosphere."
+explain = "A hydrostatic load presses on the selected faces that lie below the top of the fluid, more deeply the further down they are (along the fluid's down direction). The top of the fluid is the faces' centre moved by the offset you gave. Here every face is above it, so the load does nothing. 1 atmosphere over the fluid is taken to be balanced by the air outside."
+likely_causes = ["The offset to the top of the fluid points the wrong way (down instead of up).", "The down direction is reversed: SolidWorks' up is usually +Y, so down is 0, -1, 0.", "The wrong faces were selected."]
+actions = ["Edit the load: set the top of the fluid above the faces, and check the down direction."]
+
 [LOAD_ON_FLOATING_PART]
 severity = "blocking"
 stage = "resolve"
@@ -273,14 +281,6 @@ what = "The model is a mechanism: {count} free motion(s) without straining anyth
 explain = "Checked before meshing: some parts can move freely without stretching anything, for example a part on a sliding joint with nothing stopping the slide, or parts touching only through contact. The solver could not find an answer. The listed motions show what is free; add a fixture or change a connection on the Connections tab."
 likely_causes = ["A joint (revolute, sliding, line contact) leaves a motion that no fixture or other connection stops.", "A fixture constrains too few directions.", "Two parts are joined only along a line, which acts as a hinge."]
 actions = ["Add a fixture that stops the named motion.", "Change the joint to a tie with a decision on the connection.", "Check the mates on the named parts."]
-
-[NEAR_MISS]
-severity = "warning"
-stage = "resolve"
-what = "{parts} have faces {gap:.3g} mm apart: just outside the gap tolerance, so they are not connected."
-explain = "Two parts have faces very close together but not touching within the tolerance, so they are not connected. If they are meant to touch in reality, close the gap in the model; if not, nothing needs doing."
-likely_causes = ["The parts are meant to touch but are modelled with a small gap.", "The gap is real (clearance) and no connection is intended."]
-actions = ["Close the gap in SolidWorks if the parts should be joined.", "Or record a decision to tie them."]
 
 [INTERFERENCE]
 severity = "warning"

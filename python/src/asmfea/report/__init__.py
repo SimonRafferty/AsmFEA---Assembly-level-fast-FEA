@@ -404,6 +404,7 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                                    for w in c.get("evidence", {}).get("welds", [])}))
                  + A.subassemblies(sorted({p.subassembly for p in model.parts if p.subassembly}))
                  + A.remote([ld.id for ld in model.loads if ld.type == "remote_force"])
+                 + A.hydrostatic([ld.id for ld in model.loads if ld.type == "hydrostatic"])
                  + A.joint_band(any(c["type"] == "tie" for c in conns))
                  + A.weldment(sum(1 for c in conns if c.get("source") == "weldment" and c.get("butt")),
                               sum(1 for c in conns if c.get("source") == "weldment" and c.get("geometry") == "line"),
@@ -486,10 +487,20 @@ def build_report(study: Path, pdf: bool = False) -> Path:
              + (f"\nRotations held about: {fx.hold_rotations}" if fx.hold_rotations else "")] for fx in model.fixtures],
            [4, 13])
     _para(doc)
-    ld_type = {"force": "Force", "pressure": "Pressure", "gravity": "Gravity", "remote_force": "Remote force"}
+    ld_type = {"force": "Force", "pressure": "Pressure", "gravity": "Gravity", "remote_force": "Remote force",
+               "hydrostatic": "Hydrostatic pressure"}
     units = {"force": "N (total)", "pressure": "MPa", "gravity": "mm/s²", "remote_force": "N"}
     def load_value(ld) -> str:
         """Components and resultant of a vector load; for a remote force also where it acts and its moment."""
+        if ld.type == "hydrostatic":
+            down = ld.direction if ld.direction is not None else list(defaults.HYDRO_DOWN)
+            top = (f"{_vec(ld.point)} mm" if ld.point is not None else
+                   f"{_vec(list(ld.offset or [0, 0, 0]))} mm from the centroid of its faces")
+            return (f"Fluid density: {_fmt(ld.density if ld.density is not None else defaults.WATER_DENSITY)} kg/m³"
+                    f"\nPressure on top of the fluid (absolute): "
+                    f"{_fmt(ld.surface_pressure if ld.surface_pressure is not None else defaults.ATMOSPHERE_MPA)} MPa"
+                    f"\nTop of the fluid: {top}\nDown: {_vec(list(down))}"
+                    + ("" if ld.magnitude in (None, 1, 1.0) else f"\nLoad factor: {_fmt(ld.magnitude)}"))
         if ld.direction is None:
             return f"Value: {_fmt(ld.magnitude)} {units.get(ld.type, '')}"
         d = np.asarray(ld.direction, float)

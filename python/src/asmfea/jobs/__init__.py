@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -90,6 +91,7 @@ class JobState:
             "solver": None, "log_tail": [],
         })
         self._stop = threading.Event()
+        self._timed = None              # (text, start, estimate_s): an activity whose elapsed time is shown live
         self._flush()
         self._thread = threading.Thread(target=self._beat, daemon=True)
         self._thread.start()
@@ -101,6 +103,16 @@ class JobState:
 
     def _flush(self):
         with self._lock:
+            if self._timed is not None:
+                text, t0, est = self._timed
+                el = time.time() - t0
+                if not est:
+                    tail = f"{el:.0f} s"
+                elif el <= est:
+                    tail = f"{el:.0f} s of ~{est:.0f} s (estimate)"
+                else:
+                    tail = f"{el:.0f} s (longer than the ~{est:.0f} s estimate)"
+                self.doc["activity"] = f"{text}: {tail}"
             self.doc["heartbeat"] = _now()
             self.doc["elapsed_s"] = round(time.time() - self._t0, 1)
             write_json_atomic(self.path, self.doc)
@@ -120,8 +132,23 @@ class JobState:
             t = self.doc["timings"][name]
             t["seconds"] = round(time.time() - t.pop("start"), 2)
 
+    @contextmanager
+    def timed(self, text: str, estimate_s: Optional[float] = None):
+        """An activity shown with its elapsed time, refreshed with the heartbeat, against an estimate when there
+        is one: for a long step that reports no progress of its own (assembling the deck)."""
+        with self._lock:
+            self._timed = (text, time.time(), estimate_s)
+            self.doc["activity"] = text
+            self.doc["progress"] = None
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._timed = None
+
     def activity(self, text: str, done: Optional[int] = None, total: Optional[int] = None):
         with self._lock:
+            self._timed = None
             self.doc["activity"] = text
             self.doc["progress"] = None if total is None else {"done": done, "total": total}
 
@@ -250,8 +277,38 @@ def status(study: Path, job_id: str, wait_s: float = 0.0) -> dict:
     return doc
 
 
-def cancel(study: Path, job_id: str) -> None:
-    (job_dir(study, job_id) / "cancel").write_text(_now())
+def cancel(study: Path, job_id: str, grace_s: Optional[float] = None) -> None:
+    """Ask the job to stop; if it has not stopped within grace_s (CANCEL_GRACE_S), end its worker's whole process
+    tree (the worker, its threads, and any solver or mesher it started) and mark it cancelled. A long native call
+    (a PARDISO factorisation, a part's condensation) does not look at the request, so Cancel waited for it to
+    finish (found live on a water tank: still running minutes later; the user asked for this)."""
+    d = job_dir(study, job_id)
+    (d / "cancel").write_text(_now())
+    grace = defaults.CANCEL_GRACE_S if grace_s is None else grace_s
+    t_end = time.time() + grace
+    while time.time() < t_end:
+        doc = read_json(d / "job.json") if (d / "job.json").exists() else {}
+        if doc.get("state") not in ("running", "queued"):
+            return
+        time.sleep(0.5)
+    doc = read_json(d / "job.json")
+    pid = doc.get("pid")
+    try:
+        import psutil
+        proc = psutil.Process(int(pid))
+        cmd = " ".join(proc.cmdline())
+        # only this job's own worker: a process number can be reused by something else
+        if "asmfea.jobs.worker" in cmd and job_id in cmd:
+            for p in proc.children(recursive=True) + [proc]:
+                try:
+                    p.kill()
+                except psutil.Error:
+                    pass
+    except Exception:
+        pass                                    # gone already
+    doc.update(state="cancelled", activity="cancelled: the job did not stop on request, so its process was ended",
+               heartbeat=_now())
+    write_json_atomic(d / "job.json", doc)
 
 
 def list_jobs(study: Path) -> list[str]:

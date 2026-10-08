@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import shutil
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -40,6 +41,10 @@ class _Job:
 
     def solver(self, *a, **k):
         pass
+
+    @contextmanager
+    def timed(self, *a, **k):
+        yield
 
     def cancel_requested(self):
         return False

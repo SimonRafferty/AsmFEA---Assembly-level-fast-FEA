@@ -191,7 +191,8 @@
         "profile": {"enum": ["round", "other"], "description": "profile center: round profiles turn about their common axis unless locked"},
         "ratio": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "gear: ratio numerator and denominator (in the order of the entities)"},
         "distance_per_rev": {"type": "number", "description": "rack and pinion: rack travel per pinion revolution; screw: lead (mm per revolution)"},
-        "reverse": {"type": "boolean", "description": "gear, rack and pinion, screw: the mate's Reverse option"}
+        "reverse": {"type": "boolean", "description": "gear, rack and pinion, screw: the mate's Reverse option"},
+        "limits": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2, "description": "distance, angle: the mate's limits (minimum, maximum; mm or degrees) when it is a limit mate: the parts may move between them"}
       }
     },
     "fingerprint": {
@@ -228,17 +229,21 @@
       "properties": {
         "id": {"$ref": "#/$defs/id"},
         "load_case": {"type": "string"},
-        "type": {"enum": ["force", "pressure", "gravity", "remote_force"]},
+        "type": {"enum": ["force", "pressure", "gravity", "remote_force", "hydrostatic"]},
         "faces": {"type": "array", "items": {"type": "string"}},
-        "magnitude": {"type": "number", "description": "force, remote_force: N total; pressure: MPa (positive pushes into the face); gravity: mm/s^2"},
+        "magnitude": {"type": "number", "description": "force, remote_force: N total; pressure: MPa (positive pushes into the face); gravity: mm/s^2; hydrostatic: a load factor on its pressures (1 = as defined)"},
         "direction": {"$ref": "#/$defs/vec3"},
         "point": {"$ref": "#/$defs/vec3", "description": "remote_force: application point, assembly frame (mm)"},
-        "offset": {"$ref": "#/$defs/vec3", "description": "remote_force: application point as an offset (mm, assembly axes) from the area-weighted centroid of its faces; used when point is absent"},
+        "offset": {"$ref": "#/$defs/vec3", "description": "remote_force: application point as an offset (mm, assembly axes) from the area-weighted centroid of its faces; used when point is absent. hydrostatic: the top of the fluid, the same way"},
+        "density": {"type": "number", "exclusiveMinimum": 0, "description": "hydrostatic: the fluid's density, kg/m^3 (default water, 1000)"},
+        "surface_pressure": {"type": "number", "minimum": 0, "description": "hydrostatic: absolute pressure on the top of the fluid, MPa (default 1 atmosphere, 0.101325); 1 atmosphere is taken to act outside, so the faces get the difference"},
         "scale_in_buckling": {"type": "boolean", "description": "false = applied as preload in buckling steps (self-weight)"}
       },
       "allOf": [
         {"if": {"properties": {"type": {"enum": ["force", "pressure", "remote_force"]}}},
          "then": {"required": ["faces", "magnitude"]}},
+        {"if": {"properties": {"type": {"const": "hydrostatic"}}},
+         "then": {"required": ["faces"]}},
         {"if": {"properties": {"type": {"enum": ["force", "gravity", "remote_force"]}}},
          "then": {"required": ["direction", "magnitude"]}}
       ]
