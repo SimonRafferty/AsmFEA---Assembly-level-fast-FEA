@@ -63,7 +63,7 @@ namespace AsmFea.AddIn
         private readonly ListView loadsList = MakeList("Id", "Kind", "Type", "Value", "Faces");
         // the load case the Loads tab shows and adds to; its buckling tick
         private readonly ComboBox caseBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 170 };
-        private readonly CheckBox caseBuckling = new CheckBox { Text = "Buckling", AutoSize = true, Padding = new Padding(0, 3, 0, 0) };
+        private readonly CheckBox caseBuckling = new CheckBox { Text = "Include buckling in load case", AutoSize = true, Padding = new Padding(0, 3, 0, 0) };
         private bool showing;          // true while ShowStudy fills the controls: their change events must not store
 
         /// <summary>A load case in the drop-down: its name, marked when it includes buckling.</summary>
@@ -78,7 +78,7 @@ namespace AsmFea.AddIn
         private const double DefaultMinFos = 1.5, DefaultMinBucklingFactor = 3.0, DefaultDeflectionRatio = 250;
         private readonly ListView connList = MakeList("Connection", "Found by");
         private TabPage connTab, resTab;
-        private readonly CheckBox exceptionsOnly = new CheckBox { Text = "Exceptions only", AutoSize = true };
+        private readonly CheckBox exceptionsOnly = new CheckBox { Text = "Show exceptions only", AutoSize = true, Padding = new Padding(0, 3, 0, 0) };
         private readonly TextBox bondTol = new TextBox { Width = 45 };
         private readonly ComboBox solveCase = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
         private readonly CheckBox fullRun = new CheckBox { Text = "Full re-run", AutoSize = true, Padding = new Padding(8, 3, 0, 0) };
@@ -137,8 +137,9 @@ namespace AsmFea.AddIn
             { "Sliding joint...", "The parts stay together but slide freely (no friction) along one direction you choose." },
             { "Not connected (delete)", "Delete this connection: the parts do not transfer load here. 'Automatic' brings it back." },
             { "Automatic", "Remove your choice and let AsmFEA decide the connection from the geometry and mates." },
-            { "?", "Explain the selected item in full (or double-click it)." },
-            { "More Info", "Explain the selected problem in full: what it means and what to do (or double-click it)." },
+            { "More Info", "Explain the selected item in the list below in full: what it means and what to do (or double-click it)." },
+            { "Add hinge...", "A hinge on the faces selected in SolidWorks: one hole or pin surface is enough (AsmFEA finds the concentric faces of the other parts). Tick Lock rotation to bond it." },
+            { "Sliding, no separation", "The faces stay in contact and slide freely over each other, without friction; they can neither part nor press into each other." },
             { "Export", "Write the model (model.json and one STEP file per part) into the study folder, without running anything." },
             { "Run", "Export, then check, mesh, solve (the load cases chosen in Solve) and report. Progress shows below; the job runs in the background." },
             { "Fast run", "Fast run: for iterative design only. Results are approximate. Do a full run at the end, before relying on the results or producing a report." },
@@ -223,6 +224,42 @@ namespace AsmFea.AddIn
         }
 
         // ------------------------------------------------------------------ helpers
+
+        /// <summary>
+        /// Lay a tab out top to bottom in reading order. Docked controls stack the other way round (the last one
+        /// added sits on top), so they are added in reverse; a control docked Fill goes last in the list.
+        /// </summary>
+        private static void Stack(Control page, params Control[] topToBottom)
+        {
+            for (int i = topToBottom.Length - 1; i >= 0; i--) page.Controls.Add(topToBottom[i]);
+        }
+
+        /// <summary>A thin dividing line across the tab, between groups of controls.</summary>
+        private static Panel Rule()
+        {
+            var rule = new Panel { Dock = DockStyle.Top, Height = 9 };
+            rule.Paint += (s, e) =>
+            {
+                using (var pen = new Pen(Color.FromArgb(0xb8, 0xc4, 0xd4))) e.Graphics.DrawLine(pen, 4, 4, rule.Width - 5, 4);
+            };
+            rule.Resize += (s, e) => rule.Invalidate();
+            return rule;
+        }
+
+        /// <summary>One line of controls (it wraps when the pane is narrow).</summary>
+        private static FlowLayoutPanel Row(params Control[] items)
+        {
+            var row = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 1, 0, 1) };
+            row.Controls.AddRange(items);
+            return row;
+        }
+
+        private static Label Caption(string text, bool bold = false)
+        {
+            var l = new Label { Text = text, AutoSize = true, Padding = new Padding(0, 6, 0, 0) };
+            if (bold) l.Font = new Font(l.Font, FontStyle.Bold);
+            return l;
+        }
 
         private static ListView MakeList(params string[] cols)
         {
@@ -769,15 +806,27 @@ namespace AsmFea.AddIn
                 t.Controls.Add(new Label { Text = label, AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
                 t.Controls.Add(c);
             };
+            bool first = true;
             Action<string> heading = text =>
             {
-                var h = new Label { Text = text, AutoSize = true, Font = new Font(Font, FontStyle.Bold), Padding = new Padding(0, 12, 0, 2) };
+                if (!first)
+                {
+                    // a dividing line between the groups, across both columns
+                    var line = new Label { BorderStyle = BorderStyle.Fixed3D, Height = 2, Dock = DockStyle.Fill, Margin = new Padding(0, 10, 0, 0) };
+                    t.Controls.Add(line);
+                    t.SetColumnSpan(line, 2);
+                }
+                first = false;
+                var h = new Label { Text = text, AutoSize = true, Font = new Font(Font, FontStyle.Bold), Padding = new Padding(0, 6, 0, 2) };
                 t.Controls.Add(h);
                 t.SetColumnSpan(h, 2);
             };
             fidelity.Items.AddRange(new object[] { "coarse", "standard", "fine" });
+            // by function: how the model is meshed, how it is solved, how the results are judged
+            heading("Mesh");
             add("Mesh fidelity", fidelity);
             add("", convergence);
+            heading("Solving");
             add("", fastLoads);
             heading("Pass / fail criteria (used in the reports)");
             add("Max deflection, mm", maxDefl);
@@ -827,24 +876,12 @@ namespace AsmFea.AddIn
         private TabPage LoadsTab()
         {
             var p = new TabPage("Loads and fixtures");
-            var cases = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 2, 0, 4) };
-            cases.Controls.Add(new Label { Text = "Load case", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
-            cases.Controls.Add(caseBox);
-            // "[x] Buckling [5] modes" kept together when the row wraps
-            var buck = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+            // the load case, the buttons that manage cases, then the case's buckling, then what is added to it
+            var caseRow = Row(Caption("Load case"), caseBox);
+            var caseButtons = Row(Btn("New load case", NewCase), Btn("Rename", RenameCase), Btn("Delete load case", DeleteCase));
             bucklingModes.Width = 45;
-            buck.Controls.Add(caseBuckling);
-            buck.Controls.Add(bucklingModes);
-            buck.Controls.Add(new Label { Text = "modes", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
-            cases.Controls.Add(buck);
-            var caseButtons = new FlowLayoutPanel { AutoSize = true, Margin = new Padding(0) };
-            caseButtons.Controls.Add(Btn("New load case", NewCase));
-            caseButtons.Controls.Add(Btn("Rename", RenameCase));
-            caseButtons.Controls.Add(Btn("Delete load case", DeleteCase));
-            cases.Controls.Add(caseButtons);
-            // rows: the case; its buckling; the case buttons
-            cases.SetFlowBreak(caseBox, true);
-            cases.SetFlowBreak(buck, true);
+            var buck = Row(caseBuckling, bucklingModes, Caption("modes"));
+            buck.WrapContents = false;                                  // "[x] Include buckling in load case [5] modes" kept together
             caseBox.SelectedIndexChanged += (s, e) =>
             {
                 if (showing || Study == null) return;
@@ -868,18 +905,8 @@ namespace AsmFea.AddIn
             bar.Controls.Add(delete);
             loadsList.SelectedIndexChanged += (s, e) => HighlightSelected();
             loadsList.DoubleClick += (s, e) => EditSelected();
-            p.Controls.Add(loadsList);
-            p.Controls.Add(loadsActivity);
-            p.Controls.Add(bar);
-            // a line between the load-case controls and what is added to the case
-            var rule = new Panel { Dock = DockStyle.Top, Height = 9 };
-            rule.Paint += (s, e) =>
-            {
-                using (var pen = new Pen(Color.FromArgb(0xb8, 0xc4, 0xd4))) e.Graphics.DrawLine(pen, 4, 4, rule.Width - 5, 4);
-            };
-            rule.Resize += (s, e) => rule.Invalidate();
-            p.Controls.Add(rule);
-            p.Controls.Add(cases);
+            p.Controls.Add(loadsActivity);                              // docked at the bottom
+            Stack(p, caseRow, caseButtons, Rule(), buck, Rule(), bar, loadsList);
             return p;
         }
 
@@ -1153,33 +1180,38 @@ namespace AsmFea.AddIn
         private TabPage ConnectionsTab()
         {
             var p = connTab = new TabPage("Connections");
-            var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
-            // the same as Check only on the Run tab: export, then resolve (the list refills when it finishes)
-            bar.Controls.Add(Btn("Analyse connections", () => Run("resolve")));
-            bar.Controls.Add(exceptionsOnly);
-            bar.Controls.Add(Btn("Add hinge...", AddHinge));
-            bar.Controls.Add(Btn("?", ExplainConnection));
-            exceptionsOnly.CheckedChanged += (s, e) => LoadConnections();
-            connList.DoubleClick += (s, e) => ExplainConnection();
-            // Overrides for the selected connection (stored in the study, used from the next run)
-            var edit = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
-            edit.Controls.Add(new Label { Text = "Set to:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
+            // 1: analyse, with the bond tolerance it uses (the same as Check only on the Run tab: export, then resolve)
+            // the tolerance and its units kept together: beside the button, or on the next line as a whole
+            var bond = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+            bond.Controls.AddRange(new Control[] { Caption("Bond gaps & overlaps up to"), bondTol, Caption("mm") });
+            var analyse = Row(Btn("Analyse connections", () => Run("resolve")), bond);
+            // 2: the selected connection set to (stored in the study, used from the next run); Add hinge, a special
+            // kind of setting made from selected faces, in its own frame at the end
+            var edit = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 1, 0, 1) };
+            edit.Controls.Add(Caption("Set to:"));
             edit.Controls.Add(Btn("Fixed", () => SetConnection("tie", null, null)));
             edit.Controls.Add(Btn("Sliding with friction...", SetContact));
-            edit.Controls.Add(Btn("Sliding joint...", SetSliding));
+            var lineEnd = Btn("Sliding joint...", SetSliding);
+            edit.Controls.Add(lineEnd);
+            edit.SetFlowBreak(lineEnd, true);                           // the Set-to buttons on two lines
             edit.Controls.Add(Btn("Sliding, no separation", () => SetConnection("slide", null, null)));
             edit.Controls.Add(Btn("Not connected (delete)", () => SetConnection("none", null, null)));
             edit.Controls.Add(Btn("Automatic", ClearConnection));
+            var hingeFrame = new Panel { BorderStyle = BorderStyle.FixedSingle, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(2), Margin = new Padding(8, 1, 3, 1) };
+            var hinge = Btn("Add hinge...", AddHinge);
+            hinge.Margin = new Padding(0);
+            hingeFrame.Controls.Add(hinge);
+            edit.Controls.Add(hingeFrame);
+            // 3: the list, its filter and its More Info
+            var listBar = Row(exceptionsOnly, Btn("More Info", ExplainConnection));
+            exceptionsOnly.CheckedChanged += (s, e) => LoadConnections();
+            connList.DoubleClick += (s, e) => ExplainConnection();
             connList.SelectedIndexChanged += (s, e) =>
             {
                 var row = SelectedConnection();
                 if (row != null) host.SelectComponents(Doc, row.Parts);
             };
             // the bond tolerance: faces within it (a gap or an overlap) count as touching
-            var tol = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
-            tol.Controls.Add(new Label { Text = "Bond gaps and overlaps up to", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
-            tol.Controls.Add(bondTol);
-            tol.Controls.Add(new Label { Text = "mm", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
             bondTol.TextChanged += (s, e) =>
             {
                 if (showing || Study == null) return;
@@ -1192,11 +1224,7 @@ namespace AsmFea.AddIn
                 Stored();
                 Say("Bond tolerance stored: click Analyse connections to apply it.");
             };
-            p.Controls.Add(connList);
-            p.Controls.Add(connActivity);
-            p.Controls.Add(edit);
-            p.Controls.Add(tol);
-            p.Controls.Add(bar);
+            Stack(p, analyse, Rule(), edit, Rule(), listBar, connActivity, connList);
             return p;
         }
 
@@ -1531,29 +1559,20 @@ namespace AsmFea.AddIn
         private TabPage RunTab()
         {
             var p = new TabPage("Run");
-            var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
-            bar.Controls.Add(Btn("Run", () => Run(null)));
-            bar.Controls.Add(Btn("Fast run", () => Run(null, true)));
-            bar.Controls.Add(Btn("Check only", () => Run("resolve")));
-            bar.Controls.Add(Btn("Cancel", CancelJob));
-            bar.Controls.Add(Btn("More Info", () => { if (problems.SelectedItems.Count > 0) ShowHelp((JObj)problems.SelectedItems[0].Tag); else Say("Select a problem first.", true); }));
+            // what to solve and the run buttons; the model files; progress; the problems, their More Info and the log
+            var which = Row(Caption("Solve"), solveCase, fullRun);
+            var runs = Row(Btn("Run", () => Run(null)), Btn("Fast run", () => Run(null, true)), Btn("Check only", () => Run("resolve")),
+                           Btn("Cancel", CancelJob));
+            var files = Row(Caption("Model files:"), Btn("Export", () => Export()),
+                            Btn("Open folder", () => { if (Doc != null && StudyName != null) OpenPath(host.StudyFolder(Doc, StudyName)); }));
+            var probBar = Row(Caption("Problems", true),
+                              Btn("More Info", () => { if (problems.SelectedItems.Count > 0) ShowHelp((JObj)problems.SelectedItems[0].Tag); else Say("Select a problem first.", true); }));
             problems.DoubleClick += (s, e) => { if (problems.SelectedItems.Count > 0) ShowHelp((JObj)problems.SelectedItems[0].Tag); };
-            bar.Controls.Add(Btn("Open folder", () => { if (Doc != null && StudyName != null) OpenPath(host.StudyFolder(Doc, StudyName)); }));
-            bar.Controls.Add(Btn("Export", () => Export()));
             problems.SelectedIndexChanged += (s, e) => HighlightProblem();
-            // which load cases to solve: all, or one (each case adds to the solve time)
-            var which = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
-            which.Controls.Add(new Label { Text = "Solve", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
-            which.Controls.Add(solveCase);
-            which.Controls.Add(fullRun);
             var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 120 };
             split.Panel1.Controls.Add(problems);
             split.Panel2.Controls.Add(logBox);
-            p.Controls.Add(split);
-            p.Controls.Add(activity);
-            p.Controls.Add(progress);
-            p.Controls.Add(which);
-            p.Controls.Add(bar);
+            Stack(p, which, runs, Rule(), files, Rule(), progress, activity, probBar, split);
             return p;
         }
 
@@ -1684,26 +1703,18 @@ namespace AsmFea.AddIn
         private TabPage ResultsTab()
         {
             var p = resTab = new TabPage("Results");
-            var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
+            // the 3-D plots of a load case; the reports; then the checks and key figures
+            var plotFor = Row(Caption("Load case"), plotCase);
+            var plots = Row(Caption("Plots:"), Btn("Stress", () => ShowPlot("vonmises")),
+                            Btn("Displacement", () => ShowPlot("displacement")), Btn("FoS", () => ShowPlot("fos")));
+            var other = Row(Btn("Open in PrePoMax", OpenPrePoMax));
             reportBtn = Btn("Open report", () => OpenReport(false));
             summaryBtn = Btn("Open summary", () => OpenReport(true));
-            bar.Controls.Add(reportBtn);
-            bar.Controls.Add(summaryBtn);
-            bar.Controls.Add(Btn("Open in PrePoMax", OpenPrePoMax));
-            var plots = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
-            plots.Controls.Add(new Label { Text = "Plots:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
-            plots.Controls.Add(Btn("Stress", () => ShowPlot("vonmises")));
-            plots.Controls.Add(Btn("Displacement", () => ShowPlot("displacement")));
-            plots.Controls.Add(Btn("FoS", () => ShowPlot("fos")));
-            plots.Controls.Add(plotCase);
+            var reports = Row(Caption("Reports:"), reportBtn, summaryBtn);
             var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 160 };
             split.Panel1.Controls.Add(checksList);
             split.Panel2.Controls.Add(keyFigures);
-            p.Controls.Add(split);
-            p.Controls.Add(resActivity);
-            p.Controls.Add(plots);
-            p.Controls.Add(bar);
-            p.Controls.Add(fastBanner);
+            Stack(p, fastBanner, plotFor, plots, other, Rule(), reports, Rule(), resActivity, split);
             return p;
         }
 
