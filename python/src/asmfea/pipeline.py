@@ -181,10 +181,10 @@ LEVELS = (("base", 1.0), ("refined", defaults.REFINE_RATIO))
 
 
 def levels_for(model: Model, mode: str = FULL) -> tuple:
-    """Both meshes by default; only the base mesh when the study turns the check off, or in a fast run."""
-    if mode == FAST or (model.study and not model.study.mesh.convergence_check):
-        return LEVELS[:1]
-    return LEVELS
+    """Both meshes when the run planner (D60) keeps the convergence check (balanced, accuracy, or the study's
+    override); only the base mesh for speed, when the study turns the check off, or in a fast run."""
+    from .planner import plan_study
+    return LEVELS if plan_study(model.study, fast=(mode == FAST)).convergence_check else LEVELS[:1]
 
 
 def mesh_route(part) -> tuple[str, dict]:
@@ -267,7 +267,8 @@ def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL) -> tuple[dict, 
     from .mesh.backends import CHAINS, registry
 
     geo = read_json(study / "geometry.json")
-    fidelity = FAST if mode == FAST else (model.study.mesh.fidelity if model.study else "standard")
+    from .planner import plan_study
+    fidelity = plan_study(model.study, fast=(mode == FAST)).fidelity     # D60: from favour, or the override
     user_size = model.study.mesh.size if model.study else None
     conn_doc = read_json(study / "connections.json")
     removed = set(conn_doc.get("removed_parts", []))
@@ -486,10 +487,17 @@ def tie_zone_nodes(instances: list[Instance], conns: list[dict], model: Model | 
             for m in b["masters"]:
                 inst = by[m["part"]]
                 ids = seeds.setdefault(inst.part_id, set())
+                # every face element at once, grouped by node count (one at a time in Python was most of
+                # this step: 7 s on a 53-member frame)
+                groups: dict[int, list] = {}
                 for _, _, _, conn in inst.face_elements(int(m["face"])):
-                    P = inst.X[np.asarray(conn) - 1]
-                    if np.any(np.all((P >= lo) & (P <= hi), axis=1)):
-                        ids.update(int(inst.node0 + n) for n in conn)
+                    groups.setdefault(len(conn), []).append(conn)
+                for conns_ in groups.values():
+                    C = np.asarray(conns_, dtype=np.int64)
+                    P = inst.X[C - 1]                                          # (elements, nodes, 3)
+                    under = np.all((P >= lo) & (P <= hi), axis=2).any(axis=1)
+                    if under.any():
+                        ids.update((inst.node0 + C[under]).ravel().tolist())
     zones = {}
     for pid, ids in seeds.items():
         if not ids:
@@ -571,7 +579,7 @@ def _without_removed(model: Model, removed: set[str], face_map: dict) -> Model:
     return model.model_copy(update={"loads": loads})
 
 
-def solve_level(study: Path, js: JobState, model: Model, level: str, cfg) -> dict:
+def solve_level(study: Path, js: JobState, model: Model, level: str, cfg, plan=None) -> dict:
     """Write and solve the decks of one mesh level in run/<job>/<level>/.
 
     Linear studies: one deck with every load case (and the buckling steps).
@@ -635,11 +643,18 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg) -> dic
             from .superpose import solved_map
             deck.info["superposition"] = solved_map(deck.info, spec["model"])
         _write(rd / "deck_info.json", deck.info)
+        # the run planner (D60) chooses the solver from the deck's size and the memory free when the run began:
+        # CalculiX when it fits the budget with a margin, the hybrid solver otherwise (linear decks only)
+        from .planner import choose_solver, plan_study
+        plan = plan or plan_study(model.study)
+        if os.environ.get("ASMFEA_TEST_FORCE_HYBRID"):                       # test switch: as if it would not fit
+            plan.solver_pref = "hybrid"
+        solver_choice, plan_notes = choose_solver(plan, dof, spec["kind"])
+        for line in plan_notes:
+            js.log(f"plan: {line}")
         mem = memory_check(dof)
         too_big = [d for d in mem if d.code == "SOLVE_MEMORY_EXCEEDS_RAM"]
-        if os.environ.get("ASMFEA_TEST_FORCE_HYBRID") and not too_big:      # test switch: as if it would not fit
-            too_big = [make("SOLVE_MEMORY_EXCEEDS_RAM", need_gb=0.0, ram_gb=0.0, dof=dof)]
-        use_hybrid = bool(too_big) and spec["kind"] == "linear"
+        use_hybrid = solver_choice == "hybrid"
         if not use_hybrid:
             js.add_diags(mem)
             raise_if_blocking(mem)
@@ -654,14 +669,21 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg) -> dic
             from .solve import run_hybrid
             try:
                 with perf.span("hybrid", level=level, dof=dof) as pinfo:
-                    outcome = run_hybrid(rd, "study", on_tick=tick)
+                    outcome = run_hybrid(rd, "study", on_tick=tick, budget_gb=plan.budget_gb,
+                                         exact_part_unknowns=plan.exact_part_unknowns,
+                                         exact_total_unknowns=plan.exact_total_unknowns, reserve_gb=plan.reserve_gb,
+                                         dof=dof)
                     pinfo["peak_rss_gb"] = outcome.peak_rss_gb
+                solver_used = "hybrid"
             except Unsupported as e:
-                js.log(f"hybrid solver cannot take this deck ({e}); refused as too large for CalculiX")
-                js.add_diags(too_big)
+                # a deck the hybrid cannot take (bolts, equations, buckling): CalculiX after all, unless it
+                # cannot fit in the computer at all (it would page to a standstill)
+                js.log(f"hybrid solver cannot take this deck ({e}); solving with CalculiX")
+                js.add_diags(mem)
                 raise_if_blocking(too_big)
-                raise
-            solver_used = "hybrid"
+                use_hybrid = False
+                plan.solver = "calculix"
+        if use_hybrid:
             import psutil
             ram = psutil.virtual_memory().total / 1e9
             js.add_diags([make("SOLVER_HYBRID", dof=dof, need_gb=estimate_memory_gb(dof), ram_gb=ram,
@@ -673,6 +695,8 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg) -> dic
                 pinfo.update(perf_ccx_log(rd / "ccx.log"))
         if outcome.cancelled:
             raise Cancelled()
+        if outcome.ok and outcome.diagnostics:            # warnings from a solve that succeeded (a retry, D60)
+            js.add_diags(outcome.diagnostics)
         if not outcome.ok:
             for dg in outcome.diagnostics:
                 if dg.code == "CONTACT_NOT_CONVERGED":
@@ -687,13 +711,15 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg) -> dic
             _record_history(dof, outcome.seconds, len(spec["cases"]))
         stats["seconds"] += outcome.seconds
         stats["peak_rss_gb"] = max(stats["peak_rss_gb"], outcome.peak_rss_gb)
+        extra = {"solver_info": outcome.info} if outcome.info else {}     # the hybrid's joints, for the grade
         if "model" in spec:
             from .superpose import prepare_cases
             runs.append({"dir": "cases", "cases": cases, "kind": spec["kind"], "superposed_from": spec["dir"],
-                         "solver": solver_used})
+                         "solver": solver_used, **extra})
             prepare_cases(d, model)
         else:
-            runs.append({"dir": spec["dir"], "cases": spec["cases"], "kind": spec["kind"], "solver": solver_used})
+            runs.append({"dir": spec["dir"], "cases": spec["cases"], "kind": spec["kind"], "solver": solver_used,
+                         **extra})
         js.result(f"solve ({label}): {dof:,} DOF, {len(spec['cases'])} load case(s) in {outcome.seconds:.1f} s, "
                   f"peak solver memory {outcome.peak_rss_gb:.1f} GB")
     _write(d / "runs.json", runs)
@@ -842,7 +868,13 @@ def stage_solve(study: Path, js: JobState) -> None:
         note_reuse(js, "solve", f"results of job {run_id} reused")
         return
     js = Recorder(js)
-    stats = {level: solve_level(study, js, model, level, cfg) for level in levels}
+    # the run planner (D60): this computer's free memory and cores, measured now, decide the solver and its budget
+    from .planner import plan_study
+    plan = plan_study(model.study, fast=(mode == FAST))
+    for line in plan.notes:
+        js.log(f"plan: {line}")
+    stats = {level: solve_level(study, js, model, level, cfg, plan) for level in levels}
+    _write(js.dir / "plan.json", plan.as_dict())
     _write(js.dir / "solve_stats.json", stats)
     latest_solve_file(study, mode).write_text(js.dir.name)
     cache.put(stage, k, run_outputs(js.dir, levels), {**js.data(), "run": js.dir.name})
@@ -854,10 +886,42 @@ def _stress_classification(study: Path, model: Model, lv: str, run: Path, res: d
     instances = build_instances(study, model, lv, mode)
     topo: dict = {}
     with perf.span("stress_classification", level=lv):
-        _classify(study, model, lv, run, res, js, instances, topo)
+        _classify(study, model, lv, run, res, js, instances, topo, mode)
 
 
-def _classify(study, model, lv, run, res, js, instances, topo) -> None:
+_CLS: dict = {}          # a classification worker's model, meshes and results, loaded once (_classify_init)
+
+
+def _classify_init(study: str, lv: str, mode: str, rd: str, thick: dict, band: dict) -> None:
+    """A classification worker: load the model, the meshes and the results once (the results from the arrays
+    read_frd keeps beside the .frd, so quickly)."""
+    from .post.frd import read_frd
+    study_p = Path(study)
+    model = load_model(study_p)
+    _CLS.update(inst={i.part_id: i for i in build_instances(study_p, model, lv, mode)},
+                frd=read_frd(Path(rd) / "study.frd"), thick=thick, band={k: set(v) for k, v in band.items()},
+                topo={}, stress={})
+
+
+def _classify_part(task: tuple) -> tuple:
+    """One part's membrane plus bending stress for one load case's step, in a worker: (part id, result)."""
+    from .post.frd import von_mises
+    from .post.sections import PartTopology, membrane_bending
+    step, part_id = task
+    if step not in _CLS["stress"]:
+        sn, sv = _CLS["frd"][step]["STRESS"]
+        stress = np.zeros((int(sn.max()) + 1, 6))
+        stress[sn.astype(np.int64)] = sv[:, :6]
+        _CLS["stress"] = {step: (sn, von_mises(sv[:, :6]), stress)}            # one step at a time
+    sn, vm, stress = _CLS["stress"][step]
+    inst = _CLS["inst"][part_id]
+    sel = (sn > inst.node0) & (sn <= inst.node0 + inst.X.shape[0])
+    tp = _CLS["topo"].setdefault(part_id, PartTopology(inst))
+    return part_id, membrane_bending(inst, tp, np.column_stack([sn[sel], vm[sel]]), stress,
+                                     _CLS["band"].get(part_id, set()), thin=_CLS["thick"].get(part_id))
+
+
+def _classify(study, model, lv, run, res, js, instances, topo, mode: str = FULL) -> None:
     from .post import _wall_thickness
     from .post.frd import read_frd, von_mises
     from .post.sections import PartTopology, membrane_bending, receiving_walls
@@ -897,35 +961,59 @@ def _classify(study, model, lv, run, res, js, instances, topo) -> None:
             continue
         frd = read_frd(rd / "study.frd")
         found: dict = {}
-        for case in r["cases"]:
-            lc = res["load_cases"].get(case)
-            if lc is None or case not in step_of:
-                continue
-            k = step_of[case]
-            un, uv = frd[k]["DISP"]
-            sn, sv = frd[k]["STRESS"]
-            stress = np.zeros((int(sn.max()) + 1, 6))       # by global node id (a dict took seconds on 1 M nodes)
-            stress[sn.astype(np.int64)] = sv[:, :6]
-            vm = von_mises(sv[:, :6])
-            js.activity(f"post: membrane plus bending and receiving walls, load case {case}")
-            found[case] = {}
-            for inst in instances:
-                if lc["parts"].get(inst.part_id) is None:
+        # a large model's parts are classified in worker processes, each loading the meshes and results once
+        # itself (pure Python per part: 22 s on one core for a 4.5 M-DOF frame); a small one here, as before
+        big = (sum(len(i.X) for i in instances) >= defaults.CLASSIFY_POOL_MIN_NODES
+               and len(instances) >= 4 and not defaults.RECEIVING_WALLS)
+        pool = None
+        if big:
+            try:
+                import multiprocessing as mp
+                from concurrent.futures import ProcessPoolExecutor
+                workers = min(defaults.CLASSIFY_WORKERS, len(instances), max(1, (os.cpu_count() or 2) - 1))
+                pool = ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn"),
+                                           initializer=_classify_init,
+                                           initargs=(str(study), lv, mode, str(rd), thick,
+                                                     {k: sorted(v) for k, v in band.items()}))
+            except Exception:                                       # noqa: BLE001 - classified here instead
+                pool = None
+        try:
+            for case in r["cases"]:
+                lc = res["load_cases"].get(case)
+                if lc is None or case not in step_of:
                     continue
-                sel = (sn > inst.node0) & (sn <= inst.node0 + inst.X.shape[0])
-                tp = topo.setdefault(inst.part_id, PartTopology(inst))
-                mb = membrane_bending(inst, tp, np.column_stack([sn[sel], vm[sel]]), stress, band.get(inst.part_id, set()),
-                                      thin=thick.get(inst.part_id))
-                found[case][inst.part_id] = mb
-                apply(lc, inst.part_id, mb)
-            # the receiving wall (D34): mesh-sensitive on small or wrapping footprints, so off by default
-            disp = {int(n): uv[i, :3] for i, n in enumerate(un)} if defaults.RECEIVING_WALLS else {}
-            for rec in (receiving_walls(instances, model, info, disp, thick, topo) if defaults.RECEIVING_WALLS else []):
-                lc.setdefault("joints", []).append(rec)
-                pr = lc["parts"].get(rec["part"])
-                if pr is not None and rec["structural_stress"] > pr.get("joint_stress", 0.0):
-                    pr.update(joint_stress=rec["structural_stress"], joint_stress_at=rec["at"], joint_fos=rec["fos"],
-                              joint_with=rec["other"])
+                k = step_of[case]
+                un, uv = frd[k]["DISP"]
+                js.activity(f"post: membrane plus bending and receiving walls, load case {case}")
+                found[case] = {}
+                todo = [inst for inst in instances if lc["parts"].get(inst.part_id) is not None]
+                if pool is not None:
+                    for part_id, mb in pool.map(_classify_part, [(k, inst.part_id) for inst in todo]):
+                        found[case][part_id] = mb
+                        apply(lc, part_id, mb)
+                else:
+                    sn, sv = frd[k]["STRESS"]
+                    stress = np.zeros((int(sn.max()) + 1, 6))   # by global node id (a dict took seconds on 1 M nodes)
+                    stress[sn.astype(np.int64)] = sv[:, :6]
+                    vm = von_mises(sv[:, :6])
+                    for inst in todo:
+                        sel = (sn > inst.node0) & (sn <= inst.node0 + inst.X.shape[0])
+                        tp = topo.setdefault(inst.part_id, PartTopology(inst))
+                        mb = membrane_bending(inst, tp, np.column_stack([sn[sel], vm[sel]]), stress,
+                                              band.get(inst.part_id, set()), thin=thick.get(inst.part_id))
+                        found[case][inst.part_id] = mb
+                        apply(lc, inst.part_id, mb)
+                # the receiving wall (D34): mesh-sensitive on small or wrapping footprints, so off by default
+                disp = {int(n): uv[i, :3] for i, n in enumerate(un)} if defaults.RECEIVING_WALLS else {}
+                for rec in (receiving_walls(instances, model, info, disp, thick, topo) if defaults.RECEIVING_WALLS else []):
+                    lc.setdefault("joints", []).append(rec)
+                    pr = lc["parts"].get(rec["part"])
+                    if pr is not None and rec["structural_stress"] > pr.get("joint_stress", 0.0):
+                        pr.update(joint_stress=rec["structural_stress"], joint_stress_at=rec["at"], joint_fos=rec["fos"],
+                                  joint_with=rec["other"])
+        finally:
+            if pool is not None:
+                pool.shutdown()
         try:
             saved_path.write_text(json.dumps({"key": ck, "by_case": found}))
         except OSError:
@@ -1060,6 +1148,14 @@ def _post(study: Path, js, model: Model, run: Path, levels: list[str], mode: str
     })
     floating = sum(1 for e in exc if e["code"] == "PART_FLOATING")
     res["checks"] = checks(model, res, len(open_exc), floating=floating)
+    # how accurate these results are likely to be, from how they were solved (D60)
+    from .accuracy import grade
+    plan = read_json(run / "plan.json") if (run / "plan.json").exists() else {}
+    all_runs = [r for lv in levels for r in read_json(run / lv / "runs.json")]
+    res["plan"] = plan or None
+    res["accuracy"] = grade(mode, plan.get("fidelity"), conv, all_runs, res["mesh"]["fallback_parts"],
+                            plan.get("favour"))
+    js.verify(res["accuracy"]["summary"])
     out = results_dir(study, mode)
     _write(out / "results.json", res)
     js.add_diags(diags)

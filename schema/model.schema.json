@@ -308,9 +308,11 @@
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "fidelity": {"enum": ["coarse", "standard", "fine"]},
+            "favour": {"enum": ["speed", "balanced", "accuracy"], "description": "What the run planner favours (D60): it chooses the mesh level, solver and convergence pass from this and the computer's free memory and cores; default balanced"},
+            "fidelity": {"enum": ["coarse", "standard", "fine"], "description": "Advanced override of the planner's mesh level"},
+            "solver": {"enum": ["auto", "calculix", "hybrid"], "description": "Advanced override of the planner's solver choice; default auto"},
             "size": {"type": "number", "exclusiveMinimum": 0, "description": "Override global element size, mm"},
-            "convergence_check": {"type": "boolean", "description": "Solve again on a refined mesh and report the change (default true)"}
+            "convergence_check": {"type": "boolean", "description": "Advanced override: solve again on a refined mesh and report the change (the planner decides when absent)"}
           }
         },
         "limits": {

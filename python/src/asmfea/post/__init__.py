@@ -316,46 +316,99 @@ def convergence(base: dict, refined: dict) -> tuple[dict, list[Diagnostic]]:
     return {"worst_change": worst, "by_case": out}, diags
 
 
+# What each check means and what to do when it fails, for the task pane's More Info (the user's request) and the
+# report. {case}, {part}, {tol} are filled in per row.
+CHECK_TEXT = {
+    "reaction": ("The forces at the supports add up to the loads applied, to within {tol}. This proves the solve "
+                 "is sound: no load is lost through a part that is not connected, and nothing is missing.",
+                 ["If it fails: look for parts that are not connected (Connections tab, exceptions) or loads applied "
+                  "on fixed faces."]),
+    "deflection": ("The largest displacement anywhere in the model under load case {case}, found in {part}, against "
+                   "the maximum deflection set under Pass / fail criteria on the Study tab.",
+                   ["If it fails: stiffen the part that moves most (a deeper section, a brace, a shorter span) or "
+                    "relax the limit if it was too strict."]),
+    "fos": ("The lowest factor of safety under load case {case}, in {part}: the material's yield strength divided by "
+            "the von Mises stress. Away from bonded joints the peak stress is used; at bonded joints the structural "
+            "(membrane plus bending) stress, so the spikes at sharp tie edges, which are not real, do not count. "
+            "Compared with the minimum set under Pass / fail criteria on the Study tab.",
+            ["If it fails: look at the stress plot for where it peaks, then strengthen there (thicker, a larger "
+             "section, a gusset or a bigger weld) or use a stronger material.",
+             "A peak marked singular is at a sharp corner or edge where stress has no finite value: refine there "
+             "or judge it by the stress just away from it."]),
+    "stress": ("The highest von Mises stress under load case {case}, away from bonded joints, in {part}, against "
+               "the allowable stress set under Pass / fail criteria on the Study tab.",
+               ["If it fails: strengthen where the stress plot peaks, or use a material with a higher allowable."]),
+    "buckling": ("The lowest buckling load factor for load case {case}: how many times the load the structure can "
+                 "carry before it buckles. Below 1 it buckles under the load as applied.",
+                 ["If it fails: brace the member that buckles (see the buckling mode plot), shorten its free "
+                  "length or use a stiffer section."]),
+    "convergence": ("How much the results changed between the base mesh and a finer one. Under {tol} the mesh is "
+                    "fine enough for these results; more means the results depend on the mesh.",
+                    ["If it fails: optimise for Accuracy (a finer mesh), or look at the part named in the "
+                     "convergence warning."]),
+    "mesh": ("Parts that could not be meshed at all. They are not in the analysis.",
+             ["See the mesh warnings: usually a sliver face or a gap in the part's geometry; fix it in SolidWorks."]),
+    "floating": ("Parts that are not connected to anything that holds them, so they would fly off under load.",
+                 ["Connect them (a touching face, a mate or a weld), or fix them, on the Connections tab."]),
+    "exceptions": ("Questions AsmFEA could not decide for itself (an ambiguous connection, a gap or an overlap) "
+                   "that are still open.",
+                   ["Review them on the Connections tab (Show exceptions only) and record a decision."]),
+}
+
+
 def checks(model: Model, results: dict, open_exceptions: int, mesh_failed: int = 0,
            floating: int = 0) -> list[dict]:
-    """PASS / WARN / FAIL rows with measured value and limit."""
+    """PASS / WARN / FAIL rows with measured value and limit, and for More Info what each means (`explain`), where
+    it governs (`where`: load case and part) and what to do (`actions`)."""
     rows = []
     lim = model.study.limits if model.study else None
 
-    def row(name, value, limit, ok, bad="WARN"):
-        rows.append({"check": name, "value": value, "limit": limit, "status": "PASS" if ok else bad})
+    def row(name, value, limit, ok, bad="WARN", kind=None, case=None, part=None, tol=None):
+        r = {"check": name, "value": value, "limit": limit, "status": "PASS" if ok else bad}
+        if kind:
+            text, actions = CHECK_TEXT[kind]
+            r["explain"] = text.format(case=case or "-", part=part or "-", tol=tol or "-")
+            r["actions"] = actions
+            r["where"] = {"load_case": case, "parts": [part] if part else []}
+        rows.append(r)
+
+    def worst(parts: dict, key: str, low: bool):
+        vals = [(p[key], name) for name, p in parts.items() if p.get(key) is not None]
+        return (min(vals) if low else max(vals))[1] if vals else None
 
     for case, r in results["load_cases"].items():
         b = r["reaction_balance_err"]
         row(f"Reaction balance [{case}]", b, defaults.REACTION_BALANCE_TOL,
-            b is not None and b <= defaults.REACTION_BALANCE_TOL)
+            b is not None and b <= defaults.REACTION_BALANCE_TOL, kind="reaction", case=case,
+            tol=f"{defaults.REACTION_BALANCE_TOL:.1%}")
         if lim and lim.max_deflection:
             row(f"Max deflection [{case}]", r["max_disp"], lim.max_deflection,
-                r["max_disp"] <= lim.max_deflection, "FAIL")
+                r["max_disp"] <= lim.max_deflection, "FAIL", kind="deflection", case=case,
+                part=worst(r["parts"], "max_disp", False))
         if lim and lim.min_fos:
             # members away from joints, and bonded joints by their structural stress (D33)
-            fos = [(p["min_fos"], bool(p.get("singular"))) for p in r["parts"].values() if p["min_fos"]]
-            fos += [(p["joint_fos"], False) for p in r["parts"].values() if p.get("joint_fos")]
-            v, sing = min(fos) if fos else (None, False)
+            fos = [(p["min_fos"], bool(p.get("singular")), n) for n, p in r["parts"].items() if p["min_fos"]]
+            fos += [(p["joint_fos"], False, n) for n, p in r["parts"].items() if p.get("joint_fos")]
+            v, sing, where = min(fos) if fos else (None, False, None)
             # a governing peak flagged singular (D32) is not a real stress: a warning, not a fail
             row(f"Min factor of safety [{case}]" + (" (singular peak, see warning)" if sing else ""), v, lim.min_fos,
-                v is not None and v >= lim.min_fos, "WARN" if sing else "FAIL")
+                v is not None and v >= lim.min_fos, "WARN" if sing else "FAIL", kind="fos", case=case, part=where)
         if lim and lim.max_stress:
             # the peak away from bonded joints, as min_fos uses (D53); a singular peak warns, as there
-            pk = [(p["peak_vm_excl_ties"], bool(p.get("singular"))) for p in r["parts"].values()
+            pk = [(p["peak_vm_excl_ties"], bool(p.get("singular")), n) for n, p in r["parts"].items()
                   if p.get("peak_vm_excl_ties") is not None]
-            v, sing = max(pk) if pk else (None, False)
+            v, sing, where = max(pk) if pk else (None, False, None)
             row(f"Max stress [{case}]" + (" (singular peak, see warning)" if sing else ""), v, lim.max_stress,
-                v is not None and v <= lim.max_stress, "WARN" if sing else "FAIL")
+                v is not None and v <= lim.max_stress, "WARN" if sing else "FAIL", kind="stress", case=case, part=where)
     for case, bk in results.get("buckling", {}).items():
         lim_b = lim.min_buckling_factor if lim and lim.min_buckling_factor else 1.0
         row(f"Lowest buckling factor [{case}]", bk["lowest"], lim_b,
-            bk["lowest"] is not None and bk["lowest"] >= lim_b, "FAIL")
+            bk["lowest"] is not None and bk["lowest"] >= lim_b, "FAIL", kind="buckling", case=case)
     conv = results.get("convergence")
     if conv is not None:
         row("Convergence between the two solves", conv["worst_change"], defaults.CONVERGENCE_TOL,
-            conv["worst_change"] <= defaults.CONVERGENCE_TOL)
-    row("Parts that failed to mesh", mesh_failed, 0, mesh_failed == 0, "FAIL")
-    row("Floating parts", floating, 0, floating == 0, "FAIL")
-    row("Open exceptions", open_exceptions, 0, open_exceptions == 0)
+            conv["worst_change"] <= defaults.CONVERGENCE_TOL, kind="convergence", tol=f"{defaults.CONVERGENCE_TOL:.0%}")
+    row("Parts that failed to mesh", mesh_failed, 0, mesh_failed == 0, "FAIL", kind="mesh")
+    row("Floating parts", floating, 0, floating == 0, "FAIL", kind="floating")
+    row("Open exceptions", open_exceptions, 0, open_exceptions == 0, kind="exceptions")
     return rows

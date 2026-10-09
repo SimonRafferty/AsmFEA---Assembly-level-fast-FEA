@@ -40,6 +40,7 @@ class SolveOutcome:
     diagnostics: list[Diagnostic]
     cancelled: bool = False
     peak_rss_gb: float = 0.0
+    info: Optional[dict] = None      # solver facts for the accuracy grade (the hybrid's exact and field joints)
 
 
 def estimate_memory_gb(dof: int) -> float:
@@ -139,7 +140,10 @@ def classify_log(text: str, returncode: Optional[int], dof: int, excerpt: str) -
     return [make("SOLVE_FAILED_UNKNOWN", exit_code=returncode, raw=excerpt)]
 
 
-def run_hybrid(workdir: Path, job: str, on_tick: Optional[Callable[[dict], bool]] = None) -> SolveOutcome:
+def run_hybrid(workdir: Path, job: str, on_tick: Optional[Callable[[dict], bool]] = None,
+               budget_gb: float = 0.0, exact_part_unknowns: Optional[int] = None,
+               exact_total_unknowns: Optional[int] = None,
+               reserve_gb: float = 0.0, dof: int = 0) -> SolveOutcome:
     """Solve ``workdir``/``job``.inp with the hybrid solver (asmfea.hybrid, D49) instead of CalculiX: each part
     condensed onto its joints, for a model CalculiX cannot hold in memory. Writes the same .frd/.dat.
 
@@ -154,45 +158,73 @@ def run_hybrid(workdir: Path, job: str, on_tick: Optional[Callable[[dict], bool]
     class _Cancel(Exception):
         pass
 
-    state = {"msg": "starting", "done": False, "error": None, "cancel": False}
-
-    def log(s: str) -> None:
-        state["msg"] = s
-        if state["cancel"]:
-            raise _Cancel()
-
-    def work() -> None:
-        try:
-            state["timings"] = run(workdir, job, settings=Settings(degree=defaults.HYBRID_DEGREE, exact_max_nodes=0),
-                                   log=log)
-        except BaseException as e:            # noqa: BLE001 - handed to the caller's thread below
-            state["error"] = e
-        finally:
-            state["done"] = True
-
+    cap = defaults.HYBRID_EXACT_PART_UNKNOWNS if exact_part_unknowns is None else exact_part_unknowns
+    total = defaults.HYBRID_EXACT_TOTAL_UNKNOWNS if exact_total_unknowns is None else exact_total_unknowns
+    # the run planner's budget and joint caps (D60). Out of memory, it tries once more with smooth joints only and
+    # one part at a time, and says so: a run is slowed or simplified, never stopped after a long wait if avoidable
+    attempts = [(cap, total, 0), (0, 0, 1)]
     t0 = time.perf_counter()
     proc = psutil.Process()
     peak = 0.0
-    proc.cpu_percent(None)
-    th = threading.Thread(target=work, name="asmfea-hybrid", daemon=True)
-    th.start()
-    while not state["done"]:
-        th.join(1.0)
-        rss = proc.memory_info().rss / 1e9
-        peak = max(peak, rss)
-        if on_tick is not None and on_tick({"elapsed": time.perf_counter() - t0, "rss_gb": rss,
-                                            "cpu_cores_busy": proc.cpu_percent(None) / 100.0,
-                                            "log_tail": [state["msg"]], "solver": "hybrid solver"}):
-            state["cancel"] = True
-    seconds = time.perf_counter() - t0
-    err = state["error"]
-    if isinstance(err, _Cancel):
-        return SolveOutcome(False, seconds, None, [], cancelled=True, peak_rss_gb=peak)
-    if isinstance(err, Unsupported):
-        raise err
-    if isinstance(err, Singular):
-        return SolveOutcome(False, seconds, None, [make("SOLVE_SINGULAR", detail=f" ({err})", raw=str(err))],
-                            peak_rss_gb=peak)
-    if err is not None:
-        raise err
-    return SolveOutcome(True, seconds, 0, [], peak_rss_gb=peak)
+    notes: list = []
+    for k, (cap_k, total_k, workers) in enumerate(attempts):
+        state = {"msg": "starting" if k == 0 else "retrying with smooth joints, one part at a time",
+                 "done": False, "error": None, "cancel": False}
+
+        def log(s: str, state=state) -> None:
+            state["msg"] = s
+            if state["cancel"]:
+                raise _Cancel()
+
+        def work(state=state, cap_k=cap_k, total_k=total_k, workers=workers) -> None:
+            try:
+                state["timings"] = run(workdir, job, settings=Settings(
+                    degree=defaults.HYBRID_DEGREE, exact_max_nodes=defaults.HYBRID_EXACT_JOINT_NODES if cap_k else 0,
+                    exact_part_unknowns=cap_k, exact_total_unknowns=total_k, workers=workers,
+                    memory_bytes=int(budget_gb * 1e9), reserve_bytes=int(reserve_gb * 1e9)), log=log)
+            except BaseException as e:            # noqa: BLE001 - handed to the caller's thread below
+                state["error"] = e
+            finally:
+                state["done"] = True
+
+        proc.cpu_percent(None)
+        th = threading.Thread(target=work, name="asmfea-hybrid", daemon=True)
+        th.start()
+        while not state["done"]:
+            th.join(1.0)
+            rss = proc.memory_info().rss / 1e9
+            peak = max(peak, rss)
+            if on_tick is not None and on_tick({"elapsed": time.perf_counter() - t0, "rss_gb": rss,
+                                                "cpu_cores_busy": proc.cpu_percent(None) / 100.0,
+                                                "log_tail": [state["msg"]], "solver": "hybrid solver"}):
+                state["cancel"] = True
+        seconds = time.perf_counter() - t0
+        err = state["error"]
+        if isinstance(err, _Cancel):
+            return SolveOutcome(False, seconds, None, [], cancelled=True, peak_rss_gb=peak)
+        if isinstance(err, Unsupported):
+            raise err
+        if isinstance(err, Singular):
+            return SolveOutcome(False, seconds, None, [make("SOLVE_SINGULAR", detail=f" ({err})", raw=str(err))],
+                                peak_rss_gb=peak)
+        if err is not None and _out_of_memory(err):
+            if k + 1 < len(attempts):
+                notes.append(make("HYBRID_RETRIED", minutes=seconds / 60, raw=str(err),
+                                  evidence={"first_attempt": {"exact_part_unknowns": cap_k,
+                                                              "exact_total_unknowns": total_k},
+                                            "error": str(err)}))
+                continue
+            return SolveOutcome(False, seconds, None, notes + [make("SOLVE_OUT_OF_MEMORY", dof=dof, raw=str(err),
+                                                                    evidence={"matched": str(err)})],
+                                peak_rss_gb=peak)
+        if err is not None:
+            raise err
+        tm = state.get("timings") or {}
+        return SolveOutcome(True, seconds, 0, notes, peak_rss_gb=peak,
+                            info={k2: tm[k2] for k2 in ("joints_exact", "joints_fields") if k2 in tm})
+    raise AssertionError("unreachable")
+
+
+def _out_of_memory(err: BaseException) -> bool:
+    """PARDISO's "not enough memory" (error -2), or Python's / NumPy's MemoryError."""
+    return isinstance(err, MemoryError) or "error code -2" in str(err)

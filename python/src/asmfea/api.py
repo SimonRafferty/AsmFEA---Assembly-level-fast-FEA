@@ -69,6 +69,8 @@ class SummaryResult(BaseModel):
     load_cases: dict
     plot_view: Optional[dict] = None    # main view of the plots: {toward_viewer, up}
     run_mode: str = "full"              # "fast": approximate results of a fast run (ADDENDUM-FAST-RUN-MODE)
+    accuracy: Optional[dict] = None     # how accurate the results are likely to be (D60: grade, errors, reasons)
+    plan: Optional[dict] = None         # how the run was set up (D60: favour, mesh level, solver, machine)
 
 
 class ExceptionsResult(BaseModel):
@@ -167,7 +169,82 @@ def summary(study: str | Path) -> SummaryResult:
                     view = {"toward_viewer": v["toward_viewer"], "up": v["up"]}
                     break
     return SummaryResult(study=str(p), job=r.get("job"), checks=r.get("checks", []),
-                         load_cases=r.get("load_cases", {}), plot_view=view, run_mode=mode)
+                         load_cases=r.get("load_cases", {}), plot_view=view, run_mode=mode,
+                         accuracy=r.get("accuracy"), plan=r.get("plan"))
+
+
+def recheck(study: str | Path, limits: Optional[dict] = None) -> dict:
+    """New pass/fail criteria on finished results, without solving again (the user's request): ``limits`` (as the
+    study's "limits", from the task pane) are written into study.json, and the checks of the last full and fast
+    results are worked out again from the results already there. The reports are rewritten from them when next
+    opened (they follow results.json). Returns {"checks": [...]} of the newer results."""
+    from .model import load_model
+    from .post import checks
+    from .runmode import FAST, FULL, results_dir
+    p = _study(study)
+    st_path = p / "study.json"
+    if limits is not None and st_path.exists():
+        doc = json.loads(st_path.read_text(encoding="utf-8-sig"))
+        doc.setdefault("study", {})["limits"] = {k: v for k, v in limits.items() if v is not None}
+        st_path.write_text(json.dumps(doc, indent=1), encoding="utf-8")
+    model = load_model(p)
+    exc = json.loads((p / "exceptions.json").read_text())["exceptions"] if (p / "exceptions.json").exists() else []
+    open_exc = sum(1 for e in exc if e.get("severity") != "info")
+    floating = sum(1 for e in exc if e.get("code") == "PART_FLOATING")
+    out, newest = {"checks": []}, -1.0
+    for mode in (FULL, FAST):
+        path = results_dir(p, mode) / "results.json"
+        if not path.exists():
+            continue
+        res = json.loads(path.read_text())
+        res["checks"] = checks(model, res, open_exc, floating=floating)              # as post works them out
+        path.write_text(json.dumps(res, indent=1))
+        if path.stat().st_mtime > newest:
+            newest, out["checks"] = path.stat().st_mtime, res["checks"]
+    return out
+
+
+def plan(study: str | Path, fast: bool = False, mesh: Optional[dict] = None) -> dict:
+    """How a run of this study would be set up on this computer now (the run planner, D60): the favour and its
+    mesh level, convergence pass and joint handling; the memory free and the budget; and, when an earlier run
+    gives the model's size, the solver it would get and a time estimate. For the task pane's plan display.
+    ``mesh``: settings to plan for instead of the study's (the pane's, before they are exported); a study not
+    yet exported is planned from them alone."""
+    from .accuracy import expected
+    from .model import MeshPrefs, Study, load_model
+    from .planner import choose_solver, plan_study
+    from .runmode import latest_results
+    try:
+        p = _study(study)
+    except FileNotFoundError:                          # not exported yet: planned from the given settings alone
+        p = Path(study)
+    try:
+        st = load_model(p).study
+    except (FileNotFoundError, OSError, ValueError):
+        st = None
+    if mesh is not None:
+        prefs = MeshPrefs.model_validate(mesh)
+        st = st.model_copy(update={"mesh": prefs}) if st is not None else \
+            Study(name="-", analyses=["static"], load_cases=["-"], mesh=prefs)
+    pl = plan_study(st, fast=fast)
+    out = pl.as_dict()
+    out["expected_accuracy"] = expected(pl.favour, fast, pl.convergence_check, pl.fidelity)
+    dof = None
+    try:
+        res_dir, _ = latest_results(p)
+        res = json.loads((res_dir / "results.json").read_text())
+        mesh = res.get("mesh") or {}
+        dof = max((v.get("dof") or 0) for k, v in mesh.items() if isinstance(v, dict) and "dof" in v) or None
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    if dof:
+        solver, notes = choose_solver(pl, dof)
+        from .pipeline import estimate_solve_s
+        out.update(solver=solver, dof=dof, notes=pl.notes, estimate_s=estimate_solve_s(dof) if solver == "calculix" else None,
+                   size_from="the last run (the mesh may change if the model or settings have)")
+    else:
+        out["size_from"] = "not known until the model is meshed: the solver is chosen then"
+    return out
 
 
 def exceptions(study: str | Path) -> ExceptionsResult:

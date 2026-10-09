@@ -364,8 +364,12 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         # Nodes and elements per instance
         f.write("*NODE, NSET=NALL\n")
         for inst in instances:
-            for i, x in enumerate(inst.X):
-                f.write(f"{inst.node0 + i + 1}, {x[0]:.9g}, {x[1]:.9g}, {x[2]:.9g}\n")
+            # one format applied to plain Python lists (per-value f-strings on NumPy scalars were most of writing
+            # the deck's text); the same text as before
+            ids = range(inst.node0 + 1, inst.node0 + 1 + len(inst.X))
+            X = np.asarray(inst.X, float)
+            f.write("".join(map("%d, %.9g, %.9g, %.9g\n".__mod__,
+                                zip(ids, X[:, 0].tolist(), X[:, 1].tolist(), X[:, 2].tolist()))))
         for p in pins:
             for n in (p["ref"], p["rot"]):
                 f.write(f"{n}, {p['at'][0]:.9g}, {p['at'][1]:.9g}, {p['at'][2]:.9g}\n")
@@ -382,11 +386,12 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 name = f"{inst.set_name}_{b}"
                 names.append(name)
                 f.write(f"*ELEMENT, TYPE={etype}, ELSET={name}\n")
-                for r, nodes in enumerate(conn):
-                    vals = [str(inst.elem0 + 1 + row + r)] + [str(inst.node0 + int(n)) for n in nodes]
-                    for j in range(0, len(vals), 16):
-                        tail = "," if j + 16 < len(vals) else ""
-                        f.write(", ".join(vals[j:j + 16]) + tail + "\n")
+                # element id then its nodes, 16 values a line with a trailing comma where a line continues
+                nv = 1 + conn.shape[1]
+                fmt = ",\n".join(", ".join(["%d"] * min(16, nv - j)) for j in range(0, nv, 16)) + "\n"
+                eids = np.arange(inst.elem0 + 1 + row, inst.elem0 + 1 + row + len(conn), dtype=np.int64)
+                table = np.column_stack([eids, np.asarray(conn, np.int64) + inst.node0]).tolist()
+                f.write("".join(map(fmt.__mod__, map(tuple, table))))
                 row += len(conn)
             f.write(f"*ELSET, ELSET={inst.set_name}\n" + "\n".join(names) + "\n")
             info["instances"].append({"part": inst.part_id, "set": inst.set_name, "node0": inst.node0,

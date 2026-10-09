@@ -130,8 +130,84 @@ def _grad(dN: np.ndarray, X: np.ndarray):
     return np.einsum("ai,eji->eaj", dN, inv), det
 
 
+def _make_kernel():
+    """The element stiffness loop compiled by numba, or None without it. For an isotropic material B'DB is, per
+    pair of nodes a, b and directions i, j:  lam dNa_i dNb_j + mu dNa_j dNb_i + mu (i == j) dNa . dNb,  which
+    this computes straight from the shape-function gradients, element by element across the cores. The NumPy
+    version below (batched B'DB) was a quarter of the hybrid solver's busy time on a 4.5 M-DOF frame."""
+    try:
+        import numba
+    except ImportError:
+        return None
+
+    # one thread per call, the GIL released: the hybrid solver calls this from several part threads at once, and
+    # numba's own parallel loop is not safe to start from several threads (its default threading layer)
+    @numba.njit(nogil=True, cache=True)
+    def kernel(X, w, dN, lam, mu):
+        ne, n, _ = X.shape
+        ng = w.shape[0]
+        K = np.zeros((ne, 3 * n, 3 * n))
+        for e in range(ne):
+            G = np.empty((n, 3))
+            for g in range(ng):
+                J = np.zeros((3, 3))                       # J[i, j] = sum_a dN[a, i] X[a, j]
+                for a in range(n):
+                    for i in range(3):
+                        for j in range(3):
+                            J[i, j] += dN[g, a, i] * X[e, a, j]
+                det = (J[0, 0] * (J[1, 1] * J[2, 2] - J[1, 2] * J[2, 1])
+                       - J[0, 1] * (J[1, 0] * J[2, 2] - J[1, 2] * J[2, 0])
+                       + J[0, 2] * (J[1, 0] * J[2, 1] - J[1, 1] * J[2, 0]))
+                inv = np.empty((3, 3))
+                inv[0, 0] = (J[1, 1] * J[2, 2] - J[1, 2] * J[2, 1]) / det
+                inv[0, 1] = (J[0, 2] * J[2, 1] - J[0, 1] * J[2, 2]) / det
+                inv[0, 2] = (J[0, 1] * J[1, 2] - J[0, 2] * J[1, 1]) / det
+                inv[1, 0] = (J[1, 2] * J[2, 0] - J[1, 0] * J[2, 2]) / det
+                inv[1, 1] = (J[0, 0] * J[2, 2] - J[0, 2] * J[2, 0]) / det
+                inv[1, 2] = (J[0, 2] * J[1, 0] - J[0, 0] * J[1, 2]) / det
+                inv[2, 0] = (J[1, 0] * J[2, 1] - J[1, 1] * J[2, 0]) / det
+                inv[2, 1] = (J[0, 1] * J[2, 0] - J[0, 0] * J[2, 1]) / det
+                inv[2, 2] = (J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]) / det
+                for a in range(n):                         # global gradients: G[a, j] = sum_i dN[a, i] inv[j, i]
+                    for j in range(3):
+                        s = 0.0
+                        for i in range(3):
+                            s += dN[g, a, i] * inv[j, i]
+                        G[a, j] = s
+                f = w[g] * abs(det)
+                for a in range(n):
+                    for b in range(n):
+                        dot = G[a, 0] * G[b, 0] + G[a, 1] * G[b, 1] + G[a, 2] * G[b, 2]
+                        for i in range(3):
+                            for j in range(3):
+                                v = lam * G[a, i] * G[b, j] + mu * G[a, j] * G[b, i]
+                                if i == j:
+                                    v += mu * dot
+                                K[e, 3 * a + i, 3 * b + j] += f * v
+        return K
+
+    return kernel
+
+
+_KERNEL = "unset"
+
+
 def stiffness(etype: str, X: np.ndarray, E: float, nu: float) -> np.ndarray:
-    """Element stiffness matrices (n_el, 3n, 3n)."""
+    """Element stiffness matrices (n_el, 3n, 3n): compiled (numba) when available, else NumPy."""
+    global _KERNEL
+    if _KERNEL == "unset":
+        _KERNEL = _make_kernel()
+    if _KERNEL is not None and len(X):
+        w, _, dN = rule(etype)
+        lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
+        return _KERNEL(np.ascontiguousarray(X, dtype=np.float64), np.ascontiguousarray(w, dtype=np.float64),
+                       np.ascontiguousarray(dN, dtype=np.float64), float(lam), float(mu))
+    return stiffness_numpy(etype, X, E, nu)
+
+
+def stiffness_numpy(etype: str, X: np.ndarray, E: float, nu: float) -> np.ndarray:
+    """Element stiffness matrices (n_el, 3n, 3n), batched B'DB in NumPy (the reference the kernel is tested
+    against, and the fallback without numba)."""
     w, _, dN = rule(etype)
     D = elasticity(E, nu)
     n = X.shape[1]
@@ -191,9 +267,78 @@ def extrapolation(etype: str) -> np.ndarray:
     return E
 
 
+def _make_stress_kernel():
+    """Stress at the integration points (n_el, n_points, 6), compiled by numba (None without it): the displacement
+    gradient H[i, j] = sum_a u[a, i] dNa_j gives strain and, isotropic, stress. The NumPy version below (batched
+    B matrices) took 10 s of a 1.5 M-node frame's output. Single-threaded, the GIL released (see _make_kernel)."""
+    try:
+        import numba
+    except ImportError:
+        return None
+
+    @numba.njit(nogil=True, cache=True)
+    def kernel(X, U, dN, lam, mu):
+        ne, n, _ = X.shape
+        ng = dN.shape[0]
+        Sg = np.zeros((ne, ng, 6))
+        for e in range(ne):
+            for g in range(ng):
+                J = np.zeros((3, 3))
+                for a in range(n):
+                    for i in range(3):
+                        for j in range(3):
+                            J[i, j] += dN[g, a, i] * X[e, a, j]
+                det = (J[0, 0] * (J[1, 1] * J[2, 2] - J[1, 2] * J[2, 1])
+                       - J[0, 1] * (J[1, 0] * J[2, 2] - J[1, 2] * J[2, 0])
+                       + J[0, 2] * (J[1, 0] * J[2, 1] - J[1, 1] * J[2, 0]))
+                inv = np.empty((3, 3))
+                inv[0, 0] = (J[1, 1] * J[2, 2] - J[1, 2] * J[2, 1]) / det
+                inv[0, 1] = (J[0, 2] * J[2, 1] - J[0, 1] * J[2, 2]) / det
+                inv[0, 2] = (J[0, 1] * J[1, 2] - J[0, 2] * J[1, 1]) / det
+                inv[1, 0] = (J[1, 2] * J[2, 0] - J[1, 0] * J[2, 2]) / det
+                inv[1, 1] = (J[0, 0] * J[2, 2] - J[0, 2] * J[2, 0]) / det
+                inv[1, 2] = (J[0, 2] * J[1, 0] - J[0, 0] * J[1, 2]) / det
+                inv[2, 0] = (J[1, 0] * J[2, 1] - J[1, 1] * J[2, 0]) / det
+                inv[2, 1] = (J[0, 1] * J[2, 0] - J[0, 0] * J[2, 1]) / det
+                inv[2, 2] = (J[0, 0] * J[1, 1] - J[0, 1] * J[1, 0]) / det
+                H = np.zeros((3, 3))                           # H[i, j] = d u_i / d x_j
+                for a in range(n):
+                    for j in range(3):
+                        gj = dN[g, a, 0] * inv[j, 0] + dN[g, a, 1] * inv[j, 1] + dN[g, a, 2] * inv[j, 2]
+                        for i in range(3):
+                            H[i, j] += U[e, a, i] * gj
+                tr = H[0, 0] + H[1, 1] + H[2, 2]
+                Sg[e, g, 0] = lam * tr + 2 * mu * H[0, 0]
+                Sg[e, g, 1] = lam * tr + 2 * mu * H[1, 1]
+                Sg[e, g, 2] = lam * tr + 2 * mu * H[2, 2]
+                Sg[e, g, 3] = mu * (H[0, 1] + H[1, 0])
+                Sg[e, g, 4] = mu * (H[1, 2] + H[2, 1])
+                Sg[e, g, 5] = mu * (H[0, 2] + H[2, 0])
+        return Sg
+
+    return kernel
+
+
+_STRESS_KERNEL = "unset"
+
+
 def nodal_stress(etype: str, X: np.ndarray, U: np.ndarray, E: float, nu: float) -> np.ndarray:
     """Stress (n_el, n, 6) at each element's nodes, extrapolated from its integration points (to be averaged
-    over the elements sharing a node, as CalculiX does)."""
+    over the elements sharing a node, as CalculiX does): compiled (numba) when available, else NumPy."""
+    global _STRESS_KERNEL
+    if _STRESS_KERNEL == "unset":
+        _STRESS_KERNEL = _make_stress_kernel()
+    if _STRESS_KERNEL is None or not len(X):
+        return nodal_stress_numpy(etype, X, U, E, nu)
+    _, _, dN = rule(etype)
+    lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
+    Sg = _STRESS_KERNEL(np.ascontiguousarray(X, dtype=np.float64), np.ascontiguousarray(U, dtype=np.float64),
+                        np.ascontiguousarray(dN, dtype=np.float64), float(lam), float(mu))
+    return np.einsum("ng,egc->enc", extrapolation(etype), Sg)
+
+
+def nodal_stress_numpy(etype: str, X: np.ndarray, U: np.ndarray, E: float, nu: float) -> np.ndarray:
+    """nodal_stress in NumPy (batched B matrices): the reference the kernel is tested against, and the fallback."""
     D = elasticity(E, nu)
     _, _, dN = rule(etype)
     u = U.reshape(len(U), -1)

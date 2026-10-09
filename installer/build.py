@@ -85,11 +85,17 @@ def python_runtime() -> None:
     # installer unpacks beside CalculiX (hybrid.solve._pardiso), so the download does not grow by 600 MB
     run(VENV_PY, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location",
         "--only-binary=:all:", "--no-deps", "-c", constraints, "--target", py / "Lib" / "site-packages", "pypardiso")
+    # numba compiles the hybrid solver's element stiffness loop (2026-10-09; optional at run time, it falls back to
+    # NumPy). Its compiled-code cache goes to the user's own folder, as Program Files is read-only
+    run(VENV_PY, "-m", "pip", "install", "--disable-pip-version-check", "--no-warn-script-location",
+        "--only-binary=:all:", "--no-deps", "-c", constraints, "--target", py / "Lib" / "site-packages",
+        "numba", "llvmlite")
     shutil.rmtree(py / "Lib" / "site-packages" / "bin", ignore_errors=True)    # console scripts: unused
     run(py / "python.exe", "-m", "compileall", "-q", "-j0", py / "Lib" / "site-packages")
     # smoke test with the bundled runtime alone
-    run(py / "python.exe", "-c", "import asmfea, asmfea.pipeline, OCP, pyvista, docx, scipy; "
-        "from asmfea.post import viewer; print('bundled runtime OK', asmfea.__name__)")
+    run(py / "python.exe", "-c", "import asmfea, asmfea.pipeline, OCP, pyvista, docx, scipy, numba; "
+        "from asmfea.post import viewer; from asmfea.hybrid.elements import _make_kernel; "
+        "assert _make_kernel() is not None; print('bundled runtime OK', asmfea.__name__)")
 
 
 def addin() -> None:

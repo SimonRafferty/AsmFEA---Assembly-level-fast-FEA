@@ -148,18 +148,19 @@ def inverted_count(etype: str, P: np.ndarray) -> int:
 def element_volumes(etype: str, P: np.ndarray) -> np.ndarray:
     """Element volumes. C3D10: exact isoparametric (curved edges included, as the
     solver integrates them); C3D15/C3D20R: from corners (straight-sided)."""
+    # J[n] = P[n]' dN as one batched matrix product (an unoptimised einsum here was 38 % of writing the deck)
+    Pt = np.ascontiguousarray(np.swapaxes(P, 1, 2))                  # (n, 3, nodes)
     if etype == "C3D10":
         vol = np.zeros(len(P))
         for dN in _TET10_DN:
-            J = np.einsum("nai,aj->nij", P, dN)
-            vol += np.linalg.det(J) / 24.0
+            vol += np.linalg.det(Pt @ dN) / 24.0
         return np.abs(vol)
     if etype == "C3D15":
         # isoparametric, as the solver integrates it: skin-swept wedges on a curved wall
         # have curved faces, and a corner-only volume misses their bulge
         vol = np.zeros(len(P))
         for w, dN in _WEDGE15_DN:
-            vol += w * np.linalg.det(np.einsum("nai,aj->nij", P, dN))
+            vol += w * np.linalg.det(Pt @ dN)
         return np.abs(vol)
     a = np.linalg.norm(P[:, 1] - P[:, 0], axis=1)
     b = np.linalg.norm(P[:, 3] - P[:, 0], axis=1)

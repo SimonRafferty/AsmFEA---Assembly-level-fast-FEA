@@ -60,7 +60,7 @@ namespace AsmFea.Extract
                 { "overrides", new List<object>() },
                 { "study", new JObj { { "name", name }, { "analyses", new List<object> { "static" } },
                                      { "load_cases", new List<object> { "LC1" } },
-                                     { "mesh", new JObj { { "fidelity", "standard" }, { "convergence_check", true } } } } },
+                                     { "mesh", new JObj { { "favour", "balanced" } } } } },   // the run planner decides the rest (D60)
             };
         }
 

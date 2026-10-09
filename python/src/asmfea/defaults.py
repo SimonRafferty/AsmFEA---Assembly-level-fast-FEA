@@ -40,6 +40,39 @@ REFINE_RATIO = 0.6             # plan: refined re-solve uses 0.6 x the base size
 SOLVER_THREADS = 8             # D3: 8 physical cores
 HYBRID_DEGREE = 4              # D49: polynomial degree of a joint's modes in the hybrid solver, used when CalculiX
                                # would not fit in memory; 24-part welded chassis -3 %, Bench truss S -0.6 % against CalculiX
+# D60 run planner: what each "favour" choice means, and the memory it leaves for everything else
+PLAN_FAVOUR = {
+    # mesh level, refined convergence pass, hybrid exact-joint caps per part and in all (0: smooth joints only).
+    # Totals: m4_frame's 96 welds need 39 600 (D59); the tank's 387 joints at 232 000 ran out of memory
+    "speed": {"fidelity": "coarse", "convergence": False, "exact_part_unknowns": 0, "exact_total_unknowns": 0},
+    "balanced": {"fidelity": "standard", "convergence": True, "exact_part_unknowns": 10000,
+                 "exact_total_unknowns": 60000},
+    "accuracy": {"fidelity": "fine", "convergence": True, "exact_part_unknowns": 15000,
+                 "exact_total_unknowns": 120000},
+}
+PLAN_RESERVE_GB = 3.0          # memory left free for other programs to grow into, GB. The free memory measured already
+                               # excludes what SolidWorks and the rest use now, and the memory-pressure watch covers
+                               # them growing, so the solve takes as much as it can (the user's choice, 2026-10-09:
+                               # 6 GB / 15 % left 10 GB of 45 GB free unused)
+PLAN_RESERVE_FRACTION = 0.04   # ... or this share of the computer's RAM, whichever is larger
+PLAN_SHORT_GB = 4.0            # less than this to spare after the reserve: the plan warns before the run starts
+PLAN_CCX_MARGIN = 1.3         # CalculiX is chosen only if its estimate x this fits the budget (the estimate is a
+                               # fit to measured peaks with about 25 % scatter: BYTES_PER_DOF)
+PLAN_ACCURACY_CAP_MIN_GB = 24.0  # "accuracy" uses its larger joint cap only with at least this budget, GB
+ACCURACY_HIGH_DISP = 0.02      # D60 accuracy grade "High": displacements changed at most this between the meshes
+ACCURACY_HIGH_STRESS = 0.05    # ... and stresses away from joints at most this (beyond CONVERGENCE_TOL: Indicative)
+PRESSURE_TICKS = 5            # memory pressure: this many heartbeats in a row with free memory below the reserve
+                               # (or the solver's memory being paged out) before the warning (a few seconds)
+PRESSURE_PAGED_FRACTION = 0.6  # the solver is being paged out when its working set falls below this share of its
+                               # committed memory
+HYBRID_EXACT_TOTAL_UNKNOWNS = 60000  # D60: ... and while the model's exact joint unknowns stay within this (the global
+                                     # system grows with them; see PLAN_FAVOUR)
+HYBRID_EXACT_JOINT_NODES = 3000  # D59: a joint with at most this many master nodes is exact (node by node, as
+                                 # CalculiX's tie): m4_frame's welds by smooth fields +9.5 %, exact -0.05 %
+HYBRID_EXACT_PART_UNKNOWNS = 10000  # D59: ... while no part condenses onto more exact joint unknowns than this.
+                                    # m4_frame's busiest chord needs 9894 (every weld exact); at 15000 a tank
+                                    # panel took 14 751 and the fast tank, 11 minutes before, was stopped unfinished after 57. A
+                                    # dense block of 8 x 10000^2 bytes = 0.8 GB (every tie exact: 119 000, 105 GB)
 MEMORY_WARN_FRACTION = 0.7     # plan: warn when estimate exceeds this share of RAM, guess
 # PARDISO memory per DOF for quadratic tets. M0: 1.94 M DOF solved; estimate refined
 # from logged runs once milestone 4 records them.
@@ -136,6 +169,9 @@ SWEEP_SURFACE_TOL_T = 0.01     # tagging tolerance for swept meshes, x thickness
 
 # --- Plots and report (milestone 5) ----------------------------------------------------------
 PLOT_SIZE = (1400, 1000)       # px
+CLASSIFY_WORKERS = 6           # parts classified at once (membrane plus bending) in worker processes ...
+CLASSIFY_POOL_MIN_NODES = 500000  # ... on a model of at least this many nodes (a worker loads the model in a few
+                                  # seconds: small models stay in one process)
 PLOT_DEFORM_FRACTION = 0.05    # deformed shape scaled so the largest motion is 5 % of the model size
 PLOT_LABEL_OFFSET = 0.12       # min / max labels set off the model by 12 % of its size, with a leader line
 PLOT_FOS_CAP = 10.0            # factor-of-safety plots saturate above this

@@ -99,7 +99,48 @@ class JobState:
     # -- heartbeat ---------------------------------------------------------
     def _beat(self):
         while not self._stop.wait(defaults.HEARTBEAT_S):
+            try:
+                self._watch_memory()
+            except Exception:                    # noqa: BLE001 - the heartbeat must never die of the watch
+                pass
             self._flush()
+
+    def _watch_memory(self):
+        """Memory pressure (D60): other programs have taken the free memory below the planner's reserve, or the
+        solver's memory is being paged out, for PRESSURE_TICKS beats in a row. The run carries on (more slowly);
+        the user is told once, with what to do, and job.json's memory_pressure says whether it still holds."""
+        import psutil
+        from ..planner import machine, reserve_gb
+        if not hasattr(self, "_reserve"):
+            self._reserve, self._press, self._calm = reserve_gb(machine()), 0, 0
+        avail = psutil.virtual_memory().available / 2 ** 30
+        paged = False
+        with self._lock:
+            sv = self.doc.get("solver") or {}
+        pid = sv.get("solver_pid") or (os.getpid() if sv else None)
+        if pid:
+            try:
+                mi = psutil.Process(pid).memory_info()
+                commit = getattr(mi, "private", 0) or getattr(mi, "vms", 0)
+                paged = commit > 2 ** 30 and mi.rss < defaults.PRESSURE_PAGED_FRACTION * commit
+            except psutil.Error:
+                pass
+        pressed = avail < self._reserve or paged
+        self._press, self._calm = (self._press + 1, 0) if pressed else (0, self._calm + 1)
+        mp = self.doc.get("memory_pressure") or {}
+        if self._press >= defaults.PRESSURE_TICKS and not mp.get("active"):
+            first = not mp
+            with self._lock:
+                self.doc["memory_pressure"] = {"active": True, "since": _now(), "available_gb": round(avail, 1),
+                                               "reserve_gb": round(self._reserve, 1), "paged": paged}
+            if first:
+                from ..diagnostics import make
+                self.add_diags([make("MEMORY_PRESSURE", available_gb=avail, reserve_gb=self._reserve,
+                                     evidence={"available_gb": round(avail, 2), "reserve_gb": round(self._reserve, 2),
+                                               "solver_paged": paged})])
+        elif mp.get("active") and self._calm >= defaults.PRESSURE_TICKS:
+            with self._lock:
+                self.doc["memory_pressure"] = {**mp, "active": False, "cleared": _now()}
 
     def _flush(self):
         with self._lock:

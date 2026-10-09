@@ -54,6 +54,19 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true", help="print one JSON document")
     sub = ap.add_subparsers(dest="verb", required=True)
     sub.add_parser("status")
+    p = sub.add_parser("recheck", help="apply new pass/fail criteria to the last results, without solving again")
+    p.add_argument("study")
+    p.add_argument("--limits", default=None,
+                   help="the study's limits, replacing study.json's: name=value pairs separated by commas, e.g. "
+                        "min_fos=2,max_deflection=5 (an empty string clears them)")
+    p = sub.add_parser("plan", help="how a run would be set up on this computer now (run planner, D60)")
+    p.add_argument("study")
+    p.add_argument("--fast", action="store_true", help="the plan for a Fast run")
+    p.add_argument("--favour", choices=["speed", "balanced", "accuracy"], default=None,
+                   help="plan for this favour instead of the study's (the task pane's unsaved choice)")
+    p.add_argument("--fidelity", choices=["coarse", "standard", "fine"], default=None, help="Advanced: mesh level")
+    p.add_argument("--convergence", choices=["on", "off"], default=None, help="Advanced: convergence check")
+    p.add_argument("--solver", choices=["auto", "calculix", "hybrid"], default=None, help="Advanced: solver")
     p = sub.add_parser("run")
     p.add_argument("study")
     p.add_argument("--stages", nargs="+", default=None)
@@ -111,6 +124,16 @@ def main(argv=None) -> int:
             r = api.cancel(a.study, a.job_id)
         elif a.verb == "summary":
             r = api.summary(a.study)
+        elif a.verb == "recheck":
+            lims = None
+            if a.limits is not None:
+                lims = {k.strip(): float(v) for k, v in (kv.split("=", 1) for kv in a.limits.split(",") if "=" in kv)}
+            r = api.recheck(a.study, lims)
+        elif a.verb == "plan":
+            mesh = {k: v for k, v in (("favour", a.favour), ("fidelity", a.fidelity), ("solver", a.solver)) if v}
+            if a.convergence:
+                mesh["convergence_check"] = a.convergence == "on"
+            r = api.plan(a.study, a.fast, mesh or None)
         elif a.verb == "exceptions":
             r = api.exceptions(a.study)
         elif a.verb == "decide":

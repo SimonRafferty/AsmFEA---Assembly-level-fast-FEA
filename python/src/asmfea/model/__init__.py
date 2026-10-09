@@ -187,9 +187,11 @@ class Hinge(_M):
 
 
 class MeshPrefs(_M):
-    fidelity: Literal["coarse", "standard", "fine"] = "standard"
+    favour: Literal["speed", "balanced", "accuracy"] = "balanced"       # D60: the planner decides from this
+    fidelity: Optional[Literal["coarse", "standard", "fine"]] = None      # advanced override of the mesh level
+    solver: Literal["auto", "calculix", "hybrid"] = "auto"                # advanced override of the solver
     size: Optional[float] = None
-    convergence_check: bool = True
+    convergence_check: Optional[bool] = None                              # advanced override (None: the planner)
 
 
 class Limits(_M):

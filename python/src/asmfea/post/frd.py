@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 
@@ -75,8 +76,101 @@ def _load_npz(path, sha: str) -> dict | None:
         return None
 
 
+def _parse_block(text: bytes, width: int = 10):
+    """(node ids, values) of one data block's text (its " -1" lines, and " -2" continuations). Uniform one-line
+    records are cut into fixed-width columns and converted by NumPy in one step; a block with continuation lines
+    is read line by line as before."""
+    # fastest: the records are a run of equal-length lines, so the block is a 2-D byte table as it stands
+    i = text.find(b" -1")
+    if i >= 0 and b"\n -2" not in text:
+        region = text[i:]
+        rec = region.find(b"\n") + 1
+        if rec > 3 + width and len(region) % rec == 0:
+            a = np.frombuffer(region, dtype=np.uint8).reshape(len(region) // rec, rec)
+            if (a[:, 1] == ord("-")).all() and (a[:, 2] == ord("1")).all() and (a[:, -1] == ord("\n")).all():
+                L = rec - 1 - (1 if a[0, -2] == ord("\r") else 0)
+                ncomp = (L - 3 - width) // 12
+                nodes = np.ascontiguousarray(a[:, 3:3 + width]).view(f"S{width}").ravel().astype(np.int64)
+                cols = np.ascontiguousarray(a[:, 3 + width:3 + width + 12 * ncomp]).reshape(len(a), ncomp, 12)
+                vals = cols.view("S12").reshape(len(a), ncomp).astype(float)
+                return nodes, vals
+    lines = [l.rstrip(b"\r") for l in text.split(b"\n")]
+    rec = [l for l in lines if l.startswith(b" -1")]
+    if not rec:
+        return np.zeros(0, dtype=np.int64), np.zeros((0, 0))
+    if any(l.startswith(b" -2") for l in lines):
+        nodes, vals = [], []
+        for l in lines:
+            if l.startswith(b" -1"):
+                nodes.append(int(l[3:3 + width]))
+                body = l[3 + width:]
+                vals.append([float(body[i:i + 12]) for i in range(0, len(body) - 11, 12)])
+            elif l.startswith(b" -2"):
+                body = l[3 + width:]
+                vals[-1].extend(float(body[i:i + 12]) for i in range(0, len(body) - 11, 12))
+        return np.asarray(nodes, dtype=np.int64), np.asarray(vals, dtype=float)
+    L = max(len(l) for l in rec)
+    ncomp = (L - 3 - width) // 12
+    a = np.array(rec, dtype=f"S{L}").view(np.uint8).reshape(len(rec), L)
+    nodes = np.ascontiguousarray(a[:, 3:3 + width]).view(f"S{width}").ravel().astype(np.int64)
+    cols = a[:, 3 + width:3 + width + 12 * ncomp].reshape(len(rec), ncomp, 12)
+    vals = np.ascontiguousarray(cols).view("S12").reshape(len(rec), ncomp).astype(float)
+    return nodes, vals
+
+
 def _read_frd(path) -> dict[int, dict[str, tuple[np.ndarray, np.ndarray]]]:
-    """{step: {block name: (node ids (n,), values (n, ncomp))}}.
+    """{step: {block name: (node ids (n,), values (n, ncomp))}}, as _read_frd_lines reads them, faster: only the
+    header and marker lines are visited in Python (one regular-expression scan of the bytes); each data block's
+    fixed-width columns are converted by NumPy at once (the line-by-line reader was 13 s of a 62 s post on a
+    4.5 M-DOF frame)."""
+    data = Path(path).read_bytes()
+    out: dict[int, dict] = defaultdict(dict)
+    disps: dict[int, list] = defaultdict(list)
+    value, step = 0.0, 0
+    pos, n = 0, len(data)
+    # walk the header lines only: at a block's header, jump straight to its " -3" end line with a byte search
+    # (C speed), never visiting the data lines in Python
+    while pos < n:
+        nl = data.find(b"\n", pos)
+        end = n if nl < 0 else nl + 1
+        line = data[pos:end].rstrip(b"\r\n")
+        block = None
+        if line.startswith(b"    1PSTEP"):
+            step = int(line.split()[-1])
+        elif line.startswith(b"  100C"):
+            try:
+                value = float(line[12:24])
+            except ValueError:
+                value = 0.0
+        elif line.startswith(b"    2C"):
+            block = "COORDS"
+        elif line.startswith(b" -4"):
+            block = line.split()[1].decode("ascii", "replace")
+        if block is None:
+            pos = end
+            continue
+        stop = data.find(b"\n -3", end - 1)                           # the block's end line (after its newline)
+        stop = n if stop < 0 else stop + 1
+        parsed = _parse_block(data[end:stop])
+        if block == "COORDS":
+            out[0]["COORDS"] = parsed
+        else:
+            out[step][block] = parsed
+            if block == "DISP":
+                disps[step].append((value, parsed))
+        nl = data.find(b"\n", stop)
+        pos = n if nl < 0 else nl + 1
+    for st, blocks in disps.items():
+        if len(blocks) > 1 and blocks[0][0] == 0.0:  # a buckling step: its static block, then the modes
+            modes = [b for v, b in blocks if v != 0.0]
+            for k, b in enumerate(modes, start=1):
+                out[st][f"DISP@{k}"] = b
+    return dict(out)
+
+
+def _read_frd_lines(path) -> dict[int, dict[str, tuple[np.ndarray, np.ndarray]]]:
+    """{step: {block name: (node ids (n,), values (n, ncomp))}}: the line-by-line reader, kept as the reference
+    the fast reader is tested against.
 
     Block names as CalculiX writes them (DISP, STRESS, FORC, ...). Where a block repeats
     within a step (several increments), the last one wins. Supports both short (I5)

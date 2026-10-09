@@ -190,9 +190,17 @@ actions = ["Read the log excerpt in `raw`.", "Open the run in PrePoMax to inspec
 severity = "blocking"
 stage = "solve"
 what = "The solver ran out of memory on a model with {dof} degrees of freedom."
-explain = "The model has more unknowns than the computer's memory can hold while solving. Choose a coarser mesh fidelity on the Study tab, turn off the convergence check (it solves a finer mesh as well), or remove detail that does not matter for strength."
-likely_causes = ["The mesh is too fine for the installed RAM."]
-actions = ["Use a coarser mesh fidelity.", "Reduce the number of parts meshed with tets (members and flat sheet use swept elements)."]
+explain = "The model has more unknowns than the computer's memory can hold while solving, even after AsmFEA's own retry with the simplest joints. On the Study tab choose Optimise for: Speed (a coarser mesh, one solve), close other programs, or remove detail that does not matter for strength."
+likely_causes = ["The mesh is too fine for the installed RAM.", "Other programs took memory during the run."]
+actions = ["Choose Optimise for: Speed on the Study tab (or a coarser mesh level under Advanced).", "Close other programs before running.", "Reduce the number of parts meshed with tets (members and flat sheet use swept elements)."]
+
+[HYBRID_RETRIED]
+severity = "warning"
+stage = "solve"
+what = "The hybrid solver ran out of memory after {minutes:.0f} min with exact joints, so it solved again with smoother joints, one part at a time."
+explain = "AsmFEA joins parts exactly where the joints are small enough (as CalculiX does), which is the most accurate. On this model, with the memory free at the time, that ran out of memory, so instead of stopping the run AsmFEA solved again joining every part by smooth fields, one part at a time. The results are complete; joints by smooth fields can be up to 10 % too flexible at welded frame joints, and the accuracy grade says so."
+likely_causes = ["Many or large joints for the memory free at the time.", "Other programs took memory during the run."]
+actions = ["Accept the results (see the accuracy grade).", "For exact joints, close other programs and run again, or run on a computer with more memory."]
 
 [SOLVE_MEMORY_EXCEEDS_RAM]
 severity = "blocking"
@@ -217,6 +225,14 @@ what = "Estimated solver memory {need_gb:.1f} GB exceeds {frac:.0%} of installed
 explain = "The solver is expected to need a large share of the computer's memory. The run continues, but the computer may slow down badly or the solve may fail. Consider a coarser mesh, or close other large programs while it runs."
 likely_causes = ["The mesh is fine for the size of the model."]
 actions = ["Use a coarser mesh fidelity before solving."]
+
+[MEMORY_PRESSURE]
+severity = "warning"
+stage = "solve"
+what = "Other programs are using memory this run had planned on ({available_gb:.1f} GB free, {reserve_gb:.0f} GB wanted free): the solve is continuing, but more slowly."
+explain = "When the run started, AsmFEA measured the free memory and planned the solve to fit it, leaving room for SolidWorks and other programs. Since then other programs have taken more, so parts of the solve are waiting their turn or being moved to the page file. The run is not stopped and its results are not affected; it just takes longer. Closing programs you do not need speeds it up again."
+likely_causes = ["Another program (a browser, another SolidWorks document, a second analysis) was opened or grew during the run.", "SolidWorks itself grew while you kept working in it."]
+actions = ["Close programs you do not need (browsers, other SolidWorks documents) to give the solve its memory back.", "Leave the run going: it will finish, more slowly."]
 
 [REACTION_IMBALANCE]
 severity = "warning"

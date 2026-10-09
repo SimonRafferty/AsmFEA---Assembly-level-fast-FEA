@@ -156,7 +156,9 @@ def add_markers(pl: pv.Plotter, markers, centre, size) -> list:
 
 def _shot(mesh: pv.PolyData, scalars, title: str, clim, cmap, path: Path, centre, size, view, note: str = "",
           markers=()):
-    """One image. markers: [(point, label)] drawn as labelled points (the field's min and max)."""
+    """One image. markers: [(point, label)] drawn as labelled points (the field's min and max). A fresh plotter
+    each time: reusing one (cleared, light kit restored, overlay layer removed) saved half the plotting time but
+    lost the markers' leader lines after the first image (2026-10-09)."""
     pl = pv.Plotter(off_screen=True, window_size=defaults.PLOT_SIZE)
     pl.set_background("white")
     pl.add_mesh(mesh, scalars=scalars, cmap=cmap, clim=clim, show_scalar_bar=True,
@@ -175,6 +177,26 @@ def _shot(mesh: pv.PolyData, scalars, title: str, clim, cmap, path: Path, centre
 
 
 _WATERMARK = ""
+
+
+def _shot_job(job: dict) -> str:
+    """One deferred image: the mesh travels as plain arrays (points, cells)."""
+    global _WATERMARK
+    _WATERMARK = job.pop("watermark", "")
+    points, cells = job.pop("mesh")
+    _shot(pv.PolyData(points, cells), **job)
+    return job["path"].name
+
+
+def _render_jobs(jobs: list[dict], also=None) -> None:
+    """The images, one after another in this process (``also`` first: the setup view). Drawing them in worker
+    processes was tried and gained nothing: starting VTK in each, and sending the meshes to them, cost what the
+    parallel drawing saved (Robo-mower 6.5 s -> 6.0 s, a 4.5 M-DOF frame 10.3 s -> 10.9 s, 2026-10-09)."""
+    if also:
+        also()
+    for j in jobs:
+        j["watermark"] = _WATERMARK
+        _shot_job(dict(j))
 
 
 def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level: str = "refined",
@@ -213,8 +235,9 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
     for d in set(case_dirs.values()):
         if (d / "deck_info.json").exists():
             remote.update(read_json(d / "deck_info.json").get("remote_loads", {}))
-    images.append(_setup_view(study, model, instances, X, cells, pos, facet_index, centre, size, out, views["iso"],
-                              remote))
+    jobs: list[dict] = []                     # the images, drawn together at the end (_render_jobs)
+    setup = lambda: images.insert(0, _setup_view(study, model, instances, X, cells, pos, facet_index,  # noqa: E731
+                                                 centre, size, out, views["iso"], remote))
     for case in results["load_cases"]:
         frd, step_of = frd_for(case)
         k = step_of[case]
@@ -231,8 +254,8 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
         vm[pos[sn[keep]][sel]] = von_mises(sv[keep][sel, :6])
         umag = np.linalg.norm(U, axis=1)
         scale = defaults.PLOT_DEFORM_FRACTION * size / umag.max() if umag.max() > 0 else 0.0
-        deformed = pv.PolyData(X + scale * U, cells)
-        undeformed = pv.PolyData(X, cells)
+        deformed = (X + scale * U, cells)
+        undeformed = (X, cells)
         fos_raw = yields / np.maximum(vm, 1e-12)
         fos = np.clip(fos_raw, 0, defaults.PLOT_FOS_CAP)
         safe = case.replace(" ", "_")
@@ -252,15 +275,17 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
                     proportional=_proportional(case_dirs[case]))
         for view, cam in views.items():
             p = out / f"{safe}_displacement_{view}.png"
-            _shot(deformed, umag, "Displacement mm", None, "jet", p, centre, size, cam, note=f"(deformed shape x{scale:.3g})",
-                  markers=mk_u)
+            jobs.append(dict(mesh=deformed, scalars=umag, title="Displacement mm", clim=None, cmap="jet", path=p,
+                             centre=centre, size=size, view=cam, note=f"(deformed shape x{scale:.3g})", markers=mk_u))
             images.append(p.name)
             p = out / f"{safe}_vonmises_{view}.png"
-            _shot(undeformed, vm, "von Mises MPa", None, "jet", p, centre, size, cam, markers=mk_vm)
+            jobs.append(dict(mesh=undeformed, scalars=vm, title="von Mises MPa", clim=None, cmap="jet", path=p,
+                             centre=centre, size=size, view=cam, markers=mk_vm))
             images.append(p.name)
             p = out / f"{safe}_fos_{view}.png"
-            _shot(undeformed, fos, "FoS on yield", (0, defaults.PLOT_FOS_CAP), "jet_r", p, centre, size, cam,
-                  note=f"(colour scale capped at {defaults.PLOT_FOS_CAP:g})", markers=mk_fos)
+            jobs.append(dict(mesh=undeformed, scalars=fos, title="FoS on yield", clim=(0, defaults.PLOT_FOS_CAP),
+                             cmap="jet_r", path=p, centre=centre, size=size, view=cam,
+                             note=f"(colour scale capped at {defaults.PLOT_FOS_CAP:g})", markers=mk_fos))
             images.append(p.name)
     for case, bk in results.get("buckling", {}).items():
         on_progress(f"rendering buckling modes of {case}")
@@ -275,9 +300,12 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
             factor = bk["factors"][i - 1] if i - 1 < len(bk["factors"]) else float("nan")
             for view in [v for v in ("iso", "front") if v in views]:
                 p = out / f"{case.replace(' ', '_')}_buckling_mode{i}_{view}.png"
-                _shot(pv.PolyData(X + scale * U, cells), umag / max(umag.max(), 1e-30), "relative displacement", (0, 1),
-                      "jet", p, centre, size, views[view], note=f"(load factor {factor:.4g})")
+                jobs.append(dict(mesh=(X + scale * U, cells), scalars=umag / max(umag.max(), 1e-30),
+                                 title="relative displacement", clim=(0, 1), cmap="jet", path=p, centre=centre,
+                                 size=size, view=views[view], note=f"(load factor {factor:.4g})"))
                 images.append(p.name)
+    on_progress(f"drawing {len(jobs) + 1} plot images")
+    _render_jobs(jobs, also=setup)
     return images
 
 

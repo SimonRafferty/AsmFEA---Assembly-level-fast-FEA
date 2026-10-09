@@ -293,9 +293,21 @@ def _vec(v) -> str:
 
 # --------------------------------------------------------------------------- the report
 
-SECTIONS = ["Description", "Summary", "Assumptions", "Model information", "Study properties", "Units",
-            "Material properties", "Loads and fixtures", "Connections", "Mesh information", "Resultant forces",
-            "Study results", "Conclusion", "Appendix"]
+SECTIONS = ["Description", "Summary", "Results", "Conclusion", "Assumptions"]
+APPENDICES = ["Model information", "Study properties", "Units", "Material properties", "Loads and fixtures",
+              "Connections", "Mesh information", "Resultant forces", "Detailed results", "Input files and log"]
+
+
+def _plan_text(plan: Optional[dict]) -> str:
+    """How the run planner (D60) set this run up, for the study properties table."""
+    if not plan:
+        return "-"
+    m = plan.get("machine") or {}
+    txt = (f"Optimised for {str(plan.get('favour', 'balanced')).capitalize()}, on a computer with {m.get('cores', '?')} cores and "
+           f"{m.get('ram_available_gb', '?')} GB free of {m.get('ram_total_gb', '?')} GB")
+    if plan.get("overrides"):
+        txt += "; set by hand: " + ", ".join(plan["overrides"])
+    return txt
 
 
 def _reuse_text(study: Path) -> str:
@@ -328,10 +340,12 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     versions = res["versions"]
     statuses = [c["status"] for c in res["checks"]]
     overall = "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "PASS"
-    num = {name: i + 1 for i, name in enumerate(SECTIONS)}
+    # the main body is numbered, the appendices lettered (the data sections, read on demand: the user's request)
+    num = {name: f"{i + 1}." for i, name in enumerate(SECTIONS)}
+    num.update({name: f"Appendix {chr(65 + i)}." for i, name in enumerate(APPENDICES)})
 
     def heading(name: str):
-        doc.add_heading(f"{num[name]}. {name}", 1)
+        doc.add_heading(f"{num[name]} {name}", 1)
 
     # ---- title page
     # ---- title and contents on one page
@@ -342,15 +356,17 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                     ["Load cases", ", ".join(res["load_cases"])],
                     ["Part" if model.source.assembly.lower().endswith(".sldprt") else "Assembly", model.source.assembly],
                     ["Configuration", model.source.configuration or "-"],
-                    ["Overall result", overall]], (4.5, 12.5), size=10)
+                    ["Overall result", overall]]
+                   + ([["Accuracy", res["accuracy"]["grade"]]] if res.get("accuracy") else []), (4.5, 12.5), size=10)
     _para(doc, "Prepared with AsmFEA, which builds the finite element model from the SolidWorks assembly, and "
                "CalculiX, which solves it.", 9, colour=GREY)
     _para(doc)
     _para(doc, "Contents", 15, True, BLUE)
-    for name in SECTIONS:
-        _para(doc, f"{num[name]}.  {name}", 10.5).paragraph_format.space_after = Pt(2)
+    for name in SECTIONS + APPENDICES:
+        _para(doc, f"{num[name]}  {name}", 10.5).paragraph_format.space_after = Pt(2)
     doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
+    conv = res.get("convergence") or {}
     # ---- 1. Description
     heading("Description")
     _para(doc, f"Linear {' and '.join(a.lower() for a in analyses)} analysis of the assembly {asm_name} "
@@ -363,6 +379,12 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     heading("Summary")
     p = _para(doc, "Overall result: ")
     _font(p.add_run(overall), None, True, STATUS_COLOUR[overall])
+    acc = res.get("accuracy")
+    if acc:
+        # how far to trust these numbers, from how the model was solved (D60; wording in asmfea.accuracy)
+        _para(doc, acc["summary"], bold=True)
+        for r in acc["reasons"]:
+            _para(doc, r, style="List Bullet")
     t = _table(doc, ["Check", "Value", "Limit", "Status"],
                [[c["check"], c["value"], c["limit"], c["status"]] for c in res["checks"]], [9, 3, 3, 2])
     for row, c in zip(t.rows[1:], res["checks"]):
@@ -379,7 +401,58 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     _table(doc, ["Load case", "Max displacement (mm)", "Max von Mises (MPa)", "In part", "Min factor of safety",
                  "In part"], rows)
 
-    # ---- 3. Assumptions
+    # ---- main body: what matters first
+    # ---- 3. Results
+    heading("Results")
+    for case, lc in res["load_cases"].items():
+        doc.add_heading(f"Load case {case}", 2)
+        ext = lc.get("extremes")
+        safe = case.replace(" ", "_")
+        if ext:
+            def cell(e, unit, cap=None):
+                v = e["value"]
+                val = f"above {cap:g}" if cap is not None and v is not None and v > cap else _fmt(v)
+                at = ", ".join(f"{c:.1f}" for c in e["at"])
+                return f"{val} {unit}\nNode {e['node']} ({e['part']})\nat ({at})"
+            _table(doc, ["Name", "Type", "Min", "Max"], [
+                ["Stress", "von Mises stress", cell(ext["von_mises"]["min"], "MPa"), cell(ext["von_mises"]["max"], "MPa")],
+                ["Displacement", "Resultant displacement", cell(ext["displacement"]["min"], "mm"),
+                 cell(ext["displacement"]["max"], "mm")],
+                ["Factor of safety", "Yield / von Mises (per part's material)", cell(ext["fos"]["min"], ""),
+                 cell(ext["fos"]["max"], "", defaults.PLOT_FOS_CAP)]], [3, 4, 5, 5])
+        for field, label in (("vonmises", "Stress: von Mises"), ("displacement", "Displacement: resultant (deformed shape)"),
+                             ("fos", "Factor of safety on yield")):
+            _picture(doc, study / "results" / f"{safe}_{field}_iso.png", f"{asm_name} - {study_name} - {case} - {label}")
+    if res.get("buckling"):
+        doc.add_heading("Linear buckling", 2)
+        _para(doc, "The buckling factor multiplies the loads of the buckling case; loads marked as preload (self-weight "
+                   "by default) are applied but not scaled. Factors are upper bounds.")
+        _table(doc, ["Buckling case", "Load factors (lowest first)", "Scaled loads", "Preloads"],
+               [[case, ", ".join(f"{f:.4g}" for f in bk["factors"]), ", ".join(bk["scaled_loads"]),
+                 ", ".join(bk["preloads"]) or "-"] for case, bk in res["buckling"].items()])
+        for case, bk in res["buckling"].items():
+            for i in range(1, defaults.PLOT_BUCKLING_MODES + 1):
+                _picture(doc, study / "results" / f"{case.replace(' ', '_')}_buckling_mode{i}_iso.png",
+                         f"{asm_name} - {study_name} - {case} - buckling mode {i}", 12)
+    _para(doc, "The data behind these results (model, materials, loads, connections, mesh, reactions and the "
+               "results part by part) is in the appendices.", 9, colour=GREY)
+    # ---- 4. Conclusion
+    heading("Conclusion")
+    p = _para(doc, "Overall result: ")
+    _font(p.add_run(overall), None, True, STATUS_COLOUR[overall])
+    failed = [c for c in res["checks"] if c["status"] != "PASS"]
+    if failed:
+        for c in failed:
+            _para(doc, f"{c['status']}: {c['check']} = {_fmt(c['value'])} (limit {_fmt(c['limit'])})", style="List Bullet")
+    else:
+        _para(doc, "Every check passed against the study's limits.")
+    warnings = res.get("warnings", [])
+    if warnings:
+        _para(doc, "Warnings present when this report was produced:", bold=True)
+        for w in warnings:
+            _para(doc, f"{w['code']}: {w['what']}", style="List Bullet")
+
+    # ---- 5. Assumptions
     heading("Assumptions")
     conv = res.get("convergence") or {}
     joints = [c for c in conns if c["type"] == "bolted"]
@@ -415,7 +488,9 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     for s in sentences:
         _para(doc, s, style="List Bullet")
 
-    # ---- 4. Model information
+    # ---- the appendices: the data behind it, for the technical file
+    doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    # ---- A. Model information
     heading("Model information")
     _picture(doc, study / "results" / "setup_iso.png", f"{asm_name} - {study_name}: model, fixtures and loads")
     inst = {i["part"]: i for i in res["mesh"]["instances"]}
@@ -436,16 +511,18 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     _table(doc, ["Part", "Treated as", "Material", "Volume (mm³)", "Mass (kg)", "Elements"], rows,
            [4.5, 4.2, 2.8, 2.1, 1.6, 1.8])
 
-    # ---- 5. Study properties
+    # ---- B. Study properties
     heading("Study properties")
     contacts = [c for c in conns if c["type"] == "contact"]
     _kv_table(doc, [
         ["Study name", study_name], ["Analysis type", " and ".join(analyses)],
         ["Load cases", ", ".join(res["load_cases"])],
         ["Mesh type", "Solid mesh: quadratic wedges (swept thin walls and member spans) and quadratic tetrahedra"],
-        ["Mesh fidelity", model.study.mesh.fidelity],
+        ["Run planned", _plan_text(res.get("plan"))],
+        ["Mesh level", (res.get("plan") or {}).get("fidelity") or model.study.mesh.fidelity or "standard"],
         ["Convergence check", "On: base and refined meshes solved" if conv else "Off: one mesh"],
-        ["Solver", versions.get("solver") or "CalculiX"],
+        ["Solver", "AsmFEA hybrid solver (parts condensed onto their joints; the model was too large for CalculiX "
+                   "on this computer)" if res.get("hybrid") else versions.get("solver") or "CalculiX"],
         ["Large displacement", "Off (linear geometry)"],
         ["Contact", f"{len(contacts)} separating contact pair(s)" if contacts else "None: touching faces bonded"],
         ["Results folder", str(study)],
@@ -455,12 +532,12 @@ def build_report(study: Path, pdf: bool = False) -> Path:
         ["Meshers", ", ".join(versions.get("meshers", [])) or "-"],
         ["Job", res["job"]], ["Reused from earlier runs", _reuse_text(study)]])
 
-    # ---- 6. Units
+    # ---- C. Units
     heading("Units")
     _kv_table(doc, [["Length, displacement", "mm"], ["Force", "N"], ["Stress, pressure, elastic modulus", "MPa (N/mm²)"],
                     ["Mass", "kg (t in the result files)"], ["Density", "t/mm³"], ["Acceleration", "mm/s²"]])
 
-    # ---- 7. Material properties
+    # ---- D. Material properties
     heading("Material properties")
     rows = []
     for m in model.materials:
@@ -473,7 +550,7 @@ def build_report(study: Path, pdf: bool = False) -> Path:
         rows.append([m.name, props, "\n".join(users) or "-"])
     _table(doc, ["Material", "Properties", "Components"], rows, [3.5, 8, 5.5])
 
-    # ---- 8. Loads and fixtures
+    # ---- E. Loads and fixtures
     heading("Loads and fixtures")
     face_part = {f.id: f.part for f in model.face_refs}
 
@@ -521,7 +598,7 @@ def build_report(study: Path, pdf: bool = False) -> Path:
              + (f"\nEntities: {entities(ld.faces)}" if ld.faces else "\nEntities: whole model")] for ld in model.loads],
            [4, 13])
 
-    # ---- 9. Connections
+    # ---- F. Connections
     heading("Connections")
     _para(doc, "Connections are found from touching faces and classified from mates and part kinds. Rows marked * "
                "were decided by the user.")
@@ -544,7 +621,7 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                      "\n".join(c["parts"][:2]), ", ".join(det)])
     _table(doc, ["Connection", "Type", "Components", "Details"], rows, [3.2, 2.6, 4.5, 6.7])
 
-    # ---- 10. Mesh information
+    # ---- G. Mesh information
     heading("Mesh information")
     m = res["mesh"]
     _table(doc, ["Mesh", "Total nodes", "Degrees of freedom", "Total elements", "Mass (kg)"],
@@ -559,7 +636,7 @@ def build_report(study: Path, pdf: bool = False) -> Path:
         _para(doc, "The convergence re-solve was switched off for this study; results come from a single mesh and their "
                    "mesh sensitivity is not measured.")
 
-    # ---- 11. Resultant forces
+    # ---- H. Resultant forces
     heading("Resultant forces")
     _para(doc, "Reaction forces at all fixtures, per load case (N).")
     rows = []
@@ -573,27 +650,10 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     _para(doc, "Reactions balance the applied load to within: "
                + "; ".join(f"{case} {_fmt(lc['reaction_balance_err'])}" for case, lc in res["load_cases"].items()) + ".")
 
-    # ---- 12. Study results
-    heading("Study results")
+    # ---- I. Detailed results
+    heading("Detailed results")
     for case, lc in res["load_cases"].items():
         doc.add_heading(f"Load case {case}", 2)
-        ext = lc.get("extremes")
-        safe = case.replace(" ", "_")
-        if ext:
-            def cell(e, unit, cap=None):
-                v = e["value"]
-                val = f"above {cap:g}" if cap is not None and v is not None and v > cap else _fmt(v)
-                at = ", ".join(f"{c:.1f}" for c in e["at"])
-                return f"{val} {unit}\nNode {e['node']} ({e['part']})\nat ({at})"
-            _table(doc, ["Name", "Type", "Min", "Max"], [
-                ["Stress", "von Mises stress", cell(ext["von_mises"]["min"], "MPa"), cell(ext["von_mises"]["max"], "MPa")],
-                ["Displacement", "Resultant displacement", cell(ext["displacement"]["min"], "mm"),
-                 cell(ext["displacement"]["max"], "mm")],
-                ["Factor of safety", "Yield / von Mises (per part's material)", cell(ext["fos"]["min"], ""),
-                 cell(ext["fos"]["max"], "", defaults.PLOT_FOS_CAP)]], [3, 4, 5, 5])
-        for field, label in (("vonmises", "Stress: von Mises"), ("displacement", "Displacement: resultant (deformed shape)"),
-                             ("fos", "Factor of safety on yield")):
-            _picture(doc, study / "results" / f"{safe}_{field}_iso.png", f"{asm_name} - {study_name} - {case} - {label}")
         conv_case = conv.get("by_case", {}).get(case, {}).get("parts", {})
         _para(doc, "Results per part. The factor of safety uses the membrane plus bending stress (ASME VIII Div. 2 "
                    "Part 5 classification: the stress linearised along a line through the material at the most stressed "
@@ -624,36 +684,9 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                    [[k, v["preload"], v.get("force"), v.get("elongation")] for k, v in lc["bolts"].items()])
         if lc.get("stabilising_spring_share") is not None:
             _para(doc, f"Stabilising springs carry {lc['stabilising_spring_share']:.2%} of the applied load.")
-    if res.get("buckling"):
-        doc.add_heading("Linear buckling", 2)
-        _para(doc, "The buckling factor multiplies the loads of the buckling case; loads marked as preload (self-weight "
-                   "by default) are applied but not scaled. Factors are upper bounds.")
-        _table(doc, ["Buckling case", "Load factors (lowest first)", "Scaled loads", "Preloads"],
-               [[case, ", ".join(f"{f:.4g}" for f in bk["factors"]), ", ".join(bk["scaled_loads"]),
-                 ", ".join(bk["preloads"]) or "-"] for case, bk in res["buckling"].items()])
-        for case, bk in res["buckling"].items():
-            for i in range(1, defaults.PLOT_BUCKLING_MODES + 1):
-                _picture(doc, study / "results" / f"{case.replace(' ', '_')}_buckling_mode{i}_iso.png",
-                         f"{asm_name} - {study_name} - {case} - buckling mode {i}", 12)
 
-    # ---- 13. Conclusion
-    heading("Conclusion")
-    p = _para(doc, "Overall result: ")
-    _font(p.add_run(overall), None, True, STATUS_COLOUR[overall])
-    failed = [c for c in res["checks"] if c["status"] != "PASS"]
-    if failed:
-        for c in failed:
-            _para(doc, f"{c['status']}: {c['check']} = {_fmt(c['value'])} (limit {_fmt(c['limit'])})", style="List Bullet")
-    else:
-        _para(doc, "Every check passed against the study's limits.")
-    warnings = res.get("warnings", [])
-    if warnings:
-        _para(doc, "Warnings present when this report was produced:", bold=True)
-        for w in warnings:
-            _para(doc, f"{w['code']}: {w['what']}", style="List Bullet")
-
-    # ---- 14. Appendix
-    heading("Appendix")
+    # ---- J. Input files and log
+    heading("Input files and log")
     rows = [["model.json", _sha1(study / "model.json")], ["study.json", _sha1(study / "study.json")]]
     rows += [[f"{p_.id} geometry", p_.geometry_hash[:12]] for p_ in model.parts]
     _table(doc, ["Input", "Hash"], rows)
@@ -743,6 +776,8 @@ def build_summary(study: Path, pdf: bool = False) -> Path:
     _para(doc)
     _table(doc, ["Load case", "Max von Mises stress (MPa)", "Max displacement (mm)", "Min factor of safety"], rows,
            [3.5, 4.5, 4.5, 4.5], size=9)
+    if res.get("accuracy"):                             # one line: how far to trust the table (D60)
+        _para(doc, res["accuracy"]["summary"], 8.5, bold=True)
     lim = model.study.limits
     limits = []
     if lim.min_fos:

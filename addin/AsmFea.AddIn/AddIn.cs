@@ -15,8 +15,8 @@ using SolidWorks.Interop.swconst;
 using SolidWorks.Interop.swpublished;
 
 [assembly: AssemblyTitle("AsmFEA SolidWorks add-in")]
-[assembly: AssemblyVersion("0.5.0.0")]
-[assembly: AssemblyFileVersion("0.5.0.0")]
+[assembly: AssemblyVersion("0.6.0.0")]
+[assembly: AssemblyFileVersion("0.6.0.0")]
 
 namespace AsmFea.AddIn
 {

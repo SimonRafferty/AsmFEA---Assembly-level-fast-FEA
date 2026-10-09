@@ -54,8 +54,26 @@ namespace AsmFea.AddIn
 
         // Study tab
         private readonly NumericUpDown bucklingModes = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 5, Width = 60 };
-        private readonly ComboBox fidelity = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
-        private readonly CheckBox convergence = new CheckBox { Text = "Convergence check (solve twice)", AutoSize = true };
+        // the run planner (D60): what to favour, and the Advanced overrides of what it decides
+        private readonly ComboBox favour = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
+        private readonly CheckBox advanced = new CheckBox { Text = "Advanced: set the mesh and solver by hand", AutoSize = true };
+        private readonly ComboBox fidelity = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };   // mesh level
+        private readonly ComboBox convergence = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
+        private readonly ComboBox solverBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
+        private readonly List<Control> advancedRows = new List<Control>();
+        private static readonly string[] FavourNames = { "Speed", "Balanced", "Accuracy" };
+        private static readonly Dictionary<string, string> LegacyFavour = new Dictionary<string, string>
+            { { "coarse", "Speed" }, { "standard", "Balanced" }, { "fine", "Accuracy" } };   // studies saved before D60
+        private static readonly Dictionary<string, bool> FavourConvergence = new Dictionary<string, bool>
+            { { "Speed", false }, { "Balanced", true }, { "Accuracy", true } };             // asmfea.defaults.PLAN_FAVOUR
+        private readonly Label planText = new Label { Dock = DockStyle.Top, AutoSize = false, Height = 64,
+            ForeColor = Color.FromArgb(40, 60, 90), Padding = new Padding(2, 2, 2, 2) };
+        private readonly Label accBanner = new Label { Dock = DockStyle.Top, AutoSize = false, Height = 40, Visible = false,
+            ForeColor = Color.White, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), Padding = new Padding(4, 3, 4, 3),
+            Cursor = Cursors.Hand };
+        private JObj shownAccuracy;          // the results' accuracy grade: its reasons open from the banner
+        private string pressureShownFor;     // the job whose memory-pressure box was shown (once per run)
+        private string fixShownFor;          // the job whose "what to change" box was shown (once per run)
         private readonly CheckBox fastLoads = new CheckBox { Text = "Fast load-size changes", AutoSize = true };
         private readonly TextBox maxDefl = new TextBox { Width = 70 }, minFos = new TextBox { Width = 70 }, minBuck = new TextBox { Width = 70 };
 
@@ -107,7 +125,7 @@ namespace AsmFea.AddIn
         private string jobId;
         private string jobDoc;          // the path of the document whose job is followed (shown only while it is active)
         private string jobFile;        // the running job's job.json, fixed when it starts (not the active document's)
-        private static readonly ToolTip tips = new ToolTip { AutoPopDelay = 20000, InitialDelay = 500, ReshowDelay = 200, ShowAlways = true };
+        private static readonly WrapTip tips = new WrapTip { AutoPopDelay = 30000, InitialDelay = 500, ReshowDelay = 200, ShowAlways = true };
 
         /// <summary>Tooltip text for every button, by its caption.</summary>
         /// <summary>How to use the 3-D windows (the windows themselves carry no instructions, D44).</summary>
@@ -148,8 +166,8 @@ namespace AsmFea.AddIn
             { "Check only", "Export and check the model (connections, materials, free motion) without meshing or solving. Fast." },
             { "Cancel", "Stop the running job." },
             { "Open folder", "Open the study folder (exported model, run files, results and report) in Explorer." },
-            { "Open report", "Open the full Word report (for the Technical File); it is rewritten first if the results are newer." },
-            { "Open summary", "Open the half-page summary (project details, a stress plot, key results) for risk assessments; it is rewritten first if the results are newer." },
+            { "Open report", "Open multi-page, detailed report" },
+            { "Open summary", "Open half-page summary report" },
             { "Stress", "Open the von Mises stress of the last run in a 3-D window." + ViewerUse },
             { "Displacement", "Open the displacement (deformed shape) of the last run in a 3-D window." + ViewerUse },
             { "FoS", "Open the factor of safety (yield / von Mises) of the last run in a 3-D window." + ViewerUse },
@@ -189,8 +207,16 @@ namespace AsmFea.AddIn
             Tip(caseBox, "The load case shown below; new loads are added to it. '(+ buckling)' marks the cases checked for buckling.");
             Tip(caseBuckling, "Also check this load case for buckling: the factor by which its loads can grow before the structure buckles. "
                              + "Adds a buckling solve to the run, so it takes longer. Static stresses and deflections are always solved.");
-            Tip(fidelity, "Mesh size: coarse is quick for checking set-up; fine gives more accurate local stresses but takes longer.");
-            Tip(convergence, "Solve on a base mesh and a finer one and report how much the results changed. Doubles the solve time.");
+            Tip(favour, "What to optimise the run for. AsmFEA then decides how to solve from this and this computer's free memory and cores:\n"
+                        + "Speed - a coarse mesh, one solve: quick, for comparing designs.\n"
+                        + "Balanced - the standard mesh, checked on a finer one: for most work.\n"
+                        + "Accuracy - a finer mesh for local stresses, checked: slower.\n"
+                        + "The Run tab shows the plan before you run; the results say how accurate they are likely to be.");
+            Tip(advanced, "Set the mesh level, convergence check or solver yourself instead of leaving them to the planner (Auto: from Optimise for).");
+            Tip(fidelity, "Mesh size: coarse is quick for checking set-up; fine gives more accurate local stresses but takes longer. Auto: from Optimise for.");
+            Tip(convergence, "Solve on a base mesh and a finer one and report how much the results changed. Doubles the solve time. Auto: from Optimise for.");
+            Tip(solverBox, "CalculiX solves the whole model at once (exact; needs the memory for all of it). The hybrid solver condenses each part "
+                           + "onto its joints and needs about the largest part's memory. Auto: CalculiX when it fits this computer, the hybrid otherwise.");
             Tip(fastLoads, "Solve each load on its own once; a load case is then the sum of its loads. Changing only the size of "
                          + "loads afterwards needs no new solve, just the results (exact for linear static studies). The first solve "
                          + "takes longer when a case has several loads. Not used with buckling, separating contact or preloaded bolts.");
@@ -228,6 +254,15 @@ namespace AsmFea.AddIn
         }
 
         // ------------------------------------------------------------------ helpers
+
+        /// <summary>A label as tall as its wrapped text at its current width (the plan and the accuracy line ran off
+        /// the tab at a fixed height, found live).</summary>
+        private static void FitHeight(Label l, int min = 0)
+        {
+            int w = Math.Max(60, l.ClientSize.Width - l.Padding.Horizontal);
+            var size = TextRenderer.MeasureText(l.Text ?? "", l.Font, new Size(w, int.MaxValue), TextFormatFlags.WordBreak);
+            l.Height = Math.Max(min, size.Height + l.Padding.Vertical + 4);
+        }
 
         /// <summary>
         /// Lay a tab out top to bottom in reading order. Docked controls stack the other way round (the last one
@@ -494,8 +529,12 @@ namespace AsmFea.AddIn
                 // every field back to blank or its default, as on a document with no study (the user's request)
                 foreach (var tb in new[] { maxDefl, minFos, minBuck, bondTol }) { tb.Text = ""; tb.BackColor = SystemColors.Window; }
                 caseBuckling.Checked = fastLoads.Checked = fullRun.Checked = false;
-                convergence.Checked = true;                       // the study default (mesh.convergence_check)
-                fidelity.SelectedItem = "standard";
+                favour.SelectedItem = "Balanced";                 // the study default (mesh.favour)
+                advanced.Checked = false;
+                fidelity.SelectedItem = convergence.SelectedItem = solverBox.SelectedItem = "Auto";
+                ShowAdvanced();
+                planText.Text = "";
+                accBanner.Visible = false;
                 bucklingModes.Value = 5;
                 bucklingModes.Enabled = minBuck.Enabled = true;
                 fastBanner.Visible = false;
@@ -518,9 +557,7 @@ namespace AsmFea.AddIn
                 EnsureCriteria(st);
                 var s = Settings(st);
                 bucklingModes.Value = s["buckling_modes"] == null ? 5 : Convert.ToDecimal(s["buckling_modes"]);
-                var mesh = s["mesh"] as JObj ?? new JObj();
-                fidelity.SelectedItem = (string)mesh["fidelity"] ?? "standard";
-                convergence.Checked = mesh["convergence_check"] == null || (bool)mesh["convergence_check"];
+                ShowMesh(s["mesh"] as JObj ?? new JObj());
                 fastLoads.Checked = s["load_superposition"] != null && (bool)s["load_superposition"];
                 var lim = s["limits"] as JObj ?? new JObj();
                 maxDefl.Text = Fmt(lim["max_deflection"]);
@@ -530,6 +567,7 @@ namespace AsmFea.AddIn
                 bondTol.Text = s["bond_tolerance"] != null ? Fmt(s["bond_tolerance"]) : "0.5";      // the pipeline's default (GAP_TOL)
                 bucklingModes.Enabled = minBuck.Enabled = BucklingOn(st);
                 ShowCases(st, CurrentCaseName);
+                RefreshPlan();
                 ShowLoads(st);
                 string chosen = solveCase.SelectedItem as string;
                 solveCase.Items.Clear();
@@ -805,6 +843,105 @@ namespace AsmFea.AddIn
             RefreshDocument();
         }
 
+        // ------------------------------------------------------------------ run planner (D60)
+
+        /// <summary>Show a study's mesh settings: favour and any Advanced overrides. A study saved before the planner
+        /// always held fidelity and convergence_check: its favour follows from the fidelity, and only a setting that
+        /// differs from that favour's own counts as set by hand (as asmfea.planner reads it).</summary>
+        private void ShowMesh(JObj mesh)
+        {
+            string fav = (string)mesh["favour"];
+            bool legacy = fav == null && mesh["fidelity"] != null;
+            if (legacy)
+            {
+                string f;
+                fav = LegacyFavour.TryGetValue((string)mesh["fidelity"], out f) ? f : "Balanced";
+            }
+            fav = fav == null ? "Balanced" : char.ToUpperInvariant(fav[0]) + fav.Substring(1);
+            if (!FavourNames.Contains(fav)) fav = "Balanced";
+            favour.SelectedItem = fav;
+            string fid = legacy ? null : (string)mesh["fidelity"];
+            bool? conv = mesh["convergence_check"] == null ? (bool?)null : (bool)mesh["convergence_check"];
+            if (legacy && conv == null) conv = true;          // before the planner, a missing convergence_check meant on
+            if (legacy && conv == FavourConvergence[fav]) conv = null;
+            string solver = (string)mesh["solver"];
+            if (solver == "auto") solver = null;
+            fidelity.SelectedItem = fid ?? "Auto";
+            convergence.SelectedItem = conv == null ? "Auto" : (conv.Value ? "On" : "Off");
+            solverBox.SelectedItem = solver == null ? "Auto" : (solver == "hybrid" ? "Hybrid" : "CalculiX");
+            advanced.Checked = fid != null || conv != null || solver != null;
+            ShowAdvanced();
+        }
+
+        private void ShowAdvanced()
+        {
+            foreach (var c in advancedRows) c.Visible = advanced.Checked;
+        }
+
+        /// <summary>The plan for a run of this study on this computer now (asmfea plan), shown on the Run tab. The
+        /// pane's own settings are passed, so the plan follows them before they are exported.</summary>
+        private void RefreshPlan()
+        {
+            if (Doc == null || StudyName == null || Study == null) { planText.Text = ""; return; }
+            var mesh = Settings(Study)["mesh"] as JObj ?? new JObj();
+            string args = " --favour " + ((string)favour.SelectedItem ?? "Balanced").ToLowerInvariant();
+            if (advanced.Checked && (string)fidelity.SelectedItem != "Auto") args += " --fidelity " + (string)fidelity.SelectedItem;
+            if (advanced.Checked && (string)convergence.SelectedItem != "Auto") args += " --convergence " + ((string)convergence.SelectedItem).ToLowerInvariant();
+            if (advanced.Checked && (string)solverBox.SelectedItem != "Auto") args += " --solver " + ((string)solverBox.SelectedItem).ToLowerInvariant();
+            Cli.RunAsync(this, "plan " + Cli.Quote(host.StudyFolder(Doc, StudyName)) + args, (r, err) =>
+            {
+                if (err != null) { planText.Text = ""; return; }
+                planText.Text = FormatPlan((JObj)r);
+                FitHeight(planText);
+            });
+        }
+
+        private static string FormatPlan(JObj p)
+        {
+            var lines = new List<string>();
+            var notes = ((p["notes"] as List<object>) ?? new List<object>()).Cast<string>().ToList();
+            if (notes.Count > 0) lines.Add("Plan " + notes[0]);
+            string level = (string)p["fidelity"];
+            string what = "Mesh " + level + ", " + (Convert.ToBoolean(p["convergence_check"]) ? "checked on a finer mesh" : "one solve");
+            if (p["dof"] != null)
+            {
+                what += "; about " + Convert.ToInt64(p["dof"]).ToString("N0") + " unknowns (last run): " +
+                        ((string)p["solver"] == "hybrid" ? "hybrid solver" : "CalculiX");
+                if (p["estimate_s"] != null) what += ", about " + Math.Max(1, (int)Math.Round(Convert.ToDouble(p["estimate_s"]) / 60)) + " min";
+            }
+            else what += "; the solver is chosen once the model is meshed";
+            lines.Add(what + ".");
+            lines.AddRange(notes.Skip(1));
+            if (p["expected_accuracy"] != null) lines.Add((string)p["expected_accuracy"]);
+            return string.Join(System.Environment.NewLine, lines);
+        }
+
+        /// <summary>Other programs took the memory the run planned on: the run goes on, more slowly. Told once per run,
+        /// in a box that does not block the pane (the user's wish: never stop a run, only slow it and say why).</summary>
+        private void ShowPressureBox(JObj mp)
+        {
+            var f = new Form
+            {
+                Text = "AsmFEA: the solve is continuing, more slowly", FormBorderStyle = FormBorderStyle.FixedDialog,
+                StartPosition = FormStartPosition.CenterScreen, TopMost = true, MinimizeBox = false, MaximizeBox = false,
+                ShowInTaskbar = false, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(12)
+            };
+            var flow = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, Dock = DockStyle.Fill };
+            flow.Controls.Add(new Label
+            {
+                AutoSize = true, MaximumSize = new Size(440, 0),
+                Text = "Other programs are now using memory this run had planned on (" + Fmt(mp["available_gb"]) + " GB free, "
+                       + Fmt(mp["reserve_gb"]) + " GB wanted free).\r\n\r\nThe solve is continuing, but more slowly. Close programs "
+                       + "you don't need (browsers, other SolidWorks documents) to speed it up again. The results are not affected."
+            });
+            var ok = new Button { Text = "OK", AutoSize = true };
+            ok.Click += (s, e) => f.Close();
+            flow.Controls.Add(ok);
+            f.Controls.Add(flow);
+            f.AcceptButton = ok;
+            f.Show();
+        }
+
         // ------------------------------------------------------------------ Study tab
 
         private TabPage StudyTab()
@@ -831,12 +968,25 @@ namespace AsmFea.AddIn
                 t.Controls.Add(h);
                 t.SetColumnSpan(h, 2);
             };
-            fidelity.Items.AddRange(new object[] { "coarse", "standard", "fine" });
-            // by function: how the model is meshed, how it is solved, how the results are judged
-            heading("Mesh");
-            add("Mesh fidelity", fidelity);
-            add("", convergence);
-            heading("Solving");
+            favour.Items.AddRange(FavourNames);
+            fidelity.Items.AddRange(new object[] { "Auto", "coarse", "standard", "fine" });
+            convergence.Items.AddRange(new object[] { "Auto", "On", "Off" });
+            solverBox.Items.AddRange(new object[] { "Auto", "CalculiX", "Hybrid" });
+            Action<string, Control> addAdvanced = (label, c) =>
+            {
+                var l = new Label { Text = label, AutoSize = true, Padding = new Padding(16, 6, 0, 0) };
+                t.Controls.Add(l);
+                t.Controls.Add(c);
+                advancedRows.Add(l);
+                advancedRows.Add(c);
+            };
+            // by function: how the run is solved (the planner, D60), how the results are judged
+            heading("How to solve");
+            add("Optimise for", favour);
+            add("", advanced);
+            addAdvanced("Mesh level", fidelity);
+            addAdvanced("Convergence check", convergence);
+            addAdvanced("Solver", solverBox);
             add("", fastLoads);
             heading("Pass / fail criteria (used in the reports)");
             add("Max deflection, mm", maxDefl);
@@ -846,14 +996,29 @@ namespace AsmFea.AddIn
 
             // every change is stored at once (no Apply)
             bucklingModes.ValueChanged += (s, e) => { if (!showing && Study != null) { Settings(Study)["buckling_modes"] = (int)bucklingModes.Value; Stored(); } };
+            // the planner's inputs: favour, and the Advanced overrides only where they are not Auto (the planner then
+            // decides the rest from this computer's memory and cores when the run starts)
             Action storeMesh = () =>
             {
                 if (showing || Study == null) return;
-                Settings(Study)["mesh"] = new JObj { { "fidelity", (string)fidelity.SelectedItem ?? "standard" }, { "convergence_check", convergence.Checked } };
+                var old = Settings(Study)["mesh"] as JObj ?? new JObj();
+                var m = new JObj { { "favour", ((string)favour.SelectedItem ?? "Balanced").ToLowerInvariant() } };
+                if (old["size"] != null) m["size"] = old["size"];
+                if (advanced.Checked)
+                {
+                    if ((string)fidelity.SelectedItem != "Auto") m["fidelity"] = (string)fidelity.SelectedItem;
+                    if ((string)convergence.SelectedItem != "Auto") m["convergence_check"] = (string)convergence.SelectedItem == "On";
+                    if ((string)solverBox.SelectedItem != "Auto") m["solver"] = ((string)solverBox.SelectedItem).ToLowerInvariant();
+                }
+                Settings(Study)["mesh"] = m;
                 Stored();
+                RefreshPlan();
             };
+            favour.SelectedIndexChanged += (s, e) => storeMesh();
+            advanced.CheckedChanged += (s, e) => { ShowAdvanced(); storeMesh(); };
             fidelity.SelectedIndexChanged += (s, e) => storeMesh();
-            convergence.CheckedChanged += (s, e) => storeMesh();
+            convergence.SelectedIndexChanged += (s, e) => storeMesh();
+            solverBox.SelectedIndexChanged += (s, e) => storeMesh();
             fastLoads.CheckedChanged += (s, e) =>
             {
                 if (showing || Study == null) return;
@@ -876,9 +1041,34 @@ namespace AsmFea.AddIn
                     else if (v > 0) lim[key] = v.Value;
                     else return;
                     Stored();
+                    // the results, checks and reports follow at once, without solving again (the user's request);
+                    // a moment after the typing stops
+                    recheckTimer.Stop();
+                    recheckTimer.Start();
                 };
             }
+            recheckTimer.Tick += (s, e) => { recheckTimer.Stop(); Recheck(); };
             return p;
+        }
+
+        private readonly Timer recheckTimer = new Timer { Interval = 1200 };
+
+        /// <summary>New pass/fail criteria applied to the last results (asmfea recheck): the Results tab's checks are
+        /// worked out again and the reports are rewritten when next opened. No solve.</summary>
+        private void Recheck()
+        {
+            if (Doc == null || StudyName == null || Study == null) return;
+            string folder = host.StudyFolder(Doc, StudyName);
+            if (!File.Exists(Path.Combine(folder, "study.json"))) return;            // never run: nothing to update
+            var lim = Settings(Study)["limits"] as JObj ?? new JObj();
+            string pairs = string.Join(",", lim.Where(kv => kv.Value != null)
+                                               .Select(kv => kv.Key + "=" + Convert.ToDouble(kv.Value).ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            Cli.RunAsync(this, "recheck " + Cli.Quote(folder) + " --limits " + Cli.Quote(pairs), (r, err) =>
+            {
+                if (err != null) return;                      // no results yet: the next run uses the new criteria
+                RefreshResults();
+                Say("Pass/fail criteria applied to the last results (no new solve).");
+            });
         }
 
         // ------------------------------------------------------------------ Loads and fixtures
@@ -1633,7 +1823,9 @@ namespace AsmFea.AddIn
             var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 120 };
             split.Panel1.Controls.Add(problems);
             split.Panel2.Controls.Add(logBox);
-            Stack(p, which, runs, Rule(), files, Rule(), progress, activity, probBar, split);
+            Stack(p, which, runs, planText, Rule(), files, Rule(), progress, activity, probBar, split);
+            p.Enter += (s, e) => RefreshPlan();
+            planText.Resize += (s, e) => FitHeight(planText);           // free memory changes: the plan is refreshed when the tab is shown
             return p;
         }
 
@@ -1733,7 +1925,17 @@ namespace AsmFea.AddIn
                 progress.Value = (int)Math.Min(100, 100 * Convert.ToDouble(prog["done"]) / Convert.ToDouble(prog["total"]));
             }
             else progress.Style = state == "running" ? ProgressBarStyle.Marquee : ProgressBarStyle.Continuous;
-            Say(state + ": " + (string)job["activity"] + "  (" + Fmt(job["elapsed_s"]) + " s)", state == "failed" || state == "blocked");
+            // memory pressure (D60): the run goes on more slowly; said in the status line while it lasts, and once
+            // per run in a box that does not stop anything
+            var mp = job["memory_pressure"] as JObj;
+            bool pressed = mp != null && mp["active"] is bool && (bool)mp["active"];
+            Say(state + ": " + (string)job["activity"] + "  (" + Fmt(job["elapsed_s"]) + " s)"
+                + (pressed && state == "running" ? "  - slowed: other programs need memory" : ""), state == "failed" || state == "blocked");
+            if (pressed && state == "running" && pressureShownFor != jobId)
+            {
+                pressureShownFor = jobId;
+                ShowPressureBox(mp);
+            }
             var lines = new List<string>();
             lines.AddRange(((job["results"] as List<object>) ?? new List<object>()).Cast<string>());
             lines.AddRange(((job["verify"] as List<object>) ?? new List<object>()).Cast<string>());
@@ -1758,13 +1960,104 @@ namespace AsmFea.AddIn
                 replotting = false;
                 if (state == "done") RefreshResults(next);
                 LoadConnections();                               // a run (or Check only) rewrites connections.json
+                // a run that could not finish: what to change, in plain words, once per run
+                if ((state == "blocked" || state == "failed") && fixShownFor != jobId)
+                {
+                    fixShownFor = jobId;
+                    var blocking = ((job["diagnostics"] as List<object>) ?? new List<object>()).OfType<JObj>()
+                                   .Where(x => (string)x["severity"] == "blocking").ToList();
+                    if (blocking.Count > 0) ShowFixBox(blocking, Path.GetDirectoryName(jobFile));
+                }
             }
         }
 
         private void HighlightProblem()
         {
             if (problems.SelectedItems.Count == 0 || Doc == null) return;
-            var where = ((JObj)problems.SelectedItems[0].Tag)["where"] as JObj;
+            Highlight((JObj)problems.SelectedItems[0].Tag);
+        }
+
+        /// <summary>Whether a diagnostic names faces or parts that can be shown in SolidWorks.</summary>
+        private static bool HasPlace(JObj d)
+        {
+            var where = d["where"] as JObj;
+            if (where == null) return false;
+            return new[] { "faces", "parts" }.Any(k => where[k] is List<object> && ((List<object>)where[k]).Count > 0);
+        }
+
+        /// <summary>A run that could not finish: what to change in the model, in plain words, with each place shown in
+        /// SolidWorks at a click (the user's request: not just "run failed"). Opened once per run, not blocking.</summary>
+        private void ShowFixBox(List<JObj> blocking, string folder)
+        {
+            var f = new Form
+            {
+                Text = "AsmFEA: this run could not finish", Width = 640, Height = 540, StartPosition = FormStartPosition.CenterScreen,
+                MinimizeBox = false, ShowIcon = false, TopMost = true
+            };
+            var flow = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false,
+                                             AutoScroll = true, Padding = new Padding(10) };
+            int width = 580;
+            bool internalFault = blocking.All(d => (string)d["code"] == "JOB_FAILED");
+            flow.Controls.Add(new Label
+            {
+                AutoSize = true, MaximumSize = new Size(width, 0), Font = new Font("Segoe UI", 10f, FontStyle.Bold),
+                Text = internalFault ? "AsmFEA hit an internal problem. This is a fault in the tool, not in your model."
+                     : blocking.Count == 1 ? "One thing needs changing before this model can run:"
+                     : blocking.Count + " things need changing before this model can run:",
+                Padding = new Padding(0, 0, 0, 8)
+            });
+            int n = 1;
+            foreach (var d in blocking)
+            {
+                var item = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false,
+                                                 Padding = new Padding(0, 4, 0, 10) };
+                item.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(width, 0), Font = new Font("Segoe UI", 9.5f, FontStyle.Bold),
+                                              Text = n++ + ".  " + (string)d["what"] });
+                if (!string.IsNullOrEmpty((string)d["explain"]))
+                    item.Controls.Add(new Label { AutoSize = true, MaximumSize = new Size(width, 0), ForeColor = Color.DimGray,
+                                                  Text = (string)d["explain"], Padding = new Padding(16, 2, 0, 2) });
+                var acts = ((d["actions"] as List<object>) ?? new List<object>())
+                           .Select(a => a is JObj ? ((string)((JObj)a)["text"] ?? "") : Convert.ToString(a)).Where(a => a.Length > 0).ToList();
+                if (acts.Count > 0)
+                    item.Controls.Add(new Label
+                    {
+                        AutoSize = true, MaximumSize = new Size(width, 0), Padding = new Padding(16, 2, 0, 2),
+                        Text = (internalFault ? "What to do:" : "To run it:") + System.Environment.NewLine
+                               + string.Join(System.Environment.NewLine, acts.Select((a, k) => "   " + (k + 1) + ". " + a))
+                    });
+                var buttons = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Padding = new Padding(12, 2, 0, 0) };
+                var dd = d;
+                if (HasPlace(d))
+                {
+                    var show = new Button { Text = "Show in SolidWorks", AutoSize = true };
+                    show.Click += (s, e) => Highlight(dd);
+                    buttons.Controls.Add(show);
+                }
+                var more = new Button { Text = "More detail", AutoSize = true };
+                more.Click += (s, e) => ShowHelp(dd);
+                buttons.Controls.Add(more);
+                item.Controls.Add(buttons);
+                flow.Controls.Add(item);
+            }
+            var bottom = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
+            if (internalFault && folder != null)
+            {
+                var open = new Button { Text = "Open job folder", AutoSize = true };
+                open.Click += (s, e) => OpenPath(folder);
+                bottom.Controls.Add(open);
+            }
+            var close = new Button { Text = "Close", AutoSize = true };
+            close.Click += (s, e) => f.Close();
+            bottom.Controls.Add(close);
+            flow.Controls.Add(bottom);
+            f.Controls.Add(flow);
+            f.Show();
+        }
+
+        private void Highlight(JObj d)
+        {
+            if (Doc == null) return;
+            var where = d["where"] as JObj;
             if (where == null) return;
             var faces = ((where["faces"] as List<object>) ?? new List<object>()).Cast<string>().ToList();
             if (faces.Count > 0 && Study != null && host.HighlightFaces(Doc, Study, faces) > 0) return;
@@ -1788,7 +2081,21 @@ namespace AsmFea.AddIn
             var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 160 };
             split.Panel1.Controls.Add(checksList);
             split.Panel2.Controls.Add(keyFigures);
-            Stack(p, fastBanner, plotFor, plots, other, Rule(), reports, Rule(), resActivity, split);
+            accBanner.Click += (s, e) =>
+            {
+                if (shownAccuracy == null) return;
+                var why = ((shownAccuracy["reasons"] as List<object>) ?? new List<object>()).Cast<string>();
+                MessageBox.Show((string)shownAccuracy["summary"] + "\r\n\r\n- " + string.Join("\r\n- ", why)
+                                + "\r\n\r\nThe expected errors are for the model as defined (its loads, connections and materials), "
+                                + "not for how well it represents the real structure.", "How accurate are these results?");
+            };
+            accBanner.Resize += (s, e) => { if (accBanner.Visible) FitHeight(accBanner, 40); };
+            // the checks: what each means, where it governs and what to do, as for the problems (the user's request)
+            var checksBar = Row(Caption("Checks", true),
+                                Btn("More Info", () => { if (checksList.SelectedItems.Count > 0) ShowCheckInfo((JObj)checksList.SelectedItems[0].Tag); else Say("Select a check first.", true); }));
+            checksList.DoubleClick += (s, e) => { if (checksList.SelectedItems.Count > 0) ShowCheckInfo((JObj)checksList.SelectedItems[0].Tag); };
+            checksList.SelectedIndexChanged += (s, e) => { if (checksList.SelectedItems.Count > 0 && checksList.SelectedItems[0].Tag is JObj) Highlight((JObj)checksList.SelectedItems[0].Tag); };
+            Stack(p, fastBanner, accBanner, plotFor, plots, other, Rule(), reports, Rule(), resActivity, checksBar, split);
             return p;
         }
 
@@ -1804,6 +2111,18 @@ namespace AsmFea.AddIn
                 plotView = res["plot_view"] as JObj;
                 bool fastResults = (string)res["run_mode"] == "fast";
                 fastBanner.Visible = fastResults;
+                // how accurate these results are likely to be, from how they were solved (D60); click for the reasons
+                shownAccuracy = res["accuracy"] as JObj;
+                if (shownAccuracy != null && !fastResults)
+                {
+                    string g = (string)shownAccuracy["grade"];
+                    accBanner.Text = (string)shownAccuracy["summary"] + "  Click for why.";
+                    FitHeight(accBanner, 40);
+                    accBanner.BackColor = g == "High" ? Color.FromArgb(46, 125, 50) : g == "Good" ? Color.FromArgb(21, 101, 192)
+                                                                                    : Color.FromArgb(230, 81, 0);
+                    accBanner.Visible = true;
+                }
+                else accBanner.Visible = false;
                 foreach (var b in new[] { reportBtn, summaryBtn })
                 {
                     if (b == null) continue;
@@ -1813,7 +2132,7 @@ namespace AsmFea.AddIn
                 }
                 foreach (JObj c in ((res["checks"] as List<object>) ?? new List<object>()).OfType<JObj>())
                 {
-                    var it = new ListViewItem(new[] { (string)c["check"], Fmt(c["value"]), Fmt(c["limit"]), (string)c["status"] });
+                    var it = new ListViewItem(new[] { (string)c["check"], Fmt(c["value"]), Fmt(c["limit"]), (string)c["status"] }) { Tag = c };
                     if ((string)c["status"] != "PASS") it.ForeColor = Color.Firebrick;
                     checksList.Items.Add(it);
                 }
@@ -2078,6 +2397,22 @@ namespace AsmFea.AddIn
             ShowText((string)d["code"], sb.ToString().TrimEnd());
         }
 
+        /// <summary>More Info on a result check: what it means, its value against the limit, where it governs, what to do.</summary>
+        private void ShowCheckInfo(JObj c)
+        {
+            if (c == null) return;
+            var sb = new StringBuilder();
+            sb.AppendLine((string)c["check"]);
+            sb.AppendLine();
+            sb.AppendLine("Result: " + (string)c["status"] + "  (value " + Fmt(c["value"]) + ", limit " + Fmt(c["limit"]) + ")");
+            if (!string.IsNullOrEmpty((string)c["explain"])) { sb.AppendLine(); sb.AppendLine((string)c["explain"]); }
+            var where = c["where"] as JObj;
+            var parts = where == null ? null : where["parts"] as List<object>;
+            if (parts != null && parts.Count > 0) { sb.AppendLine(); sb.AppendLine("Where: " + string.Join(", ", parts.Cast<object>())); }
+            Bullets(sb, "What to do:", c["actions"] as List<object>);
+            ShowText("Check", sb.ToString().TrimEnd());
+        }
+
         private static void Bullets(StringBuilder sb, string heading, List<object> items)
         {
             if (items == null || items.Count == 0) return;
@@ -2244,7 +2579,7 @@ namespace AsmFea.AddIn
         public bool Accepted { get; private set; }
         private readonly Timer previewTimer = new Timer { Interval = 250 };
         private readonly Label resultant = new Label { AutoSize = true, Padding = new Padding(0, 6, 0, 0) };
-        private readonly ToolTip tips = new ToolTip { AutoPopDelay = 20000, InitialDelay = 400 };
+        private readonly WrapTip tips = new WrapTip { AutoPopDelay = 30000, InitialDelay = 400 };
 
 
         private static TextBox[] Boxes()
@@ -2476,7 +2811,7 @@ namespace AsmFea.AddIn
     {
         private readonly ComboBox typeBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 110 };
         private readonly CheckBox[] move = Checks(), turn = Checks();
-        private readonly ToolTip tips = new ToolTip { AutoPopDelay = 20000, InitialDelay = 400 };
+        private readonly WrapTip tips = new WrapTip { AutoPopDelay = 30000, InitialDelay = 400 };
 
         private static CheckBox[] Checks()
         {
@@ -2569,6 +2904,39 @@ namespace AsmFea.AddIn
             var dofs = ticked(move);
             if (tp == "displacement" || dofs.Count < 3) fx["dofs"] = dofs;   // pinned holds all three when dofs is absent
             if (tp == "pinned" && ticked(turn).Count > 0) fx["hold_rotations"] = ticked(turn);
+        }
+    }
+
+    /// <summary>A tooltip whose text is wrapped to lines of a readable length: Windows draws a tooltip as one line per
+    /// line of text, and long ones ran off the screen (found live).</summary>
+    internal sealed class WrapTip : ToolTip
+    {
+        public new void SetToolTip(Control control, string caption)
+        {
+            base.SetToolTip(control, Wrap(caption));
+        }
+
+        /// <summary>Lines of at most ``width`` characters, broken at spaces; the text's own line breaks are kept.</summary>
+        internal static string Wrap(string text, int width = 80)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            var outLines = new List<string>();
+            foreach (var line in text.Replace("\r\n", "\n").Split('\n'))
+            {
+                var cur = new StringBuilder();
+                foreach (var word in line.Split(' '))
+                {
+                    if (cur.Length > 0 && cur.Length + 1 + word.Length > width)
+                    {
+                        outLines.Add(cur.ToString());
+                        cur.Clear();
+                    }
+                    if (cur.Length > 0) cur.Append(' ');
+                    cur.Append(word);
+                }
+                outLines.Add(cur.ToString());
+            }
+            return string.Join("\r\n", outLines);
         }
     }
 }

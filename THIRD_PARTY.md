@@ -13,6 +13,8 @@ Licences were checked on 2026-10-02 against each project's own repository or dis
 | numpy | BSD-3-Clause | PyPI metadata | Arrays |
 | scipy | BSD-3-Clause | PyPI metadata | KD-trees and sparse algebra (face tagging) |
 | psutil | BSD-3-Clause | PyPI metadata | Process monitoring, killing process trees |
+| numba 0.68.0 | BSD-2-Clause | PyPI metadata, github.com/numba/numba `LICENSE` | Compiles the hybrid solver's element stiffness loop to machine code (added 2026-10-09). Optional at run time: without it the same matrices come from the NumPy code, more slowly |
+| llvmlite 0.50.0 (numba's compiler back end) | BSD-2-Clause; the LLVM it bundles is Apache-2.0 WITH LLVM-exception | PyPI metadata, github.com/numba/llvmlite `LICENSE`, `LICENSE.thirdparty` | Used only through numba |
 | cadquery-ocp (OCP) 8.0.1 | Apache-2.0 | github.com/CadQuery/OCP `LICENSE` | Python binding to OpenCascade: STEP reading and writing, face fingerprints, booleans for overlap and interference |
 | OpenCascade Technology (OCCT), inside OCP | LGPL-2.1 plus the Open CASCADE exception | github.com/Open-Cascade-SAS/OCCT `LICENSE_LGPL_21.txt`, `OCCT_LGPL_EXCEPTION.txt` | Dynamically linked through OCP. The exception allows distributing object code under other terms, with a prominent notice in the documentation that the software uses Open CASCADE Technology. |
 
