@@ -11,7 +11,7 @@ AsmFEA analyses a whole SolidWorks assembly (welded frames, bolted structures, s
 
 ## Download and install
 
-**[Download the installer: AsmFEA-Setup-0.5.0.exe](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases/download/v0.5.0/AsmFEA-Setup-0.5.0.exe)** (Windows 10/11, 64-bit; all releases on the [Releases page](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases)).
+**[Download the installer: AsmFEA-Setup-0.6.0.exe](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases/download/v0.6.0/AsmFEA-Setup-0.6.0.exe)** (Windows 10/11, 64-bit; all releases on the [Releases page](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases)).
 
 The installer contains AsmFEA, the SolidWorks add-in and a private Python runtime. During installation it downloads the solver and mesher from their official sources (about 310 MB), each checked against a pinned SHA-256 hash:
 
@@ -28,6 +28,7 @@ The bundled Python runtime is the official embeddable package, <https://www.pyth
 
 ## Documents
 
+- **[Technology overview (PDF)](AsmFEA%20Technology%20Overview.pdf):** what AsmFEA does and how, in plain language: how it reads an assembly, the decision path it follows for every model (matching geometry, finding and classifying connections, checking the model is held, choosing how to mesh each part, planning the run for the computer, solving, checking and assessing the results), the part-by-part solver for large assemblies, how each result's accuracy is graded, and the verification evidence.
 - **[Quick start guide (PDF)](AsmFEA%20Quick%20Start%20Guide.pdf):** installing, setting up a study, running it and reading the results. The installer also puts it, and a web version, in the Start menu.
 - **[Verification report (PDF)](AsmFEA%20Verification%20Report.pdf):** AsmFEA's results against classical hand calculations on four cases (a tube cantilever, a bar under its own weight, a cantilever built from two bonded members, and a buckling column), the CalculiX solver against its own test examples and the NAFEMS LE1 and LE10 benchmarks, and the hybrid solver against CalculiX. Every comparison is within its acceptance criterion. It is a comparison of methods, not a sign-off: check AsmFEA against your own known cases before relying on it.
 
@@ -66,6 +67,7 @@ CalculiX and Gmsh run as separate programs that exchange files with AsmFEA; no G
 - [pydantic](https://docs.pydantic.dev) and [jsonschema](https://github.com/python-jsonschema/jsonschema) (MIT): the neutral model
 - [psutil](https://github.com/giampaolo/psutil) (BSD-3-Clause): job monitoring
 - [pypardiso](https://github.com/haasad/PyPardisoProject) (BSD-3-Clause): PARDISO for the hybrid solver
+- [numba](https://numba.pydata.org) and [llvmlite](https://github.com/numba/llvmlite) (BSD-2-Clause; LLVM under Apache-2.0 with LLVM exception): compiled element calculations in the hybrid solver
 
 **Build tools:** [Inno Setup](https://jrsoftware.org/isinfo.php) (installer).
 
