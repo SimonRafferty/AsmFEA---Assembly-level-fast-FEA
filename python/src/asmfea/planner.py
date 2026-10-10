@@ -58,6 +58,7 @@ class Plan:
     notes: list = field(default_factory=list)       # plain-language lines for the plan display
     solver: Optional[str] = None   # chosen once the deck's size is known
     dof: Optional[int] = None
+    refine_unconverged: bool = False   # a third pass, finer again, on the parts that did not converge (D65)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -89,6 +90,13 @@ def plan_study(study, m: Optional[Machine] = None, fast: bool = False) -> Plan:
     if given is not None and not fast and not (legacy and bool(given) == table["convergence"]):
         convergence = bool(given)
         overrides.append("convergence check " + ("on" if convergence else "off"))
+    # the local pass needs the convergence check's two solves to find the parts to refine
+    refine = bool(table.get("refine")) and convergence and not fast
+    given_r = mesh.refine_unconverged if mesh is not None else None
+    if given_r is not None and not fast:
+        refine = bool(given_r) and convergence
+        overrides.append("refine where not converged " + ("on" if given_r else "off")
+                         + ("" if convergence or not given_r else " (needs the convergence check)"))
     solver_pref = (mesh.solver if mesh is not None else "auto") or "auto"
     if solver_pref != "auto":
         overrides.append(f"solver {solver_pref}")
@@ -105,8 +113,11 @@ def plan_study(study, m: Optional[Machine] = None, fast: bool = False) -> Plan:
         notes.insert(1, f"Memory is short right now (only {m.ram_available_gb:.0f} GB free). The run will go ahead "
                         "but may be slow: close programs you do not need (browsers, other SolidWorks documents, "
                         "another analysis) before starting it.")
+    if refine:
+        notes.append("Parts whose results change by more than the limit between the two meshes are meshed finer "
+                     "again and solved a third time.")
     return Plan(favour, fidelity, convergence, solver_pref, cap, total, round(budget, 1), round(res, 1), m.cores,
-                m.as_dict(), overrides, notes)
+                m.as_dict(), overrides, notes, refine_unconverged=refine)
 
 
 def ccx_estimate_gb(dof: int) -> float:

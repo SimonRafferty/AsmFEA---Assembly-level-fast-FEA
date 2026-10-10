@@ -211,7 +211,7 @@ def _facet_size(facets, coords) -> float:
 
 
 def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exclude: set,
-                     n_candidates: int | None = None, thin: float | None = None) -> dict | None:
+                     n_candidates: int | None = None, thin: float | None = None, zones: dict | None = None) -> dict | None:
     """The largest von Mises stress of membrane plus bending over this part's most stressed surface
     nodes (outside ``exclude``, the joint band). stress: {global node: (6,) sxx syy szz sxy syz szx}, or the
     same as an array indexed by global node id;
@@ -221,9 +221,16 @@ def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exc
     through the wall reports a notch's in-plane concentration as membrane: there the line runs across the
     ligament from the edge (side faces: the outline, holes, notches), face points away from the edges
     keep the line through the wall (plate bending and membrane), and face points near an edge are left
-    to the edge's line."""
+    to the edge's line.
+
+    zones: {"edge", "line", "inside"} sets of global node ids from pipeline.joint_zones. The joints are assessed too
+    (the user's request, 2026-10-10: the stress round a joint matters), in "joint": a thick part by sections through
+    the material in its joint bands (a section's average and linear part are finite at a sharp edge); a thin part by
+    the hot-spot stress at its joint edges (hot_spots): through a thin wall the stress is linear, so a section there
+    returns the edge's own spike, which grows with every mesh (153 MPa on a folding step's plate, its peak 145)."""
     from scipy.spatial import cKDTree
     n_candidates = n_candidates or defaults.SCL_CANDIDATES
+    zones = zones or {}
     ext = tp.exterior()
     # outward unit normal of each exterior facet, and the facets as triangles (for the ray casts)
     C, N, fnodes_of, tri = _exterior_facets(inst, tp, ext)
@@ -254,9 +261,35 @@ def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exc
                 if a not in side_nodes and da < defaults.SCL_EDGE_T * thin:
                     skip.add(a)
     local = {int(g - inst.node0): v for g, v in vm_nodes}
-    cands = [a for a in sorted(nrm_node, key=lambda a: -local.get(a, 0.0))
-             if int(inst.node0 + a) not in exclude and a in local and a not in skip][:n_candidates]
-    if not cands:
+    ranked = [a for a in sorted(nrm_node, key=lambda a: -local.get(a, 0.0)) if a in local and a not in skip]
+    # The most stressed points away from the joints; on a thick part as many again in the joint bands (``exclude``),
+    # off the edge's own elements: a section through the material at a joint averages out the sharp edge's spike,
+    # which has no finite value, and keeps the membrane and bending the joint really puts in (ASME VIII-2 5.A). The
+    # bands' spikes would take every place in one list, so they get their own, spread over the joints: at most
+    # SCL_PER_JOINT_CELL points per cell 3 walls wide. A thin part's sections through the wall return the surface
+    # stress itself, so there no point nearer the edge line than HOT_SPOT_NEAR_T walls is read on its own (the IIW
+    # read-out's nearest point): the edge itself is read by hot_spots.
+    cands = [a for a in ranked if int(inst.node0 + a) not in exclude][:n_candidates]
+    edge = zones.get("edge") or set()
+    in_band = [a for a in ranked if int(inst.node0 + a) in exclude and int(inst.node0 + a) not in edge]
+    line_l = np.array(sorted(g - inst.node0 for g in (zones.get("line") or ())), dtype=np.int64)
+    if thin and in_band and len(line_l):
+        r, _ = cKDTree(inst.X[line_l - 1]).query(inst.X[np.asarray(in_band) - 1], k=1)
+        in_band = [a for a, ra in zip(in_band, r) if ra >= defaults.HOT_SPOT_NEAR_T * thin]
+    if in_band:
+        cell = 2.0 * max(thin or 0.0, h) * defaults.JOINT_BAND_T
+        keys = np.floor(inst.X[np.asarray(in_band) - 1] / cell).astype(np.int64)
+        seen: dict = {}
+        for a, k in zip(in_band, map(tuple, keys)):
+            if seen.get(k, 0) < defaults.SCL_PER_JOINT_CELL:
+                seen[k] = seen.get(k, 0) + 1
+                cands.append(a)
+                if len(cands) >= 2 * n_candidates:
+                    break
+    hot = None
+    if thin and zones.get("line"):
+        hot = hot_spots(inst, nrm_node, local, stress, thin, zones["line"], zones.get("inside") or set(), h)
+    if not cands and hot is None:
         return None
     ids = np.array(sorted(local), dtype=np.int64)
     Xn = inst.X[ids - 1]
@@ -266,7 +299,8 @@ def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exc
     else:
         S_nodes = np.array([stress[int(inst.node0 + a)] for a in ids])
     reach = 1.5 * (thin or h)                     # where the first ray search looks (any value is exact)
-    worst = None
+    worst = joint = None
+    band_set = set(in_band)
     for a in cands:
         p0 = inst.X[a - 1]
         # one SCL per distinct face direction at the point; the longest is the section that carries the
@@ -293,7 +327,84 @@ def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exc
         if worst is None or v > worst["membrane_bending"]:
             worst = {"membrane_bending": float(v), "membrane": float(_vm(sm)), "at": p0.round(3).tolist(),
                      "scl_length": float(L), "peak": float(local[a])}
+        if a in band_set and (joint is None or v > joint["membrane_bending"]):
+            joint = {"membrane_bending": float(v), "at": p0.round(3).tolist()}
+    if hot is not None and (joint is None or hot["membrane_bending"] > joint["membrane_bending"]):
+        joint = hot
+    if joint is not None and (worst is None or joint["membrane_bending"] > worst["membrane_bending"]):
+        # a joint governs the part: its stress is the part's (a hot spot has no separate membrane)
+        worst = {"membrane_bending": joint["membrane_bending"], "membrane": joint.get("membrane", 0.0),
+                 "at": joint["at"], "scl_length": 0.0, "peak": 0.0}
+    if worst is not None:
+        worst["joint"] = joint            # the worst at the joints (None: no joint, or none read there)
     return worst
+
+
+def hot_spots(inst, nrm_node: dict, local: dict, stress, t: float, line: set, inside: set,
+              h: float = 0.0) -> dict | None:
+    """The worst hot-spot stress along a thin part's joint edges (IIW structural hot-spot stress, type "a", the
+    coarse-mesh read-out for elements about a wall thick: Hobbacher, IIW recommendations, 2016, 4.2.3): the surface
+    stress read between HOT_SPOT_NEAR_T and HOT_SPOT_FAR_T wall thicknesses from the edge and extrapolated in a
+    straight line back to it. The edge's own spike (the notch, and the singular point a sharp modelled edge makes)
+    is left out; the bending and membrane the joint puts into the wall stay, as in a weld's hot-spot stress.
+
+    The read-out is direction-free: at each edge point (one per HOT_SPOT_SPACING_T of edge), the surface nodes on the
+    same face (normals within 60 degrees), off the joint's own face (``inside``), within a wall thickness sideways and
+    HOT_SPOT_NEAR_T..HOT_SPOT_FAR_T from the edge line give a straight-line fit of each stress component against
+    their distance from the line; its value at the line is the hot-spot stress tensor, reported as von Mises.
+    Elements longer than the wall (h, the median element edge) widen the read-out to at least two elements beyond
+    its nearest point, as IIW's coarse read-out at the first two elements' midpoints does: a 7.5 mm mesh on a 5 mm
+    wall left most of a joint edge with too few points in 0.4-1.6 t.
+    line, inside: global node ids. Returns {"membrane_bending": von Mises, "at", "method": "hot spot"} or None."""
+    from scipy.spatial import cKDTree
+    n0 = inst.node0
+    line_l = np.array(sorted(a - n0 for a in line if (a - n0) in nrm_node), dtype=np.int64)
+    if len(line_l) == 0:
+        return None
+    skip = {a - n0 for a in inside} | set(line_l.tolist())
+    surf = np.array([a for a in sorted(nrm_node) if a not in skip and a in local], dtype=np.int64)
+    if len(surf) < 3:
+        return None
+
+    def unit_normal(a):
+        v = np.mean(nrm_node[a], axis=0)
+        return v / max(np.linalg.norm(v), 1e-30)
+    XL, XS = inst.X[line_l - 1], inst.X[surf - 1]
+    r, _ = cKDTree(XL).query(XS, k=1)                       # each surface node's distance from the edge line
+    lo = defaults.HOT_SPOT_NEAR_T * t
+    hi = max(defaults.HOT_SPOT_FAR_T * t, lo + 2.0 * h)
+    wide = max(t, h)                                         # how far sideways along the edge a read-out reaches
+    win = (r >= lo) & (r <= hi)
+    if win.sum() < 3:
+        return None
+    surf, XS, r = surf[win], XS[win], r[win]
+    NS = np.array([unit_normal(a) for a in surf])
+    if isinstance(stress, np.ndarray):
+        S = stress[n0 + surf]
+    else:
+        S = np.array([stress[int(n0 + a)] for a in surf])
+    tree = cKDTree(XS)
+    # one read-out per HOT_SPOT_SPACING_T of edge: the first edge node in each cell of that size
+    cell = max(defaults.HOT_SPOT_SPACING_T * t, 1e-6)
+    _, first = np.unique(np.floor(XL / cell).astype(np.int64), axis=0, return_index=True)
+    best = None
+    for i in first:
+        p, nL = XL[i], unit_normal(int(line_l[i]))
+        near = np.asarray(tree.query_ball_point(p, float(np.hypot(hi, wide))), dtype=np.int64)
+        if len(near) < 3:
+            continue
+        d = np.linalg.norm(XS[near] - p, axis=1)
+        side = np.sqrt(np.maximum(d ** 2 - r[near] ** 2, 0.0))
+        keep = near[(NS[near] @ nL > 0.5) & (side <= wide)]
+        if len(keep) < 3 or np.ptp(r[keep]) < 0.3 * (hi - lo):
+            continue
+        A = np.column_stack([np.ones(len(keep)), r[keep]])
+        coef, *_ = np.linalg.lstsq(A, S[keep], rcond=None)   # (2, 6): the value at the line, the slope
+        v = _vm(coef[0])
+        if best is None or v > best["membrane_bending"]:
+            best = {"membrane_bending": float(v), "at": p.round(3).tolist(), "method": "hot spot",
+                    "points": int(len(keep))}
+    return best
 
 
 def _scl_profile(p0, n, L, s, Xn, S_nodes, tree) -> np.ndarray:

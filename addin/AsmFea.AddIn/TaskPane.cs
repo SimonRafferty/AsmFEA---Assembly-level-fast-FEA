@@ -59,6 +59,7 @@ namespace AsmFea.AddIn
         private readonly CheckBox advanced = new CheckBox { Text = "Advanced: set the mesh and solver by hand", AutoSize = true };
         private readonly ComboBox fidelity = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };   // mesh level
         private readonly ComboBox convergence = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
+        private readonly ComboBox refine = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };   // D65
         private readonly ComboBox solverBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
         private readonly List<Control> advancedRows = new List<Control>();
         private static readonly string[] FavourNames = { "Speed", "Balanced", "Accuracy" };
@@ -101,6 +102,13 @@ namespace AsmFea.AddIn
         private readonly ComboBox solveCase = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
         private readonly CheckBox fullRun = new CheckBox { Text = "Full re-run", AutoSize = true, Padding = new Padding(8, 3, 0, 0) };
         private readonly ProgressBar progress = new ProgressBar { Dock = DockStyle.Top, Height = 14 };
+        // the same progress, small, beside the Connections tab's More Info: Analyse connections shows it there
+        private readonly ProgressBar connProgress = new ProgressBar { Width = 110, Height = 14, Margin = new Padding(8, 7, 0, 0) };
+        private bool starting;          // an export and job start are under way: further Run clicks wait for it
+        // when a hinge was added or deleted: the Connections list is out of date until connections.json is written
+        // after it (by Analyse connections or a run). Adding a hinge used to analyse at once, which takes minutes
+        // on a large model (the user's choice, 2026-10-09: mark it stale and let them analyse when ready)
+        private DateTime? connChangedAt;
         private readonly Label activity = new Label { Dock = DockStyle.Top, Height = 34, AutoEllipsis = true };
         private readonly Label connActivity = new Label { Dock = DockStyle.Top, Height = 34, AutoEllipsis = true };   // the same text, on the Connections tab
         private readonly Label resActivity = new Label { Dock = DockStyle.Top, Height = 34, AutoEllipsis = true };    // and on the Results tab
@@ -158,6 +166,7 @@ namespace AsmFea.AddIn
             { "Not connected (delete)", "Delete this connection: the parts do not transfer load here. 'Automatic' brings it back." },
             { "Automatic", "Remove your choice and let AsmFEA decide the connection from the geometry and mates." },
             { "More Info", "Explain the selected item in the list below in full: what it means and what to do (or double-click it)." },
+            { "Edit...", "Change the selected connection: fixed, sliding with friction, sliding joint, sliding without separation, not connected (delete), or back to automatic." },
             { "Add hinge...", "A hinge on the faces selected in SolidWorks: one hole or pin surface is enough (AsmFEA finds the concentric faces of the other parts). Tick Lock rotation to bond it." },
             { "Sliding, no separation", "The faces stay in contact and slide freely over each other, without friction; they can neither part nor press into each other." },
             { "Export", "Write the model (model.json and one STEP file per part) into the study folder, without running anything." },
@@ -210,11 +219,13 @@ namespace AsmFea.AddIn
             Tip(favour, "What to optimise the run for. AsmFEA then decides how to solve from this and this computer's free memory and cores:\n"
                         + "Speed - a coarse mesh, one solve: quick, for comparing designs.\n"
                         + "Balanced - the standard mesh, checked on a finer one: for most work.\n"
-                        + "Accuracy - a finer mesh for local stresses, checked: slower.\n"
+                        + "Accuracy - a finer mesh for local stresses, checked, and refined again where not converged: slower.\n"
                         + "The Run tab shows the plan before you run; the results say how accurate they are likely to be.");
-            Tip(advanced, "Set the mesh level, convergence check or solver yourself instead of leaving them to the planner (Auto: from Optimise for).");
+            Tip(advanced, "Set the mesh level, convergence check, local refinement or solver yourself instead of leaving them to the planner (Auto: from Optimise for).");
             Tip(fidelity, "Mesh size: coarse is quick for checking set-up; fine gives more accurate local stresses but takes longer. Auto: from Optimise for.");
             Tip(convergence, "Solve on a base mesh and a finer one and report how much the results changed. Doubles the solve time. Auto: from Optimise for.");
+            Tip(refine, "After the two solves, mesh the parts whose results changed by more than the limit finer again and solve a third time; "
+                        + "the report then gives the stress the mesh is converging to. Needs the convergence check. Auto: on with Optimise for Accuracy.");
             Tip(solverBox, "CalculiX solves the whole model at once (exact; needs the memory for all of it). The hybrid solver condenses each part "
                            + "onto its joints and needs about the largest part's memory. Auto: CalculiX when it fits this computer, the hybrid otherwise.");
             Tip(fastLoads, "Solve each load on its own once; a load case is then the sum of its loads. Changing only the size of "
@@ -531,7 +542,7 @@ namespace AsmFea.AddIn
                 caseBuckling.Checked = fastLoads.Checked = fullRun.Checked = false;
                 favour.SelectedItem = "Balanced";                 // the study default (mesh.favour)
                 advanced.Checked = false;
-                fidelity.SelectedItem = convergence.SelectedItem = solverBox.SelectedItem = "Auto";
+                fidelity.SelectedItem = convergence.SelectedItem = refine.SelectedItem = solverBox.SelectedItem = "Auto";
                 ShowAdvanced();
                 planText.Text = "";
                 accBanner.Visible = false;
@@ -864,12 +875,14 @@ namespace AsmFea.AddIn
             bool? conv = mesh["convergence_check"] == null ? (bool?)null : (bool)mesh["convergence_check"];
             if (legacy && conv == null) conv = true;          // before the planner, a missing convergence_check meant on
             if (legacy && conv == FavourConvergence[fav]) conv = null;
+            bool? refineV = mesh["refine_unconverged"] == null ? (bool?)null : (bool)mesh["refine_unconverged"];
             string solver = (string)mesh["solver"];
             if (solver == "auto") solver = null;
             fidelity.SelectedItem = fid ?? "Auto";
             convergence.SelectedItem = conv == null ? "Auto" : (conv.Value ? "On" : "Off");
+            refine.SelectedItem = refineV == null ? "Auto" : (refineV.Value ? "On" : "Off");
             solverBox.SelectedItem = solver == null ? "Auto" : (solver == "hybrid" ? "Hybrid" : "CalculiX");
-            advanced.Checked = fid != null || conv != null || solver != null;
+            advanced.Checked = fid != null || conv != null || refineV != null || solver != null;
             ShowAdvanced();
         }
 
@@ -887,6 +900,7 @@ namespace AsmFea.AddIn
             string args = " --favour " + ((string)favour.SelectedItem ?? "Balanced").ToLowerInvariant();
             if (advanced.Checked && (string)fidelity.SelectedItem != "Auto") args += " --fidelity " + (string)fidelity.SelectedItem;
             if (advanced.Checked && (string)convergence.SelectedItem != "Auto") args += " --convergence " + ((string)convergence.SelectedItem).ToLowerInvariant();
+            if (advanced.Checked && (string)refine.SelectedItem != "Auto") args += " --refine " + ((string)refine.SelectedItem).ToLowerInvariant();
             if (advanced.Checked && (string)solverBox.SelectedItem != "Auto") args += " --solver " + ((string)solverBox.SelectedItem).ToLowerInvariant();
             Cli.RunAsync(this, "plan " + Cli.Quote(host.StudyFolder(Doc, StudyName)) + args, (r, err) =>
             {
@@ -903,6 +917,7 @@ namespace AsmFea.AddIn
             if (notes.Count > 0) lines.Add("Plan " + notes[0]);
             string level = (string)p["fidelity"];
             string what = "Mesh " + level + ", " + (Convert.ToBoolean(p["convergence_check"]) ? "checked on a finer mesh" : "one solve");
+            if (p["refine_unconverged"] != null && Convert.ToBoolean(p["refine_unconverged"])) what += ", refined again where not converged";
             if (p["dof"] != null)
             {
                 what += "; about " + Convert.ToInt64(p["dof"]).ToString("N0") + " unknowns (last run): " +
@@ -930,8 +945,8 @@ namespace AsmFea.AddIn
             flow.Controls.Add(new Label
             {
                 AutoSize = true, MaximumSize = new Size(440, 0),
-                Text = "Other programs are now using memory this run had planned on (" + Fmt(mp["available_gb"]) + " GB free, "
-                       + Fmt(mp["reserve_gb"]) + " GB wanted free).\r\n\r\nThe solve is continuing, but more slowly. Close programs "
+                Text = "Other programs have taken " + Fmt(mp["taken_gb"]) + " GB of memory since this run started ("
+                       + Fmt(mp["available_gb"]) + " GB now free).\r\n\r\nThe solve is continuing, but may be slower. Close programs "
                        + "you don't need (browsers, other SolidWorks documents) to speed it up again. The results are not affected."
             });
             var ok = new Button { Text = "OK", AutoSize = true };
@@ -971,6 +986,7 @@ namespace AsmFea.AddIn
             favour.Items.AddRange(FavourNames);
             fidelity.Items.AddRange(new object[] { "Auto", "coarse", "standard", "fine" });
             convergence.Items.AddRange(new object[] { "Auto", "On", "Off" });
+            refine.Items.AddRange(new object[] { "Auto", "On", "Off" });
             solverBox.Items.AddRange(new object[] { "Auto", "CalculiX", "Hybrid" });
             Action<string, Control> addAdvanced = (label, c) =>
             {
@@ -986,6 +1002,7 @@ namespace AsmFea.AddIn
             add("", advanced);
             addAdvanced("Mesh level", fidelity);
             addAdvanced("Convergence check", convergence);
+            addAdvanced("Refine where not converged", refine);
             addAdvanced("Solver", solverBox);
             add("", fastLoads);
             heading("Pass / fail criteria (used in the reports)");
@@ -1008,6 +1025,7 @@ namespace AsmFea.AddIn
                 {
                     if ((string)fidelity.SelectedItem != "Auto") m["fidelity"] = (string)fidelity.SelectedItem;
                     if ((string)convergence.SelectedItem != "Auto") m["convergence_check"] = (string)convergence.SelectedItem == "On";
+                    if ((string)refine.SelectedItem != "Auto") m["refine_unconverged"] = (string)refine.SelectedItem == "On";
                     if ((string)solverBox.SelectedItem != "Auto") m["solver"] = ((string)solverBox.SelectedItem).ToLowerInvariant();
                 }
                 Settings(Study)["mesh"] = m;
@@ -1018,6 +1036,7 @@ namespace AsmFea.AddIn
             advanced.CheckedChanged += (s, e) => { ShowAdvanced(); storeMesh(); };
             fidelity.SelectedIndexChanged += (s, e) => storeMesh();
             convergence.SelectedIndexChanged += (s, e) => storeMesh();
+            refine.SelectedIndexChanged += (s, e) => storeMesh();
             solverBox.SelectedIndexChanged += (s, e) => storeMesh();
             fastLoads.CheckedChanged += (s, e) =>
             {
@@ -1432,7 +1451,7 @@ namespace AsmFea.AddIn
             // the tolerance and its units kept together: beside the button, or on the next line as a whole
             var bond = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
             bond.Controls.AddRange(new Control[] { Caption("Bond gaps & overlaps up to"), bondTol, Caption("mm") });
-            var analyse = Row(Btn("Analyse connections", () => Run("resolve")), bond);
+            var analyse = Row(Btn("Analyse connections", AnalyseConnections), bond);
             // 2: the selected connection set to (stored in the study, used from the next run); Add hinge, a special
             // kind of setting made from selected faces, in its own frame at the end
             var edit = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 1, 0, 1) };
@@ -1451,7 +1470,7 @@ namespace AsmFea.AddIn
             hingeFrame.Controls.Add(hinge);
             edit.Controls.Add(hingeFrame);
             // 3: the list, its filter and its More Info
-            var listBar = Row(exceptionsOnly, Btn("More Info", ExplainConnection));
+            var listBar = Row(exceptionsOnly, Btn("Edit...", EditConnection), Btn("More Info", ExplainConnection), connProgress);
             exceptionsOnly.CheckedChanged += (s, e) => LoadConnections();
             connList.DoubleClick += (s, e) => ExplainConnection();
             connList.SelectedIndexChanged += (s, e) =>
@@ -1655,11 +1674,32 @@ namespace AsmFea.AddIn
             try { doc = (JObj)Json.Parse(File.ReadAllText(path, Encoding.UTF8)); }
             catch (Exception e) { Say("Could not read connections.json: " + e.Message, true); return; }
             var st = Study;
+            // hinges added or deleted since the last analysis: the list is out of date until the next one
+            bool stale = connChangedAt != null && File.GetLastWriteTime(path) < connChangedAt.Value;
+            if (!stale) connChangedAt = null;
+            if (!stale && st != null) RemoveLeftOutHinges(st, doc);
+            var hingeIds = new HashSet<string>(st == null ? new string[0]
+                : StudyStore.List(st, "hinges").OfType<JObj>().Select(o => (string)o["id"]));
+            if (stale)
+            {
+                connList.Items.Add(new ListViewItem(new[] { "Out of date: hinges changed since the last analysis. Click Analyse connections to update.", "" })
+                { ForeColor = Color.Firebrick });
+                var analysed = new HashSet<string>(((doc["connections"] as List<object>) ?? new List<object>()).OfType<JObj>()
+                                                   .Where(c => c["hinge"] != null).Select(c => (string)c["hinge"]));
+                foreach (var hid in hingeIds.Where(h => !analysed.Contains(h)))
+                    connList.Items.Add(new ListViewItem(new[] { "Hinge " + hid + ": not yet analysed", "your hinge (next analysis)" }));
+            }
             foreach (JObj c in ((doc["connections"] as List<object>) ?? new List<object>()).OfType<JObj>())
             {
                 var row = new ConnRow { Parts = ((c["parts"] as List<object>) ?? new List<object>()).Cast<string>().ToList(), Interface = (string)c["id"], Connection = c };
                 string type = ShortType((string)c["type"], c["friction"], c["params"] as JObj);
                 if (c["locked"] is bool && (bool)c["locked"]) type += " (rotation locked)";
+                if (c["hinge"] != null && !hingeIds.Contains((string)c["hinge"]))
+                {
+                    // a hinge of the user's since deleted (or replaced): gone at the next analysis
+                    connList.Items.Add(new ListViewItem(new[] { type + " (deleted): " + PartsLabel(row.Parts), "removed at next analysis" }) { Tag = row });
+                    continue;
+                }
                 string source = FoundBy(c);
                 if ((string)c["source"] == "weld")
                 {
@@ -1714,14 +1754,21 @@ namespace AsmFea.AddIn
             string kind = row.Connection == null ? null : (string)row.Connection["type"];
             if ((kind == "gear" || kind == "rack_pinion") && type != "none")
             { Say("A gear or rack and pinion coupling can only be switched off (Not connected), or changed by its mate in SolidWorks.", true); return; }
-            if (type == "none" && row.Connection != null && (string)row.Connection["source"] == "user" && row.Connection["hinge"] != null)
+            string hid = type == "none" ? UserHingeOf(st, row) : null;
+            if (hid != null)
             {
-                // a hinge the user added: "not connected" deletes it
-                string hid = (string)row.Connection["hinge"];
+                // a hinge the user added: "not connected" deletes it, from its connection row or from its notice in
+                // Exceptions only (a duplicate hinge left out: there the row has no connection, and an override for a
+                // connection that does not exist was stored instead, so the hinge stayed; found live 2026-10-10), with
+                // any such override for it
                 StudyStore.List(st, "hinges").RemoveAll(o => o is JObj && (string)((JObj)o)["id"] == hid);
+                StudyStore.List(st, "overrides").RemoveAll(o => o is JObj && IsHingeInterface((string)((JObj)o)["interface"], hid));
+                Trace("hinge: " + hid + " deleted (Not connected)");
                 Changed();
-                LoadConnections();
-                Say("Hinge " + hid + " deleted. Click Analyse connections to update the list.");
+                connChangedAt = DateTime.Now;
+                Say("Hinge " + hid + " deleted: analysing the connections.");
+                if (!starting && !(jobId != null && poll.Enabled)) AnalyseConnections();
+                else LoadConnections();
                 return;
             }
             var ovs = StudyStore.List(st, "overrides");
@@ -1737,6 +1784,70 @@ namespace AsmFea.AddIn
             Say("Connection set to " + Describe(type, friction, prms) + ". Run the study to use it.");
         }
 
+        /// <summary>The id of the user's hinge a row stands for, if it still is in the study: its connection's hinge, or
+        /// for a notice in Exceptions only (a duplicate hinge left out) the hinge it names.</summary>
+        private static string UserHingeOf(JObj st, ConnRow row)
+        {
+            string hid = null;
+            if (row.Connection != null && (string)row.Connection["source"] == "user") hid = (string)row.Connection["hinge"];
+            if (hid == null && row.Diagnostic != null)
+            {
+                var ev = row.Diagnostic["evidence"] as JObj;
+                hid = ev == null ? null : ev["hinge"] as string;
+                if (hid == null && row.Interface != null && row.Interface.StartsWith("H-HG"))
+                {
+                    // older notices name only the connection: H-<hinge> or H-<hinge>-<part>
+                    string rest = row.Interface.Substring(2);
+                    int dash = rest.IndexOf('-');
+                    hid = dash < 0 ? rest : rest.Substring(0, dash);
+                }
+            }
+            if (hid == null) return null;
+            return StudyStore.List(st, "hinges").OfType<JObj>().Any(o => (string)o["id"] == hid) ? hid : null;
+        }
+
+        /// <summary>A duplicate hinge is no problem (the newest on an axis is used), so the analysis lists the older ones it
+        /// left out (connections.json "left_out_hinges") instead of raising an exception, and they are deleted from the
+        /// study here, with any "not connected" override stored for them (the user's choice, 2026-10-10).</summary>
+        private void RemoveLeftOutHinges(JObj st, JObj doc)
+        {
+            var gone = new List<string>();
+            foreach (JObj lo in ((doc["left_out_hinges"] as List<object>) ?? new List<object>()).OfType<JObj>())
+            {
+                string hid = lo["hinge"] as string;
+                if (hid == null) continue;
+                int n = StudyStore.List(st, "hinges").RemoveAll(o => o is JObj && (string)((JObj)o)["id"] == hid);
+                StudyStore.List(st, "overrides").RemoveAll(o => o is JObj && IsHingeInterface((string)((JObj)o)["interface"], hid));
+                if (n > 0) gone.Add(hid + " (" + (lo["kept"] as string ?? "a newer hinge") + " is on the same axis)");
+            }
+            if (gone.Count == 0) return;
+            host.MarkChanged(Doc);
+            Trace("hinge: duplicates deleted: " + string.Join(", ", gone));
+            Say("Duplicate hinge" + (gone.Count > 1 ? "s" : "") + " deleted: " + string.Join("; ", gone) + ". Save the assembly to keep the change.");
+        }
+
+        private static bool IsHingeInterface(string iface, string hid)
+        {
+            return iface != null && (iface == "H-" + hid || iface.StartsWith("H-" + hid + "-"));
+        }
+
+        /// <summary>Edit: the Set-to choices for the selected connection in one box (double-click opens More Info).</summary>
+        private void EditConnection()
+        {
+            var row = SelectedConnection();
+            if (row == null) { Say("Select a connection first.", true); return; }
+            var options = new[] { "Fixed (bonded)", "Sliding with friction...", "Sliding joint...", "Sliding, no separation",
+                                  "Not connected (delete)", "Automatic" };
+            string pick = Choose("Edit connection", "Set " + PartsLabel(row.Parts) + " to:", options);
+            if (pick == null) return;
+            if (pick == options[0]) SetConnection("tie", null, null);
+            else if (pick == options[1]) SetContact();
+            else if (pick == options[2]) SetSliding();
+            else if (pick == options[3]) SetConnection("slide", null, null);
+            else if (pick == options[4]) SetConnection("none", null, null);
+            else ClearConnection();
+        }
+
         /// <summary>
         /// A hinge on the concentric faces selected in SolidWorks (holes or pin surfaces in two or more parts),
         /// optionally with rotation locked (bonded). Stored in the study; the pipeline checks the faces.
@@ -1745,6 +1856,8 @@ namespace AsmFea.AddIn
         {
             var st = Study;
             if (st == null) { Say("Create a study first (New).", true); return; }
+            if (Busy()) return;                                 // its analysis would start on top of a running job
+            Trace("hinge: checking the selection");
             if (host.SelectedFaces(Doc).Count < 1)
             {
                 MessageBox.Show(this, "Select a hole or pin surface of the hinge (one is enough: AsmFEA finds the concentric faces of the other parts), then click Add hinge again.",
@@ -1755,14 +1868,91 @@ namespace AsmFea.AddIn
             if (locked == null) return;
             try
             {
+                Trace("hinge: reading the selected faces");
                 var h = new JObj { { "id", StudyStore.NextId(st, "hinges", "HG") }, { "faces", FacesFromSelection(st) } };
                 if (locked.Value) h["lock_rotation"] = true;
+                // the newest hinge on an axis replaces older ones there (the user's rule: what was set last is
+                // what is wanted, e.g. a hinge added again to lock it)
+                var replaced = HingesOnAxisOf(st, (string)((List<object>)h["faces"])[0]);
+                StudyStore.List(st, "hinges").RemoveAll(o => o is JObj && replaced.Contains((string)((JObj)o)["id"]));
                 StudyStore.List(st, "hinges").Add(h);
+                Trace("hinge: " + (string)h["id"] + " stored on " + Json.Write(h["faces"]).Trim()
+                      + (replaced.Count > 0 ? ", replacing " + string.Join(", ", replaced) : ""));
                 Changed();
-                Say("Hinge " + (string)h["id"] + " added" + (locked.Value ? ", rotation locked" : "") + ": analysing the connections to show it.");
-                Run("resolve");          // the list shows the last analysis: refresh it so the hinge appears
+                connChangedAt = DateTime.Now;
+                // analysed at once again (the user's choice, 2026-10-09): with the interference check's overlaps
+                // kept and its stalls fixed, a re-analysis takes seconds; if it cannot start now (a job running),
+                // the list stays marked out of date
+                Say("Hinge " + (string)h["id"] + " added" + (locked.Value ? ", rotation locked" : "")
+                    + (replaced.Count > 0 ? " (it replaces " + string.Join(", ", replaced) + " on the same axis)" : "")
+                    + ": analysing the connections.");
+                if (!starting && !(jobId != null && poll.Enabled)) AnalyseConnections();
+                else LoadConnections();
             }
-            catch (Exception e) { Say(e.Message, true); }
+            catch (Exception e) { Trace("hinge: failed: " + e); Say(e.Message, true); }
+        }
+
+        /// <summary>The ids of the study's hinges on the axis line of face ``faceId`` (a cylinder of the study's
+        /// face_refs). An older hinge's axis comes from the last analysis (connections.json gives it exactly), else
+        /// from its first face's fingerprint. A cylinder's centroid lies on its axis for a whole cylinder and within
+        /// its radius for part of one, so "on the line" allows the radius.</summary>
+        private List<string> HingesOnAxisOf(JObj st, string faceId)
+        {
+            var found = new List<string>();
+            var refs = StudyStore.List(st, "face_refs").OfType<JObj>().ToList();
+            var fp = refs.FirstOrDefault(x => (string)x["id"] == faceId)?["fingerprint"] as JObj;
+            double[] a = Vec3Of(fp?["axis"]), c = Vec3Of(fp?["centroid"]);
+            if (a == null || c == null) return found;
+            double radius = fp["radius"] == null ? 0 : Convert.ToDouble(fp["radius"], CultureInfo.InvariantCulture);
+            // the last analysis' hinges, by the hinge they came from
+            var lines = new Dictionary<string, Tuple<double[], double[]>>();
+            try
+            {
+                string path = Path.Combine(host.StudyFolder(Doc, StudyName), "connections.json");
+                if (File.Exists(path))
+                    foreach (JObj cn in ((((JObj)Json.Parse(File.ReadAllText(path, Encoding.UTF8)))["connections"] as List<object>)
+                                         ?? new List<object>()).OfType<JObj>())
+                        if ((string)cn["type"] == "hinge" && cn["hinge"] != null && Vec3Of(cn["axis"]) != null && Vec3Of(cn["axis_point"]) != null)
+                            lines[(string)cn["hinge"]] = Tuple.Create(Vec3Of(cn["axis"]), Vec3Of(cn["axis_point"]));
+            }
+            catch (Exception e) { Trace("hinge: connections.json not read: " + e.Message); }
+            foreach (JObj old in StudyStore.List(st, "hinges").OfType<JObj>())
+            {
+                string id = (string)old["id"];
+                Tuple<double[], double[]> line;
+                double slack = radius;
+                if (!lines.TryGetValue(id, out line))
+                {
+                    var f0 = ((old["faces"] as List<object>) ?? new List<object>()).Cast<object>().FirstOrDefault() as string;
+                    var ofp = refs.FirstOrDefault(x => (string)x["id"] == f0)?["fingerprint"] as JObj;
+                    if (Vec3Of(ofp?["axis"]) == null || Vec3Of(ofp?["centroid"]) == null) continue;
+                    line = Tuple.Create(Vec3Of(ofp["axis"]), Vec3Of(ofp["centroid"]));
+                    slack += ofp["radius"] == null ? 0 : Convert.ToDouble(ofp["radius"], CultureInfo.InvariantCulture);
+                }
+                if (OnLine(a, c, line.Item1, line.Item2, slack + 0.5)) found.Add(id);
+            }
+            return found;
+        }
+
+        private static double[] Vec3Of(object v)
+        {
+            var l = v as List<object>;
+            if (l == null || l.Count != 3) return null;
+            return l.Select(x => Convert.ToDouble(x, CultureInfo.InvariantCulture)).ToArray();
+        }
+
+        /// <summary>Whether the line through p along a lies on the line through q along b (parallel, and p within
+        /// tol mm of the second line).</summary>
+        private static bool OnLine(double[] a, double[] p, double[] b, double[] q, double tol)
+        {
+            double na = Math.Sqrt(a.Sum(x => x * x)), nb = Math.Sqrt(b.Sum(x => x * x));
+            if (na == 0 || nb == 0) return false;
+            double cos = Math.Abs((a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / (na * nb));
+            if (cos < 0.999) return false;
+            var d = new[] { p[0] - q[0], p[1] - q[1], p[2] - q[2] };
+            double along = (d[0] * b[0] + d[1] * b[1] + d[2] * b[2]) / nb;
+            double off2 = d.Sum(x => x * x) - along * along;
+            return Math.Sqrt(Math.Max(0, off2)) <= tol;
         }
 
         /// <summary>The hinge dialog: a Lock rotation check box. Null when cancelled.</summary>
@@ -1837,7 +2027,9 @@ namespace AsmFea.AddIn
                 IList<string> log;
                 Say("Exporting the model...");
                 Application.DoEvents();
+                Trace("export: start");
                 string path = host.Export(Doc, StudyName, out log);
+                Trace("export: done (" + log.Count + " log lines)");
                 logBox.Text = string.Join(System.Environment.NewLine, log);
                 Say("Exported: " + path);
                 return true;
@@ -1861,25 +2053,78 @@ namespace AsmFea.AddIn
             Fit(problems);
         }
 
-        private void Run(string stages, bool fast = false)
+        /// <summary>True (and says so) while a job is being started or is running: a second export and job on top
+        /// of a running one rewrote the files it was reading. Found live (2026-10-09): three Add hinge clicks 11 s
+        /// apart started three analyses at once, and SolidWorks crashed as the third began.</summary>
+        private bool Busy()
         {
-            if (!Export()) return;
-            string folder = host.StudyFolder(Doc, StudyName);
-            problems.Items.Clear();
-            // Run solves the load case chosen in "Solve" (all by default)
-            string cases = stages == null && solveCase.SelectedIndex > 0 ? " --cases " + Cli.Quote((string)solveCase.SelectedItem) : "";
-            string force = fullRun.Checked ? " --force" : "";
-            fullRun.Checked = false;                         // a one-off: the next Run reuses again
-            string mode = fast ? " --fast" : "";       // a fast run: approximate, no report (ADDENDUM-FAST-RUN-MODE)
-            Cli.RunAsync(this, "run " + Cli.Quote(folder) + (stages == null ? "" : " --stages " + stages) + cases + force + mode, (r, err) =>
+            if (starting || (jobId != null && poll.Enabled))
             {
-                if (err != null) { Say(err, true); return; }
-                jobId = (string)((JObj)r)["job_id"];
-                jobFile = Path.Combine(folder, "run", jobId, "job.json");
-                jobDoc = DocPath();
-                Say("Job " + jobId + " started.");
-                poll.Start();
-            });
+                Say("A job is still running: wait for it to finish (or Cancel it), then try again.", true);
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>Analyse connections: the list empties at once (the old one no longer applies), then fills from
+        /// the new analysis; its progress shows beside More Info.</summary>
+        private void AnalyseConnections()
+        {
+            if (Busy()) return;
+            connList.Items.Clear();
+            connList.Items.Add(new ListViewItem(new[] { "Analysing connections...", "" }));
+            Fit(connList);
+            if (!Run("resolve")) LoadConnections();          // not started: show what there was
+        }
+
+        /// <summary>Export the model and start a job; false when it did not start.</summary>
+        private bool Run(string stages, bool fast = false)
+        {
+            if (Busy()) return false;
+            starting = true;
+            try
+            {
+                Trace("run: exporting for " + (stages ?? "a full run"));
+                if (!Export()) { starting = false; return false; }
+                string folder = host.StudyFolder(Doc, StudyName);
+                problems.Items.Clear();
+                // Run solves the load case chosen in "Solve" (all by default)
+                string cases = stages == null && solveCase.SelectedIndex > 0 ? " --cases " + Cli.Quote((string)solveCase.SelectedItem) : "";
+                string force = fullRun.Checked ? " --force" : "";
+                fullRun.Checked = false;                         // a one-off: the next Run reuses again
+                string mode = fast ? " --fast" : "";       // a fast run: approximate, no report (ADDENDUM-FAST-RUN-MODE)
+                Trace("run: starting the job");
+                Cli.RunAsync(this, "run " + Cli.Quote(folder) + (stages == null ? "" : " --stages " + stages) + cases + force + mode, (r, err) =>
+                {
+                    starting = false;
+                    if (err != null) { Say(err, true); Trace("run: job not started: " + err); return; }
+                    jobId = (string)((JObj)r)["job_id"];
+                    jobFile = Path.Combine(folder, "run", jobId, "job.json");
+                    jobDoc = DocPath();
+                    Trace("run: job " + jobId + " started");
+                    Say("Job " + jobId + " started.");
+                    SetProgress(ProgressBarStyle.Marquee, 0);
+                    poll.Start();
+                });
+                return true;
+            }
+            catch (Exception e)
+            {
+                starting = false;
+                Trace("run: failed to start: " + e);
+                Say("Could not start the job: " + e.Message, true);
+                return false;
+            }
+        }
+
+        /// <summary>The job's progress on both bars: the Run tab's and the small one on the Connections tab.</summary>
+        private void SetProgress(ProgressBarStyle style, int value)
+        {
+            foreach (var bar in new[] { progress, connProgress })
+            {
+                bar.Style = style;
+                if (style == ProgressBarStyle.Continuous) bar.Value = Math.Max(0, Math.Min(100, value));
+            }
         }
 
         private void CancelJob()
@@ -1920,11 +2165,8 @@ namespace AsmFea.AddIn
             string state = (string)job["state"];
             var prog = job["progress"] as JObj;
             if (prog != null && Convert.ToDouble(prog["total"]) > 0)
-            {
-                progress.Style = ProgressBarStyle.Continuous;
-                progress.Value = (int)Math.Min(100, 100 * Convert.ToDouble(prog["done"]) / Convert.ToDouble(prog["total"]));
-            }
-            else progress.Style = state == "running" ? ProgressBarStyle.Marquee : ProgressBarStyle.Continuous;
+                SetProgress(ProgressBarStyle.Continuous, (int)Math.Min(100, 100 * Convert.ToDouble(prog["done"]) / Convert.ToDouble(prog["total"])));
+            else SetProgress(state == "running" ? ProgressBarStyle.Marquee : ProgressBarStyle.Continuous, progress.Value);
             // memory pressure (D60): the run goes on more slowly; said in the status line while it lasts, and once
             // per run in a box that does not stop anything
             var mp = job["memory_pressure"] as JObj;
@@ -1952,8 +2194,7 @@ namespace AsmFea.AddIn
             if (state != "running" && state != "queued")
             {
                 poll.Stop();
-                progress.Style = ProgressBarStyle.Continuous;
-                progress.Value = state == "done" ? 100 : 0;
+                SetProgress(ProgressBarStyle.Continuous, state == "done" ? 100 : 0);
                 // what was waiting for a redraw from the current view (a plot, a report) goes ahead
                 var next = afterJob;
                 afterJob = null;
@@ -2034,7 +2275,7 @@ namespace AsmFea.AddIn
                     buttons.Controls.Add(show);
                 }
                 var more = new Button { Text = "More detail", AutoSize = true };
-                more.Click += (s, e) => ShowHelp(dd);
+                more.Click += (s, e) => ShowHelp(dd, f);         // owned by this box, so it opens above it
                 buttons.Controls.Add(more);
                 item.Controls.Add(buttons);
                 flow.Controls.Add(item);
@@ -2133,7 +2374,9 @@ namespace AsmFea.AddIn
                 foreach (JObj c in ((res["checks"] as List<object>) ?? new List<object>()).OfType<JObj>())
                 {
                     var it = new ListViewItem(new[] { (string)c["check"], Fmt(c["value"]), Fmt(c["limit"]), (string)c["status"] }) { Tag = c };
-                    if ((string)c["status"] != "PASS") it.ForeColor = Color.Firebrick;
+                    string status = (string)c["status"];
+                    if (status == "INFO") it.ForeColor = Color.DimGray;           // for information, no pass/fail
+                    else if (status != "PASS") it.ForeColor = Color.Firebrick;
                     checksList.Items.Add(it);
                 }
                 Fit(checksList);
@@ -2366,8 +2609,9 @@ namespace AsmFea.AddIn
 
         // ------------------------------------------------------------------ help
 
-        /// <summary>A diagnostic in full: what, the plain-English explanation, where, evidence, causes, actions.</summary>
-        private void ShowHelp(JObj d)
+        /// <summary>A diagnostic in full: what, the plain-English explanation, where, evidence, causes, actions.
+        /// ``owner``: the window it is opened from (default the task pane); see ShowText.</summary>
+        private void ShowHelp(JObj d, Form owner = null)
         {
             var sb = new StringBuilder();
             string sev = (string)d["severity"];
@@ -2394,7 +2638,7 @@ namespace AsmFea.AddIn
                 foreach (var kv in ev) sb.AppendLine("  " + kv.Key + ": " + Json.Write(kv.Value).Trim());
             }
             if (!string.IsNullOrEmpty((string)d["raw"])) { sb.AppendLine(); sb.AppendLine("Raw output:"); sb.AppendLine((string)d["raw"]); }
-            ShowText((string)d["code"], sb.ToString().TrimEnd());
+            ShowText((string)d["code"], sb.ToString().TrimEnd(), owner);
         }
 
         /// <summary>More Info on a result check: what it means, its value against the limit, where it governs, what to do.</summary>
@@ -2424,9 +2668,13 @@ namespace AsmFea.AddIn
             }
         }
 
-        private void ShowText(string title, string text)
+        /// <summary>A modal text window. ``owner``: the window it is opened from, default the task pane. Opened from the
+        /// always-on-top "could not finish" box, it must be owned by that box: owned by the pane it opened UNDER the
+        /// box, yet as a modal dialog it disabled the box, so neither could be reached (found live, 2026-10-09).</summary>
+        private void ShowText(string title, string text, Form owner = null)
         {
-            using (var f = new Form { Text = "AsmFEA: " + title, Width = 560, Height = 440, StartPosition = FormStartPosition.CenterParent, MinimizeBox = false, ShowIcon = false })
+            using (var f = new Form { Text = "AsmFEA: " + title, Width = 560, Height = 440, StartPosition = FormStartPosition.CenterParent,
+                                      MinimizeBox = false, ShowIcon = false, TopMost = owner != null && owner.TopMost })
             {
                 var tb = new TextBox
                 {
@@ -2439,7 +2687,8 @@ namespace AsmFea.AddIn
                 f.Controls.Add(close);
                 f.CancelButton = close;
                 f.Shown += (s, e) => { tb.SelectionStart = 0; tb.SelectionLength = 0; close.Focus(); };
-                f.ShowDialog(this);
+                if (owner != null) f.ShowDialog(owner);
+                else f.ShowDialog(this);
             }
         }
 

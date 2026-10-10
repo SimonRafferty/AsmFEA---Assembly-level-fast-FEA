@@ -9,7 +9,11 @@ measurement when a milestone can produce one.
 BODY_CENTROID_TOL = 0.05       # mm, guess
 BODY_VOLUME_WARN = 0.01        # a matched body whose STEP volume differs from SolidWorks' by more than 1 % is a warning; measured: a 297-body weldment from SolidWorks 2026 read by OpenCASCADE was 0.1 % off typically, 0.6 % at the 95th percentile, 61 % worst, every bounding box within 0.001 mm
 FACE_AREA_RTOL = 1e-3          # guess
-FACE_CENTROID_TOL = 0.05       # mm, guess
+FACE_CENTROID_TOL = 0.05       # mm, guess: the floor of the centroid tolerance (small faces)
+FACE_CENTROID_RTOL = 2e-3      # and the tolerance grows with the face: this times sqrt(area). The add-in's centroid comes from
+                               # SolidWorks' display tessellation, whose chords round off holes and fillets: a 20 100 mm2 sheet
+                               # metal cheek with holes was 0.073 mm off (exact area), and 0.05 mm flat refused it as
+                               # "matches no face" (2026-10-09). 2e-3 gives it 0.28 mm; area, type and normal still match tightly
 FACE_NORMAL_COS = 0.999        # guess (~2.5 degrees)
 FACE_POINT_TOL = 0.05          # mm, guess: a face_ref point (D53) this close to a face lies on it
 
@@ -35,6 +39,7 @@ FAST_FALLBACK_FACTOR = 1.6        # a part that will not mesh at the fast size i
 FAST_SWEEP_LAYER_T = 40.0         # span layers in a fast run (exact on clean spans: investigation avenue 2)
 FAST_SWEEP_SECTION_T = 3.0        # span section triangles in a fast run
 REFINE_RATIO = 0.6             # plan: refined re-solve uses 0.6 x the base size
+LOCAL_REFINE_RATIO = 0.6       # the local pass (D65): parts that did not converge again at 0.6 x their refined size
 
 # --- Solve ---------------------------------------------------------------------------
 SOLVER_THREADS = 8             # D3: 8 physical cores
@@ -44,10 +49,12 @@ HYBRID_DEGREE = 4              # D49: polynomial degree of a joint's modes in th
 PLAN_FAVOUR = {
     # mesh level, refined convergence pass, hybrid exact-joint caps per part and in all (0: smooth joints only).
     # Totals: m4_frame's 96 welds need 39 600 (D59); the tank's 387 joints at 232 000 ran out of memory
-    "speed": {"fidelity": "coarse", "convergence": False, "exact_part_unknowns": 0, "exact_total_unknowns": 0},
-    "balanced": {"fidelity": "standard", "convergence": True, "exact_part_unknowns": 10000,
+    # refine: the third, local pass where the two solves disagree (D65; the user's choice: on for accuracy)
+    "speed": {"fidelity": "coarse", "convergence": False, "refine": False, "exact_part_unknowns": 0,
+              "exact_total_unknowns": 0},
+    "balanced": {"fidelity": "standard", "convergence": True, "refine": False, "exact_part_unknowns": 10000,
                  "exact_total_unknowns": 60000},
-    "accuracy": {"fidelity": "fine", "convergence": True, "exact_part_unknowns": 15000,
+    "accuracy": {"fidelity": "fine", "convergence": True, "refine": True, "exact_part_unknowns": 15000,
                  "exact_total_unknowns": 120000},
 }
 PLAN_RESERVE_GB = 3.0          # memory left free for other programs to grow into, GB. The free memory measured already
@@ -63,8 +70,11 @@ ACCURACY_HIGH_DISP = 0.02      # D60 accuracy grade "High": displacements change
 ACCURACY_HIGH_STRESS = 0.05    # ... and stresses away from joints at most this (beyond CONVERGENCE_TOL: Indicative)
 PRESSURE_TICKS = 5            # memory pressure: this many heartbeats in a row with free memory below the reserve
                                # (or the solver's memory being paged out) before the warning (a few seconds)
-PRESSURE_PAGED_FRACTION = 0.6  # the solver is being paged out when its working set falls below this share of its
-                               # committed memory
+PRESSURE_DROP_GB = 3.0        # memory pressure: other programs took more than this since the run started (the run's own
+                               # growth not counted). The user's rule (2026-10-09): warn only when the free memory falls
+                               # by more than the 3 GB margin during a run, never for what was already so at the start.
+                               # A test of the solver's working set against its committed memory (0.6) was dropped: the
+                               # solver library commits far more than it touches, and warned with 44 GB free
 HYBRID_EXACT_TOTAL_UNKNOWNS = 60000  # D60: ... and while the model's exact joint unknowns stay within this (the global
                                      # system grows with them; see PLAN_FAVOUR)
 HYBRID_EXACT_JOINT_NODES = 3000  # D59: a joint with at most this many master nodes is exact (node by node, as
@@ -82,8 +92,13 @@ MEMORY_BLOCK_FRACTION = 0.9    # estimate above this share of RAM: not solved (6
 # --- Checks (Results, checks and report section) -------------------------------------
 REACTION_BALANCE_TOL = 0.01    # plan: within 1 %
 CONVERGENCE_TOL = 0.10
-JOINT_BAND_T = 1.5             # stresses within 1.5 x the wall thickness of a bonded joint are not assessed (D32; hot-spot read-out practice)
-JOINT_BAND_MIN = 3.0           # mm: ... and within at least this distance (solids, unknown thickness), D32
+JOINT_BAND_T = 1.5             # the joint band: 1.5 x the wall thickness round a joint's edge (D32; hot-spot read-out practice); since D-joint-edge only a part wholly inside is unassessed
+JOINT_BAND_MIN = 3.0           # mm: ... and at least this distance (solids, unknown thickness), D32
+HOT_SPOT_NEAR_T = 0.4          # thin parts' joint edges: surface stress read from 0.4 t ... (IIW type "a" coarse read-out points 0.5 t / 1.5 t, widened for a fit over nodes; D-joint-edge)
+HOT_SPOT_FAR_T = 1.6           # ... to 1.6 t from the edge, extrapolated in a straight line back to it
+HOT_SPOT_SPACING_T = 0.5       # one hot-spot read-out per half wall thickness of joint edge, guess
+JOINT_EDGE_FILL_NEAREST = 6    # plots: a joint-edge point drawn with the inverse-distance mean of its part's 6 nearest assessed points, guess
+SCL_PER_JOINT_CELL = 8        # membrane plus bending in the joint bands: at most 8 sections per cell 3 walls wide, so every joint gets some (D-joint-edge), guess
 JOINT_PATCH_T = 3.0            # joint structural stress read over windows 3 wall thicknesses long (D33), guess
 JOINT_WINDOW_ELEMENTS = 1.0    # window half-length >= 1 element: windows span >= 2 elements along the joint (D33)
 REPORT_JOINT_ROWS = 12          # bonded joints listed per load case in the report, highest stress first
@@ -113,6 +128,9 @@ SINGULAR_IMBALANCE = 0.10      # M1: the mechanism case showed 103 % imbalance; 
 NEAR_MISS_FACTOR = 5.0         # face pairs within 5 x GAP_TOL but beyond it are near misses, guess
 OVERLAP_TOL = 0.05             # mm: faces this far into each other still count as touching, guess
 OVERLAP_VOL_TOL = 1.0          # mm^3: solids overlapping more than this are interference, guess
+OVERLAP_FUZZY_MM = 1e-3        # the interference check's intersections treat sub-shapes this close as coincident: a bush
+                               # against its link took 268 s plain and 0.06 s fuzzy, every overlap volume of that model the
+                               # same at 0.001 and 0.01 mm (measured 2026-10-09)
 TIE_AREA_RATIO = 4.0           # tie sides differing this much in area (an edge on a face): the small one is the slave (D30), guess
 COAX_TOL = 0.1                 # mm: axis offset for coaxial cylinders, guess
 # Hydrostatic loads (D54)
@@ -173,6 +191,7 @@ CLASSIFY_WORKERS = 6           # parts classified at once (membrane plus bending
 CLASSIFY_POOL_MIN_NODES = 500000  # ... on a model of at least this many nodes (a worker loads the model in a few
                                   # seconds: small models stay in one process)
 PLOT_DEFORM_FRACTION = 0.05    # deformed shape scaled so the largest motion is 5 % of the model size
+PLOT_LEADER_DASH = 0.008       # report images: leader-line dashes 0.8 % of the model's size long, guess
 PLOT_LABEL_OFFSET = 0.12       # min / max labels set off the model by 12 % of its size, with a leader line
 PLOT_FOS_CAP = 10.0            # factor-of-safety plots saturate above this
 PLOT_BUCKLING_MODES = 3        # mode-shape images per buckling case

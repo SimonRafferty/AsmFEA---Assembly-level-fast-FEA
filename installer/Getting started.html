@@ -93,10 +93,10 @@
         A single part works too: its bodies are treated as the parts, and bodies that touch are joined.</li>
       <li>Click <span class="btn">New</span> in the pane and name the study. It is saved inside the assembly (or part).</li>
       <li>On the <b>Study</b> tab choose what to <b>Optimise for</b>: <i>Speed</i> (a coarse mesh, one solve: quick, for
-        comparing designs), <i>Balanced</i> (for most work) or <i>Accuracy</i> (a finer mesh for local stresses).
+        comparing designs), <i>Balanced</i> (for most work) or <i>Accuracy</i> (a finer mesh for local stresses, and parts whose results have not settled are solved again on a finer mesh).
         AsmFEA decides the rest from this and your computer's free memory and cores, always leaving room for
         SolidWorks and other programs; the <b>Run</b> tab shows the plan before you run. <i>Advanced</i> lets you set
-        the mesh level, convergence check or solver yourself. Check the pass/fail criteria the reports use too.
+        the mesh level, convergence check, <i>Refine where not converged</i> or solver yourself. Check the pass/fail criteria the reports use too.
         Changes are kept as you make them.</li>
       <li>If you expect to try several sizes of load, tick <i>Fast load-size changes</i>: each load is solved once,
         and changing only load sizes afterwards needs no new solve.</li>
@@ -140,7 +140,7 @@
     <h2><span class="num" style="background:var(--green)">4</span>Check how the parts connect</h2>
     <ul>
       <li>Click <span class="btn">Analyse connections</span>: the list shows every place where parts meet and how they will be joined.</li>
-      <li>To change one, select it and <i>Set to</i>: <span class="btn">Fixed</span> (bonded),
+      <li>To change one, select it and click <span class="btn">Edit...</span>, or use <i>Set to</i>: <span class="btn">Fixed</span> (bonded),
         <span class="btn">Sliding with friction...</span>, <span class="btn">Sliding joint...</span> or
         <span class="btn">Not connected</span>. <span class="btn">Automatic</span> undoes your choice.</li>
       <li>Weld beads appear as their own rows.</li>
@@ -182,7 +182,7 @@
   <div>
     <h2><span class="num" style="background:#f28a1a">6</span>Look at the results</h2>
     <ul>
-      <li>The <b>Results</b> tab shows the pass/fail checks and the key numbers for each load case.</li>
+      <li>The <b>Results</b> tab shows the pass/fail checks and the key numbers for each load case. Stress is judged as an engineer would: through the wall (membrane plus bending), round joints as well, and not on the spikes at sharp edges. The factor of safety is given on yield and, for information, on ultimate strength.</li>
       <li><span class="btn">Stress</span>, <span class="btn">Displacement</span> and <span class="btn">FoS</span> open
         a 3-D window (their tooltips repeat what follows):
         <ul>
@@ -193,7 +193,9 @@
             stop at the full load;</li>
           <li><b>Deformation x</b> exaggerates the deformed shape, on every plot (0 shows it undeformed), and <b>Undeformed
             shape</b> adds a grey outline of the original;</li>
-          <li><b>Min / max</b> shows the highest and lowest values; drag their labels anywhere.</li>
+          <li><b>Min / max</b> shows the highest and lowest values; drag their labels anywhere;</li>
+          <li><b>right-click a part</b> to see it as an outline and look at the parts behind it; right-click it again, or the background, to bring it back;</li>
+          <li>local peaks beyond the assessed stress show <b>magenta</b>; grey parts (such as bushes) are not assessed: check their bearing pressure by hand.</li>
         </ul></li>
       <li><span class="btn">Open report</span> gives the full Word report; <span class="btn">Open summary</span>
         a half-page summary. Both need a full run (they are greyed out after a fast run).</li>

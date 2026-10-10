@@ -105,39 +105,48 @@ class JobState:
                 pass
             self._flush()
 
-    def _watch_memory(self):
-        """Memory pressure (D60): other programs have taken the free memory below the planner's reserve, or the
-        solver's memory is being paged out, for PRESSURE_TICKS beats in a row. The run carries on (more slowly);
-        the user is told once, with what to do, and job.json's memory_pressure says whether it still holds."""
+    @staticmethod
+    def _own_gb() -> float:
+        """The memory this run itself holds: this process and everything it started (the solver), GB."""
         import psutil
-        from ..planner import machine, reserve_gb
-        if not hasattr(self, "_reserve"):
-            self._reserve, self._press, self._calm = reserve_gb(machine()), 0, 0
-        avail = psutil.virtual_memory().available / 2 ** 30
-        paged = False
-        with self._lock:
-            sv = self.doc.get("solver") or {}
-        pid = sv.get("solver_pid") or (os.getpid() if sv else None)
-        if pid:
+        try:
+            me = psutil.Process(os.getpid())
+            procs = [me] + me.children(recursive=True)
+        except psutil.Error:
+            return 0.0
+        total = 0
+        for p in procs:
             try:
-                mi = psutil.Process(pid).memory_info()
-                commit = getattr(mi, "private", 0) or getattr(mi, "vms", 0)
-                paged = commit > 2 ** 30 and mi.rss < defaults.PRESSURE_PAGED_FRACTION * commit
+                total += p.memory_info().rss
             except psutil.Error:
                 pass
-        pressed = avail < self._reserve or paged
+        return total / 2 ** 30
+
+    def _watch_memory(self):
+        """Memory pressure (D60, the user's rule 2026-10-09): other programs have taken more than PRESSURE_DROP_GB
+        of the memory that was free when the run started, for PRESSURE_TICKS beats in a row. The run's own growth
+        does not count, and what was already so at the start never warns (there is nothing to do about it then).
+        The run carries on (more slowly); the user is told once, with what to do, and job.json's memory_pressure
+        says whether it still holds."""
+        import psutil
+        avail = psutil.virtual_memory().available / 2 ** 30
+        own = self._own_gb()
+        if not hasattr(self, "_avail0"):
+            self._avail0, self._own0, self._press, self._calm = avail, own, 0, 0
+        taken = (self._avail0 - avail) - (own - self._own0)      # what others took since the start
+        pressed = taken > defaults.PRESSURE_DROP_GB
         self._press, self._calm = (self._press + 1, 0) if pressed else (0, self._calm + 1)
         mp = self.doc.get("memory_pressure") or {}
         if self._press >= defaults.PRESSURE_TICKS and not mp.get("active"):
             first = not mp
             with self._lock:
                 self.doc["memory_pressure"] = {"active": True, "since": _now(), "available_gb": round(avail, 1),
-                                               "reserve_gb": round(self._reserve, 1), "paged": paged}
+                                               "taken_gb": round(taken, 1), "start_available_gb": round(self._avail0, 1)}
             if first:
                 from ..diagnostics import make
-                self.add_diags([make("MEMORY_PRESSURE", available_gb=avail, reserve_gb=self._reserve,
-                                     evidence={"available_gb": round(avail, 2), "reserve_gb": round(self._reserve, 2),
-                                               "solver_paged": paged})])
+                self.add_diags([make("MEMORY_PRESSURE", available_gb=avail, taken_gb=taken,
+                                     evidence={"available_gb": round(avail, 2), "taken_gb": round(taken, 2),
+                                               "start_available_gb": round(self._avail0, 2)})])
         elif mp.get("active") and self._calm >= defaults.PRESSURE_TICKS:
             with self._lock:
                 self.doc["memory_pressure"] = {**mp, "active": False, "cleared": _now()}

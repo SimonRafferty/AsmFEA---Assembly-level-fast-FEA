@@ -90,8 +90,10 @@ def contact_only(model: Model, conns: list[dict], removed: list[str], face_map: 
     return out
 
 
-def resolve(model: Model, geoms: dict, face_map: dict) -> tuple[list[dict], list[str], list[Diagnostic]]:
-    """Returns (connections, removed, diags)."""
+def resolve(model: Model, geoms: dict, face_map: dict,
+            overlap_cache: dict | None = None) -> tuple[list[dict], list[str], list[Diagnostic]]:
+    """Returns (connections, removed, diags). overlap_cache: the interference check's results of earlier
+    analyses (find_interferences), read and updated."""
     interfaces, near, lines = find_interfaces(geoms, model.study.bond_tolerance)
     conns, removed, diags = classify(model, geoms, interfaces, lines, face_map)
     diags += apply_welds(model, conns, removed)
@@ -100,7 +102,7 @@ def resolve(model: Model, geoms: dict, face_map: dict) -> tuple[list[dict], list
     # still reported (PART_FLOATING, PART_EXCLUDED_DISCONNECTED).
     # solids overlapping within the bond tolerance were bonded across the overlap on purpose
     overlapped = {tuple(sorted(c["parts"][:2])) for c in conns if c["type"] == "tie" and c.get("gap", 0.0) < 0}
-    for itf in find_interferences({k: v for k, v in geoms.items() if k not in removed}):
+    for itf in find_interferences({k: v for k, v in geoms.items() if k not in removed}, overlap_cache):
         if tuple(sorted(itf["parts"])) in overlapped:
             continue
         diags.append(make("INTERFERENCE", where={"parts": itf["parts"]}, parts=" and ".join(itf["parts"]),

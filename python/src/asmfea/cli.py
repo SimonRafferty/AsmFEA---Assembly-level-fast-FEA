@@ -66,6 +66,8 @@ def main(argv=None) -> int:
                    help="plan for this favour instead of the study's (the task pane's unsaved choice)")
     p.add_argument("--fidelity", choices=["coarse", "standard", "fine"], default=None, help="Advanced: mesh level")
     p.add_argument("--convergence", choices=["on", "off"], default=None, help="Advanced: convergence check")
+    p.add_argument("--refine", choices=["on", "off"], default=None,
+                   help="Advanced: refine where not converged (a third, local pass)")
     p.add_argument("--solver", choices=["auto", "calculix", "hybrid"], default=None, help="Advanced: solver")
     p = sub.add_parser("run")
     p.add_argument("study")
@@ -133,6 +135,8 @@ def main(argv=None) -> int:
             mesh = {k: v for k, v in (("favour", a.favour), ("fidelity", a.fidelity), ("solver", a.solver)) if v}
             if a.convergence:
                 mesh["convergence_check"] = a.convergence == "on"
+            if a.refine:
+                mesh["refine_unconverged"] = a.refine == "on"
             r = api.plan(a.study, a.fast, mesh or None)
         elif a.verb == "exceptions":
             r = api.exceptions(a.study)

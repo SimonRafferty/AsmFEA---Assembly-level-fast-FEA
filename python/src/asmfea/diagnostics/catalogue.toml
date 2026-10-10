@@ -173,10 +173,10 @@ actions = ["Set [solver] ccx in asmfea.toml to the full path of the CalculiX exe
 [SOLVE_SINGULAR]
 severity = "blocking"
 stage = "solve"
-what = "The stiffness matrix is singular: the model can move without resistance{detail}."
-explain = "The solver found that part of the model can move without any resistance, so there is no single answer. Something is not held: a part not connected, a joint left free to slide or turn, or too few fixtures. The detail names where the solver noticed it."
+what = "Free body motion: part of the model is not held and can move without resistance{detail}."
+explain = "One or more parts are insufficiently constrained: they can move as a mechanism (turn on their hinges, slide, or float), so the solve has no single answer. The part named is the one that moved furthest; the parts joined to it move with it. A folding or hinged assembly needs something to hold it in the position analysed: a fixture, a locked hinge, or a connection that stops the motion."
 likely_causes = ["A part or group of parts is not held against rigid-body motion.", "A connection that should transfer load is missing or set to 'none'."]
-actions = ["Run the preflight checks and look for a mechanism or floating part.", "Add a fixture or a connection to the named part."]
+actions = ["Hold the named part and the parts moving with it: add a fixture, lock a hinge (Lock rotation), or set a connection that stops the motion to Fixed.", "If the assembly is meant to move (a linkage), model the stop or actuator that holds it in the position analysed."]
 
 [SOLVE_FAILED_UNKNOWN]
 severity = "blocking"
@@ -229,7 +229,7 @@ actions = ["Use a coarser mesh fidelity before solving."]
 [MEMORY_PRESSURE]
 severity = "warning"
 stage = "solve"
-what = "Other programs are using memory this run had planned on ({available_gb:.1f} GB free, {reserve_gb:.0f} GB wanted free): the solve is continuing, but more slowly."
+what = "Other programs have taken {taken_gb:.1f} GB of memory since this run started ({available_gb:.1f} GB now free): the solve is continuing, but may be slower."
 explain = "When the run started, AsmFEA measured the free memory and planned the solve to fit it, leaving room for SolidWorks and other programs. Since then other programs have taken more, so parts of the solve are waiting their turn or being moved to the page file. The run is not stopped and its results are not affected; it just takes longer. Closing programs you do not need speeds it up again."
 likely_causes = ["Another program (a browser, another SolidWorks document, a second analysis) was opened or grew during the run.", "SolidWorks itself grew while you kept working in it."]
 actions = ["Close programs you do not need (browsers, other SolidWorks documents) to give the solve its memory back.", "Leave the run going: it will finish, more slowly."]
@@ -338,6 +338,14 @@ explain = "A hinge you add joins concentric cylindrical faces (holes, or a pin's
 likely_causes = ["A flat face or an edge was picked with the holes.", "The holes are not on one axis.", "All the faces are on one part.", "A face has changed in SolidWorks since the hinge was added."]
 actions = ["Delete the hinge on the Connections tab and add it again, choosing only the concentric holes or pin surfaces in two or more parts."]
 
+[HINGE_DUPLICATE]
+severity = "info"
+stage = "resolve"
+what = "Hinge {hinge} is on the same axis and parts as the newer hinge {kept}, so the newer one is used and {hinge} is left out."
+explain = "One hinge on an axis is all a joint needs. When a hinge is added again on the same axis (for example to change whether its rotation is locked), the one added last is the one used."
+likely_causes = ["Add hinge was clicked more than once on the same joint."]
+actions = ["Nothing to do: the older hinge is not used, and the task pane deletes it from the study. It is logged, not listed as an exception."]
+
 [MATE_COUPLING_UNUSED]
 severity = "warning"
 stage = "resolve"
@@ -414,9 +422,9 @@ actions = ["Look at the stress plot away from the marked point.", "Add a fillet 
 severity = "warning"
 stage = "post"
 what = "Results changed by up to {worst:.1%} between the base and refined meshes (limit {tol:.0%}) in: {parts}."
-explain = "Each run solves on a base mesh and a finer one and compares the results. These parts changed by more than the limit, so their results depend noticeably on the mesh and may not be accurate yet. Use a finer fidelity, or look at whether the peak sits at a sharp corner (a stress singularity that never converges)."
+explain = "Each run solves on a base mesh and a finer one and compares the deflections and the assessed stress (membrane plus bending, as the factor of safety uses). These parts changed by more than the limit, so their results depend noticeably on the mesh and may not be accurate yet. Use a finer fidelity if the study is not on the finest already, or look at where the change is (a joint or notch with large elements next to it, or a sharp corner)."
 likely_causes = ["The base mesh is too coarse for these parts (thin walls, small fillets, stress concentrations).", "The peak sits on a singular point (sharp re-entrant corner or fixture edge) that never converges."]
-actions = ["Use a finer mesh fidelity for the study and run again.", "Check where the peak is: a peak on a sharp corner or fixture edge is a singularity, not a real stress."]
+actions = ["If the study is not on the finest mesh yet, optimise for Accuracy and run again; if it is, allow for the change shown before relying on a small margin in these parts.", "Check where the stress is: a sharp corner or fixture edge is a singularity (a fillet in the model settles it), not a real stress."]
 
 [BUCKLING_NO_SCALED_LOAD]
 severity = "blocking"

@@ -163,10 +163,14 @@ def translated(shape, v) -> TopoDS_Shape:
     return BRepBuilderAPI_Transform(shape, tr, True).Shape()
 
 
-def common(a, b):
+def common(a, b, fuzzy: float = 0.0):
     """The common part of two shapes, or None. OpenCASCADE runs it on all cores with oriented bounding
     boxes pre-filtering sub-shapes: the same result, about 3 x faster on a weldment's 1,026 touching pairs
-    (the interference check took 118 s of a 297-body resolve; measured, identical volumes)."""
+    (the interference check took 118 s of a 297-body resolve; measured, identical volumes).
+
+    ``fuzzy`` (mm): sub-shapes this close count as coincident. A plain intersection of a bush against its link
+    (near-coincident bore and flange faces) took 268 s where its four identical siblings took 0.1 s; with 0.001 mm
+    it took 0.06 s, and every overlap volume on that model came out the same (2026-10-09)."""
     from OCP.OCP.collections import List_TopoDS_Shape
     op = BRepAlgoAPI_Common()
     args, tools = List_TopoDS_Shape(), List_TopoDS_Shape()
@@ -176,6 +180,8 @@ def common(a, b):
     op.SetTools(tools)
     op.SetRunParallel(True)
     op.SetUseOBB(True)
+    if fuzzy > 0:
+        op.SetFuzzyValue(fuzzy)
     op.Build()
     if not op.IsDone():
         return None
@@ -448,7 +454,7 @@ def match_face(ref: FaceRef, faces: list[FaceInfo]) -> list[int]:
     if ref.fingerprint is None:                        # given by a point on the face (D53)
         return faces_at_point(ref.point, faces)
     fp = ref.fingerprint
-    ctol = max(defaults.FACE_CENTROID_TOL, 1e-4 * math.sqrt(fp.area))
+    ctol = max(defaults.FACE_CENTROID_TOL, defaults.FACE_CENTROID_RTOL * math.sqrt(fp.area))
     hits = []
     for f in faces:
         if f.surface != fp.surface:

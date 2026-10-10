@@ -37,7 +37,9 @@ def _conv_split(conv: Optional[dict]) -> tuple[Optional[float], Optional[float]]
             if d.get("singular"):
                 continue
             disp = max(disp, d.get("max_disp") or 0.0)
-            stress = max(stress, d.get("peak_vm_excl_ties") or 0.0)
+            # the assessed stress (membrane plus bending) against the model's highest (post.convergence); older
+            # results graded the peak, against the model's or the part's own
+            stress = max(stress, d.get("stress_model", d.get("peak_vm_model", d.get("peak_vm_excl_ties"))) or 0.0)
     if disp == 0.0 and stress == 0.0 and conv.get("worst_change") is not None:
         disp = stress = float(conv["worst_change"])
     return disp, stress
@@ -49,7 +51,7 @@ EXPECTED = {
     "balanced": "Expected accuracy: High (displacements within about 1 %, stresses away from joints within about "
                 "3 %) when the convergence check agrees; the results say whether it did.",
     "accuracy": "Expected accuracy: High, with a finer mesh for local stresses (fillets, holes, joints); the "
-                "convergence check confirms it. Slower.",
+                "convergence check confirms it, and parts that have not settled are meshed finer again. Slower.",
     "fast": "Fast run: approximate, for iterative design only (no report).",
 }
 

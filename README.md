@@ -5,13 +5,13 @@ AsmFEA analyses a whole SolidWorks assembly (welded frames, bolted structures, s
 - **Analyses:** linear static and linear buckling, several load cases per run, optional frictional contact and preloaded bolts.
 - **Connections:** found from the geometry, mates and fasteners, each listed and editable: bonded, bolted, sliding, and hinges (from concentric, hinge, screw or profile-center mates, or added on one chosen face) whose parts' other touching faces slide without separating. Gear and rack-and-pinion mates couple the parts' turning and sliding. Sub-assemblies are analysed as if their parts were in the top-level assembly, with their own mates.
 - **Meshing:** members and thin walls are meshed with elements swept along the section or through the wall, so a model is many times smaller than a conventional solid mesh; chunky parts get quadratic tetrahedra.
-- **Results:** stresses, displacements, factors of safety and buckling factors, with weld/joint structural stress and membrane-plus-bending stress that settle as the mesh is refined. Every full run is solved at two mesh sizes and the change is reported.
+- **Results:** stresses, displacements, factors of safety and buckling factors, judged as static design codes do: on the membrane-plus-bending stress through the wall, round joints as well as away from them (at a thin wall's joint edge, the hot-spot stress of welded-joint practice), not on the spikes at sharp modelled edges, which have no finite value. Plots are scaled to that stress, with local peaks beyond it in their own colour. The factor of safety is given on yield and, for information, on ultimate strength. Every full run is solved at two mesh sizes and the change is reported; with Optimise for Accuracy, parts that have not settled are solved a third time on a finer mesh and the converged value is extrapolated.
 - **Speed:** re-runs redo only what changed; a fast run gives an approximate answer for design iterations; models too large for CalculiX's memory are solved by AsmFEA's own hybrid solver, part by part.
 - Runs in SolidWorks 2018 to 2026, including Standard and Professional seats.
 
 ## Download and install
 
-**[Download the installer: AsmFEA-Setup-0.6.0.exe](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases/download/v0.6.0/AsmFEA-Setup-0.6.0.exe)** (Windows 10/11, 64-bit; all releases on the [Releases page](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases)).
+**[Download the installer: AsmFEA-Setup-0.7.0.exe](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases/download/v0.7.0/AsmFEA-Setup-0.7.0.exe)** (Windows 10/11, 64-bit; all releases on the [Releases page](https://github.com/SimonRafferty/AsmFEA---Assembly-level-fast-FEA/releases)).
 
 The installer contains AsmFEA, the SolidWorks add-in and a private Python runtime. During installation it downloads the solver and mesher from their official sources (about 310 MB), each checked against a pinned SHA-256 hash:
 
@@ -33,6 +33,16 @@ The bundled Python runtime is the official embeddable package, <https://www.pyth
 - **[Verification report (PDF)](AsmFEA%20Verification%20Report.pdf):** AsmFEA's results against classical hand calculations on four cases (a tube cantilever, a bar under its own weight, a cantilever built from two bonded members, and a buckling column), the CalculiX solver against its own test examples and the NAFEMS LE1 and LE10 benchmarks, and the hybrid solver against CalculiX. Every comparison is within its acceptance criterion. It is a comparison of methods, not a sign-off: check AsmFEA against your own known cases before relying on it.
 
 The SolidWorks models of the verification cases are in [`cases/verification`](cases/verification): each case's `sw` folder holds its assembly and parts, with the study stored in the assembly. They use the SHS 100×100×5 weldment profile in `_profiles` and the material "S355 verification" from `_materials/AsmFEA Verification.sldmat` (copy it into SolidWorks' Custom Materials folder).
+
+## Material libraries
+
+[`materials`](materials) holds SolidWorks material libraries to copy into SolidWorks' Custom Materials folder:
+
+- **igus iglidur.sldmat:** 13 iglidur plain-bearing grades from igus' published data (modulus, compressive strength as yield, flexural strength, density, thermal properties; Poisson's ratio, which igus do not publish, estimated from each grade's stiffness and description). Each material's description gives its maximum recommended surface pressure for the bearing check.
+- **Structural steel EN 10025-2.sldmat:** S275 and S355, with the minimum yield of each thickness band (up to 16, 16-40 and 40-63 mm) and minimum tensile strength, and EN 1993-1-1 physical properties.
+- **Stainless 304 by supply condition.sldmat:** 1.4301 and 1.4307 (304 / 304L) cold-rolled 2B sheet and hot-rolled 1D plate to EN 10088-2, and 304 1/4 and 1/2 hard to ASTM A666, at the standards' minimum values.
+
+`make_sldmat.py` writes them from `igus_data.json` and the tables in the script.
 
 ## How it works
 

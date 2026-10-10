@@ -166,8 +166,10 @@ namespace AsmFea.AddIn
             }
             finally
             {
-                doc.IRelease3rdPartyStorage(STREAM);
+                // our reference to the stream goes first, then SolidWorks' storage: released the other way round,
+                // the stream's last Release reached an object SolidWorks had already let go of
                 Marshal.ReleaseComObject(st);
+                doc.IRelease3rdPartyStorage(STREAM);
             }
         }
 
@@ -182,8 +184,8 @@ namespace AsmFea.AddIn
             }
             finally
             {
+                Marshal.ReleaseComObject(st);                    // see ReadStream
                 doc.IRelease3rdPartyStorage(STREAM);
-                Marshal.ReleaseComObject(st);
             }
         }
     }

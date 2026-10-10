@@ -312,7 +312,8 @@
             "fidelity": {"enum": ["coarse", "standard", "fine"], "description": "Advanced override of the planner's mesh level"},
             "solver": {"enum": ["auto", "calculix", "hybrid"], "description": "Advanced override of the planner's solver choice; default auto"},
             "size": {"type": "number", "exclusiveMinimum": 0, "description": "Override global element size, mm"},
-            "convergence_check": {"type": "boolean", "description": "Advanced override: solve again on a refined mesh and report the change (the planner decides when absent)"}
+            "convergence_check": {"type": "boolean", "description": "Advanced override: solve again on a refined mesh and report the change (the planner decides when absent)"},
+            "refine_unconverged": {"type": "boolean", "description": "Advanced override: after the two solves, mesh the parts that did not converge finer again and solve a third time (on with Optimise for Accuracy when absent)"}
           }
         },
         "limits": {

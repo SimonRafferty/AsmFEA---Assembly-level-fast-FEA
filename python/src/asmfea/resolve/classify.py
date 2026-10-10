@@ -87,16 +87,16 @@ def hinges_from_mates(model: Model, geoms, face_map: dict, clamped: dict, locked
     and the touching faces slide without separating."""
     pins = []
     locked_holes = set() if locked_holes is None else locked_holes   # concentric hole mates found bonded (D55)
-    # the faces of the user's hinges, by face (the study's face_ref ids differ from the mates' ids)
-    taken = {tuple(face_map[fid]) for h in model.hinges for fid in h.faces if fid in face_map}
+    # A user's hinge on the same parts and axis replaces this mate's hinge (_one_hinge_per_axis / _same_hinge, in
+    # classify). It used to be any mate sharing a FACE with a user's hinge: a hinge from a bush to a step plate,
+    # picked on the bush's bore, then also suppressed the bush-to-link concentric mate (another pair), whose faces
+    # fell back to an older revolute joint that did not hold the bush, and the solve was singular (2026-10-09)
     for m in model.mates:
         # a concentric mate names two cylinders; SolidWorks' hinge mate names two cylinders and two planes
         if m.type.lower() not in ("concentric", "hinge", "screw") or len(m.parts) != 2 or len(m.entities) < 2:
             continue
         if _pair(*m.parts) in clamped:
             continue                               # a fastener through the holes: the bolted joint governs
-        if any(tuple(face_map.get(e, ())) in taken for e in m.entities):
-            continue                               # the user made a hinge of these faces
         sides = []
         for e in m.entities:
             hit = face_map.get(e)
@@ -133,7 +133,7 @@ def hinges_from_mates(model: Model, geoms, face_map: dict, clamped: dict, locked
             c = _hinge(f"H-{m.id}", pa, fa, pb, fb, f"concentric mate, {kinds}: a hinge on that axis (it has "
                        "priority; the parts' other touching faces slide without separating)", "mates", [m.id])
         pins.append(c)
-    pins += profile_hinges(model, geoms, face_map, clamped, taken)
+    pins += profile_hinges(model, geoms, face_map, clamped, set())   # a user's hinge there: as above
     return pins
 
 
@@ -405,19 +405,89 @@ def hinges_from_selection(model: Model, geoms, face_map: dict, removed=()) -> tu
     return out, diags
 
 
+def _pivot_stack(pair, itf: dict, pins: list[dict]) -> str | None:
+    """The part both parts of ``pair`` are hinged to, when their touching faces are square to those hinges'
+    (parallel) axes, else None. Such faces turn against each other as the shared part turns on its hinges: a bush
+    flange riding in a link and rubbing on the cheek the link pivots in. Bonded by the general rule, the bush became
+    a second pivot that fixed the link to the cheek and took a load that is not there (found live, a folding step,
+    2026-10-09). A part welded or bonded to the shared one has no hinge to it, so this does not apply to it."""
+    nrm = itf.get("normal")
+    if nrm is None or itf.get("geometry") != "plane":
+        return None
+    n = np.asarray(nrm, float)
+    n /= np.linalg.norm(n) or 1.0
+    by_part: dict = defaultdict(list)
+    for h in pins:
+        if h.get("type") != "hinge" or h.get("axis") is None:
+            continue
+        a = np.asarray(h["axis"], float)
+        a /= np.linalg.norm(a) or 1.0
+        p, q = h["parts"][:2]
+        by_part[p].append((q, a))
+        by_part[q].append((p, a))
+    for other_a, ax_a in by_part.get(pair[0], []):
+        if abs(abs(float(np.dot(ax_a, n))) - 1) > 1e-3:
+            continue
+        for other_b, ax_b in by_part.get(pair[1], []):
+            if other_b == other_a and abs(abs(float(np.dot(ax_a, ax_b))) - 1) <= 1e-3:
+                return other_a
+    return None
+
+
+def _same_hinge(a: dict, b: dict) -> bool:
+    """Two hinge connections between the same two parts about the same axis line."""
+    if set(a["parts"][:2]) != set(b["parts"][:2]) or a.get("axis") is None or b.get("axis") is None:
+        return False
+    a0 = np.asarray(a["axis"], float) / np.linalg.norm(a["axis"])
+    if abs(abs(float(np.dot(a0, np.asarray(b["axis"], float) / np.linalg.norm(b["axis"])))) - 1) > 1e-3:
+        return False
+    d = np.asarray(b["axis_point"], float) - np.asarray(a["axis_point"], float)
+    return float(np.linalg.norm(d - np.dot(d, a0) * a0)) <= defaults.COAX_TOL + 0.5
+
+
+def _one_hinge_per_axis(chosen: list[dict]) -> tuple[list[dict], list[Diagnostic]]:
+    """The user's hinges, one per axis and pair of parts: the NEWEST on an axis is used and older ones there are
+    left out with a note (the user's rule, 2026-10-09: what was set last is what the user wants, e.g. a hinge
+    added again to change its lock; three Add hinge clicks on one joint had stored three hinges). The add-in
+    deletes the older ones when a hinge is added; this covers studies stored before that."""
+    kept, diags, noted = [], [], set()
+    for c in reversed(chosen):                         # stored in the order added: the newest last
+        newer = next((k for k in kept if _same_hinge(k, c)), None)
+        if newer is None:
+            kept.append(c)
+        elif c.get("hinge") not in noted:
+            noted.add(c.get("hinge"))
+            # evidence names the hinges, so the pane can delete the older one from its notice (a notice row has no
+            # connection; "Not connected (delete)" there stored an override instead, found live 2026-10-10)
+            diags.append(make("HINGE_DUPLICATE", where={"parts": list(c["parts"][:2]), "connections": [c["id"]]},
+                              hinge=c.get("hinge"), kept=newer.get("hinge"),
+                              evidence={"hinge": c.get("hinge"), "kept": newer.get("hinge")}))
+    return kept[::-1], diags
+
+
 def lock_loose_pins(hinges: list[dict], conns: list[dict]) -> None:
     """A part held only by hinges on one axis (a loose pin through holes) would spin freely about its own
     axis, leaving the model singular. Its first hinge is locked: the pin is held in the first part it
-    passes through and turns in the others, which changes nothing that matters."""
+    passes through and turns in the others, which changes nothing that matters.
+
+    Faces sliding square to the axis (a bolt's head or washer on a plate, the faces beside its hinges) do not
+    stop the spin, so they do not make it any less a loose pin. Found live (2026-10-09): six M8 pivot bolts of a
+    folding step, each with its head sliding on a plate, were left out as free to move instead, which took the
+    linkage's pivots out and left the model singular."""
     by_part = defaultdict(list)
     for c in conns:
         for p in c["parts"][:2]:
             by_part[p].append(c)
     done = set()
     for pid, cs in sorted(by_part.items()):
-        if not cs or any(c["type"] != "hinge" for c in cs if c["type"] != "none"):
-            continue
         hs = [c for c in cs if c["type"] == "hinge"]
+        if not hs:
+            continue
+        a_ref = np.asarray(hs[0]["axis"], float)
+        square = lambda c: (c["type"] == "slide" and c.get("normal") is not None  # noqa: E731
+                            and abs(abs(float(np.dot(a_ref, np.asarray(c["normal"], float)))) - 1) < 1e-3)
+        if any(c["type"] not in ("hinge", "none") and not square(c) for c in cs):
+            continue
         if not hs or any(c.get("locked") for c in hs) or any(c["type"] == "screw" for c in cs):
             continue
         if len({q for c in hs for q in c["parts"][:2]} - {pid}) < 2:
@@ -612,10 +682,15 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
     # hinges from concentric mates on cylinders; those mates then no longer decide the touching faces' type
     chosen, hdiags = hinges_from_selection(model, geoms, face_map or {}, removed)
     diags += hdiags
+    chosen, ddiags = _one_hinge_per_axis(chosen)
+    diags += ddiags
     locked_holes: set = set()
-    pins = [p for p in chosen + hinges_from_mates(model, geoms, face_map or {}, clamped, locked_holes)
-            if not set(p["parts"]) & set(removed)]
-    mates = mate_index(model, skip={m for p in pins for m in p["evidence"]["mates"]} | locked_holes)
+    all_from_mates = hinges_from_mates(model, geoms, face_map or {}, clamped, locked_holes)
+    from_mates = [m for m in all_from_mates if not any(_same_hinge(m, c) for c in chosen)]  # the user's stands
+    pins = [p for p in chosen + from_mates if not set(p["parts"]) & set(removed)]
+    # a mate whose hinge gave way to the user's on that axis is still used up by it: left unused, it made an old
+    # revolute joint of the faces as well, which the mechanism check took as rigid (found live 2026-10-09)
+    mates = mate_index(model, skip={m for p in pins + all_from_mates for m in p["evidence"]["mates"]} | locked_holes)
     hinged = {_pair(*p["parts"]) for p in pins}
     # a face that is part of a hinge belongs to it: touching interfaces on it are left to the hinge
     hinge_faces = {(s["part"], s["face"]) for p in pins for s in p["sides"]}
@@ -640,10 +715,15 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
             if any((s["part"], s["face"]) in hinge_faces for s in itf.get("sides", [])):
                 continue                    # a pin surface touching its hole: the hinge stands for it
             c = {k: v for k, v in itf.items()}
+            pivot = None if joint is not None or pair in hinged else _pivot_stack(pair, c, pins)
             if joint is None and pair in hinged:
                 # the hinge has priority: the touching faces slide on each other but do not separate
                 c["type"] = "slide"
                 rule = "touching faces of parts joined by a hinge: they slide but do not separate"
+            elif pivot is not None:
+                c["type"] = "slide"
+                rule = (f"faces square to the hinges of {pivot} touching: each part turns on it, so they slide "
+                        "but do not separate (a bush or washer face on the next part of a pivot)")
             elif joint is None:
                 c["type"] = "tie"
                 rule = ("bodies of the same weldment part touching" if same_weldment

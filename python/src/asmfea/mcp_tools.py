@@ -218,8 +218,10 @@ def register(server: Any, prefix: str = "asmfea_", sw_session: Optional[api.SwSe
             s = api.summary(params.study)
             lines = [f"{c['status']}: {c['check']} = {c['value']} (limit {c['limit']})" for c in s.checks]
             key = {case: {"max_disp_mm": lc["max_disp"], "max_disp_at": lc.get("max_disp_at"),
-                          "parts": {p: {"peak_vm_MPa": v["peak_vm_excl_ties"], "raw_peak_MPa": v["peak_vm"],
-                                        "min_fos": v["min_fos"]} for p, v in lc["parts"].items()}}
+                          "parts": {p: {"membrane_bending_MPa": v.get("membrane_bending"),
+                                        "peak_vm_MPa": v["peak_vm_excl_ties"],
+                                        "min_fos": v["min_fos"],
+                                        "min_fos_ultimate": v.get("min_fos_ultimate")} for p, v in lc["parts"].items()}}
                    for case, lc in s.load_cases.items()}
             return _j({"ok": True, "job": s.job, "checks": lines, "load_cases": key})
         except Exception as e:

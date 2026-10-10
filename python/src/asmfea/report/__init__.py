@@ -34,6 +34,7 @@ from .. import defaults
 from ..config import load_config
 from ..jobs import read_json
 from ..model import load_model
+from ..post import assessed_stress
 from . import assumptions as A
 
 FONT = "Arial"
@@ -42,7 +43,7 @@ GREY = RGBColor(0x59, 0x59, 0x59)
 HEADER_FILL = "D9E2F3"        # table header shading
 BORDER = "A6A6A6"
 STATUS_COLOUR = {"PASS": RGBColor(0x1B, 0x7F, 0x2A), "WARN": RGBColor(0xB2, 0x6B, 0x00),
-                 "FAIL": RGBColor(0xB0, 0x1C, 0x1C)}
+                 "FAIL": RGBColor(0xB0, 0x1C, 0x1C), "INFO": RGBColor(0x55, 0x5B, 0x66)}
 KIND_TEXT = {"solid": "Solid body", "sheet": "Sheet", "member": "Structural member", "fastener": "Fastener",
              "weld_bead": "Weld bead"}
 CONN_TEXT = {"tie": "Bonded", "contact": "Contact", "bolted": "Bolt", "revolute": "Pin (revolute)",
@@ -396,10 +397,12 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     for case, lc in res["load_cases"].items():
         fos = [(p_["min_fos"], name) for name, p_ in lc["parts"].items() if p_["min_fos"]]
         fmin = min(fos) if fos else (None, "-")
-        vmax = max(((p_["peak_vm_excl_ties"], name) for name, p_ in lc["parts"].items()), default=(None, "-"))
-        rows.append([case, lc["max_disp"], vmax[0], vmax[1], fmin[0], fmin[1]])
-    _table(doc, ["Load case", "Max displacement (mm)", "Max von Mises (MPa)", "In part", "Min factor of safety",
-                 "In part"], rows)
+        fult = min((p_["min_fos_ultimate"] for p_ in lc["parts"].values() if p_.get("min_fos_ultimate")), default=None)
+        vmax = max(((v, name) for name, p_ in lc["parts"].items() if (v := assessed_stress(p_)) is not None),
+                   default=(None, "-"))
+        rows.append([case, lc["max_disp"], vmax[0], vmax[1], fmin[0], fult, fmin[1]])
+    _table(doc, ["Load case", "Max displacement (mm)", "Max von Mises, membrane + bending (MPa)", "In part",
+                 "Min factor of safety (yield)", "Min factor of safety (ultimate)", "In part"], rows)
 
     # ---- main body: what matters first
     # ---- 3. Results
@@ -411,7 +414,9 @@ def build_report(study: Path, pdf: bool = False) -> Path:
         if ext:
             def cell(e, unit, cap=None):
                 v = e["value"]
-                val = f"above {cap:g}" if cap is not None and v is not None and v > cap else _fmt(v)
+                if v is None or e.get("at") is None:
+                    return "not assessed (joint edges only)"
+                val = f"above {cap:g}" if cap is not None and v > cap else _fmt(v)
                 at = ", ".join(f"{c:.1f}" for c in e["at"])
                 return f"{val} {unit}\nNode {e['node']} ({e['part']})\nat ({at})"
             _table(doc, ["Name", "Type", "Min", "Max"], [
@@ -420,6 +425,14 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                  cell(ext["displacement"]["max"], "mm")],
                 ["Factor of safety", "Yield / von Mises (per part's material)", cell(ext["fos"]["min"], ""),
                  cell(ext["fos"]["max"], "", defaults.PLOT_FOS_CAP)]], [3, 4, 5, 5])
+            _para(doc, "The stress maximum and factor of safety minimum are the membrane plus bending values the "
+                       "checks use. On the plots, local peaks beyond them (notches, the stress next to a joint's edge) "
+                       "are magenta"
+                       + (". Along the joint edges themselves, where the computed values are artefacts of how the "
+                          "joints are modelled, the plots show the stress just beside them." if lc.get("joint_zone_points")
+                          else ".")
+                       + (" Parts not assessed (wholly within joints, such as bushes: a bearing check by hand) are grey."
+                          if lc.get("unassessed_points") else ""), 9)
         for field, label in (("vonmises", "Stress: von Mises"), ("displacement", "Displacement: resultant (deformed shape)"),
                              ("fos", "Factor of safety on yield")):
             _picture(doc, study / "results" / f"{safe}_{field}_iso.png", f"{asm_name} - {study_name} - {case} - {label}")
@@ -440,7 +453,7 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     heading("Conclusion")
     p = _para(doc, "Overall result: ")
     _font(p.add_run(overall), None, True, STATUS_COLOUR[overall])
-    failed = [c for c in res["checks"] if c["status"] != "PASS"]
+    failed = [c for c in res["checks"] if c["status"] not in ("PASS", "INFO")]
     if failed:
         for c in failed:
             _para(doc, f"{c['status']}: {c['check']} = {_fmt(c['value'])} (limit {_fmt(c['limit'])})", style="List Bullet")
@@ -520,7 +533,9 @@ def build_report(study: Path, pdf: bool = False) -> Path:
         ["Mesh type", "Solid mesh: quadratic wedges (swept thin walls and member spans) and quadratic tetrahedra"],
         ["Run planned", _plan_text(res.get("plan"))],
         ["Mesh level", (res.get("plan") or {}).get("fidelity") or model.study.mesh.fidelity or "standard"],
-        ["Convergence check", "On: base and refined meshes solved" if conv else "Off: one mesh"],
+        ["Convergence check", ("On: base and refined meshes solved, then the parts that had not converged solved "
+                               "again on a finer mesh" if res.get("local_pass") else
+                               "On: base and refined meshes solved") if conv else "Off: one mesh"],
         ["Solver", "AsmFEA hybrid solver (parts condensed onto their joints; the model was too large for CalculiX "
                    "on this computer)" if res.get("hybrid") else versions.get("solver") or "CalculiX"],
         ["Large displacement", "Off (linear geometry)"],
@@ -626,12 +641,33 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     m = res["mesh"]
     _table(doc, ["Mesh", "Total nodes", "Degrees of freedom", "Total elements", "Mass (kg)"],
            [[lv, m[lv]["nodes"], m[lv]["dof"], m[lv].get("elements"), m[lv]["total_mass_t"] * 1000]
-            for lv in ("base", "refined") if lv in m])
+            for lv in ("base", "refined", "local") if lv in m])
     if m.get("fallback_parts"):
         _para(doc, "Parts meshed by a fallback mesher: " + ", ".join(m["fallback_parts"]))
-    if conv:
-        _para(doc, f"Largest change between the base and refined meshes: {conv.get('worst_change', 0):.1%} (peak "
-                   "stress excluding tie boundaries, and maximum displacement, per part).")
+    lp = res.get("local_pass")
+    if conv and lp:
+        # the local pass (D65): what was refined, the changes, and the extrapolated stress where the three agree
+        short = lambda pid: pid.split("/body:")[-1].split("/")[-1]  # noqa: E731
+        _para(doc, f"Largest change between the base and refined meshes: {lp['first_worst_change']:.1%}. The parts "
+                   f"that changed by more than {defaults.CONVERGENCE_TOL:.0%} ({', '.join(short(p) for p in lp['parts'])}) "
+                   f"were meshed {1 / defaults.LOCAL_REFINE_RATIO:.3g} times finer again and the model solved a third "
+                   f"time (the \"local\" mesh, reported). Largest change between the refined and local meshes: "
+                   f"{conv.get('worst_change', 0):.1%} (assessed stress and maximum displacement, per part).")
+        rows = []
+        for case, parts in (lp.get("extrapolated") or {}).items():
+            for part, e in parts.items():
+                rows.append([case, short(part)] + [e["stress"][k] for k in range(3)]
+                            + ([e["extrapolated"], f"±{e['gci']:.1%}"] if "extrapolated" in e else ["-", "not steady"]))
+        if rows:
+            _table(doc, ["Load case", "Part", "Base (MPa)", "Refined (MPa)", "Local (MPa)", "Extrapolated (MPa)",
+                         "Band"], rows, size=9)
+            _para(doc, "Extrapolated: the assessed stress the mesh is converging to (Richardson extrapolation over the "
+                       "three meshes), with the band it is expected within (grid convergence index, safety factor "
+                       "1.25). \"Not steady\": the three values do not close in steadily, so no extrapolation is "
+                       "given; judge by the local mesh's value and the change shown.", 9)
+    elif conv:
+        _para(doc, f"Largest change between the base and refined meshes: {conv.get('worst_change', 0):.1%} (assessed "
+                   "stress, membrane plus bending, and maximum displacement, per part).")
     else:
         _para(doc, "The convergence re-solve was switched off for this study; results come from a single mesh and their "
                    "mesh sensitivity is not measured.")
@@ -657,12 +693,16 @@ def build_report(study: Path, pdf: bool = False) -> Path:
         conv_case = conv.get("by_case", {}).get(case, {}).get("parts", {})
         _para(doc, "Results per part. The factor of safety uses the membrane plus bending stress (ASME VIII Div. 2 "
                    "Part 5 classification: the stress linearised along a line through the material at the most stressed "
-                   "points), which leaves notch peaks to fatigue assessment. Peaks are shown for reference; the peak "
-                   "excluding ties leaves out the bands at bonded joints, which are assessed below.", 9)
-        _table(doc, ["Part", "Membrane + bending (MPa)", "Peak excl. ties (MPa)", "Raw peak (MPa)", "Min FoS", "Max disp. (mm)",
-                     "Mesh change"],
-               [[name, p_.get("membrane_bending"), p_["peak_vm_excl_ties"], p_["peak_vm"], p_["min_fos"], p_["max_disp"],
-                 f"{max(conv_case.get(name, {}).get('max_disp', 0), conv_case.get(name, {}).get('peak_vm_excl_ties', 0)):.1%}"
+                   "points, round the joints as well as away from them), which leaves local peaks to fatigue "
+                   "assessment. Peaks are shown for reference, leaving out the joint edges, where they are artefacts of "
+                   "how the joints are modelled; bonded joints are also assessed below, and a part lying wholly in "
+                   "joint bands (a bush) is marked \"at joints only\".", 9)
+        _table(doc, ["Part", "Membrane + bending (MPa)", "Peak excl. joint edges (MPa)", "Min FoS yield",
+                     "Min FoS ultimate", "Max disp. (mm)", "Mesh change"],
+               [[name, p_.get("membrane_bending"),
+                 p_["peak_vm_excl_ties"] if p_["peak_vm_excl_ties"] is not None else "at joints only",
+                 p_["min_fos"], p_.get("min_fos_ultimate"), p_["max_disp"],
+                 f"{max(conv_case.get(name, {}).get('max_disp', 0), conv_case.get(name, {}).get('stress', conv_case.get(name, {}).get('peak_vm_excl_ties', 0))):.1%}"
                  if conv_case else "-"] for name, p_ in lc["parts"].items()])
         joints = sorted(lc.get("joints", []), key=lambda j: -j["structural_stress"])
         if joints:
@@ -728,17 +768,19 @@ def build_summary(study: Path, pdf: bool = False) -> Path:
     statuses = [c["status"] for c in res["checks"]]
     overall = "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "PASS"
 
-    # per load case: the figures the factor of safety is based on (peaks excluding tie edges)
+    # per load case: the figures the factor of safety is based on (membrane plus bending)
     rows, worst_case, worst_vm = [], None, -1.0
     for case, lc in res["load_cases"].items():
         parts = lc["parts"]
-        vm_part = max(parts, key=lambda n: parts[n]["peak_vm_excl_ties"] or 0) if parts else None
+        vm_part = max(parts, key=lambda n: assessed_stress(parts[n]) or 0) if parts else None
         fos = [(p_["min_fos"], n) for n, p_ in parts.items() if p_["min_fos"]]
         fmin = min(fos) if fos else (None, "-")
-        vm = parts[vm_part]["peak_vm_excl_ties"] if vm_part else None
+        fult = min((p_["min_fos_ultimate"] for p_ in parts.values() if p_.get("min_fos_ultimate")), default=None)
+        vm = assessed_stress(parts[vm_part]) if vm_part else None
         if vm is not None and vm > worst_vm:
             worst_vm, worst_case = vm, case
-        rows.append([case, f"{_fmt(vm)}\n({vm_part})", f"{_fmt(lc['max_disp'])}", f"{_fmt(fmin[0])}\n({fmin[1]})"])
+        rows.append([case, f"{_fmt(vm)}\n({vm_part})", f"{_fmt(lc['max_disp'])}", f"{_fmt(fmin[0])}\n({fmin[1]})",
+                     _fmt(fult) if fult else "-"])
 
     _para(doc, f"Structural analysis summary: {asm_name}", 15, True, BLUE)
     _para(doc, f"Study {study_name}  |  {when:%d %B %Y}  |  AsmFEA {res['versions']['asmfea']} with CalculiX", 8.5,
@@ -774,8 +816,8 @@ def build_summary(study: Path, pdf: bool = False) -> Path:
         _font(cap.add_run(f"von Mises stress, load case {worst_case} (MPa)"), 8, colour=GREY)
 
     _para(doc)
-    _table(doc, ["Load case", "Max von Mises stress (MPa)", "Max displacement (mm)", "Min factor of safety"], rows,
-           [3.5, 4.5, 4.5, 4.5], size=9)
+    _table(doc, ["Load case", "Max von Mises stress (MPa)", "Max displacement (mm)", "Min factor of safety (yield)",
+                 "Min factor of safety (ultimate)"], rows, [3.0, 4.0, 3.5, 3.8, 3.2], size=9)
     if res.get("accuracy"):                             # one line: how far to trust the table (D60)
         _para(doc, res["accuracy"]["summary"], 8.5, bold=True)
     lim = model.study.limits

@@ -35,7 +35,7 @@ def field_files(study: Path, case: str, out: Path | None = None) -> tuple[Path, 
 
 def save_fields(study: Path, case: str, X, cells, U, umag, vm, fos, scale: float, markers: dict, fos_cap: float,
                 out: Path | None = None, parts: tuple | None = None, yields=None, run_mode: str = "full",
-                proportional: bool = True) -> None:
+                proportional: bool = True, ultimates=None, joint_edge=None) -> None:
     """Called by post.plots.render_all for each load case. parts: (part ids, part index per point) and
     yields (yield strength per point) let the viewer's point probe name the part and give an uncapped FoS."""
     import pyvista as pv
@@ -49,6 +49,10 @@ def save_fields(study: Path, case: str, X, cells, U, umag, vm, fos, scale: float
         mesh.point_data["part"] = np.asarray(parts[1], np.int32)
     if yields is not None:
         mesh.point_data["yield MPa"] = np.asarray(yields, np.float32)
+    if ultimates is not None:
+        mesh.point_data["ultimate MPa"] = np.asarray(ultimates, np.float32)
+    if joint_edge is not None:            # points drawn with the stress beside them (post.plots.fill_joint_edges)
+        mesh.point_data["joint edge"] = np.asarray(joint_edge, np.uint8)
     mesh.save(str(vtp))
     meta.write_text(json.dumps({"schema_version": "1.0", "case": case, "deform_scale": scale, "fos_cap": fos_cap,
                                 "run_mode": run_mode, "parts": list(parts[0]) if parts is not None else [],
@@ -70,7 +74,24 @@ def show(study: Path, case: str, field: str) -> None:
         mesh.points = mesh.points + meta["deform_scale"] * mesh.point_data["U"]
     # the colour range is the full load's, so it stays put while the load animation scales the values
     values = np.asarray(mesh.point_data[array])
-    clim = (0, meta["fos_cap"]) if field == "fos" else (float(values.min()), float(values.max()))
+    # joint edges carry no stress or FoS (NaN, drawn grey): their raw values are modelling artefacts (post.plots)
+    finite = values[np.isfinite(values)] if np.isfinite(values).any() else np.zeros(1)
+    clim = (0, meta["fos_cap"]) if field == "fos" else (float(finite.min()), float(finite.max()))
+    raw_max = float(finite.max())
+    if field != "fos" and 0 <= clim[0] < 1e-6 * max(clim[1], 1e-30):
+        clim = (0.0, clim[1])                          # a speck above zero reads as 0 on the key, not 2.63e-05
+    beyond = None
+    if field == "vonmises":
+        # the key's top: the highest assessed stress (membrane plus bending), as the checks use; local peaks above it
+        # show magenta (post.plots)
+        top = _assessed_peak(vtp.parent, case)
+        if top is not None and clim[0] < top < clim[1]:
+            clim, beyond = (clim[0], top), "above"
+    elif field == "fos":
+        # the key's bottom: the lowest assessed factor of safety; local peaks below it show magenta
+        floor = _assessed_fos(vtp.parent, case)
+        if floor is not None and 0 < floor < clim[1] and float(finite.min()) < floor:
+            clim, beyond = (floor, clim[1]), "below"
     lo, hi = np.asarray(mesh.bounds[::2]), np.asarray(mesh.bounds[1::2])
     centre, size = (lo + hi) / 2, float(np.linalg.norm(hi - lo))
     model = load_model(study)
@@ -133,8 +154,12 @@ def show(study: Path, case: str, field: str) -> None:
     pl.add_text("Reset view (R)", position=(rx + BUTTON_PX + 8, by + 4), font_size=9, color="black")
     pl.add_key_event("r", reset)
     _camera(pl, centre, size, main)
+    band = _ColourRange(pl, surface, clim, cmap, pl.scalar_bar, values=values, allow_log=(field != "fos"),
+                        raw_max=raw_max, beyond=beyond)
+    band.add_sliders()
     min_max = _Markers(pl, base, marks, meta["deform_scale"] if "U" in base.point_data else 0.0, centre, size)
     spot = _Probe(pl, surface, mesh, meta, field, base=base)
+    see_through = _Outlines(pl, surface, mesh)
     anim = _LoadAnimation(pl, mesh, base, meta, field, spot, markers=min_max)
     anim.add_button((bx, by))
     anim.add_shape_controls((rx + BUTTON_PX + 160, by))
@@ -144,17 +169,24 @@ def show(study: Path, case: str, field: str) -> None:
         if at:
             pl.render()
             spot.click(*(int(v) for v in at.split(",")))
+        at = os.environ.get("ASMFEA_VIEWER_OUTLINE")      # tests: right-click at this window position ("x,y")
+        if at:
+            pl.render()
+            see_through.click(*(int(v) for v in at.split(",")))
         if os.environ.get("ASMFEA_VIEWER_DEFORM"):         # tests: this deformation scale
             anim.set_scale(float(os.environ["ASMFEA_VIEWER_DEFORM"]))
         if os.environ.get("ASMFEA_VIEWER_GHOST"):          # tests: the undeformed shape shown
             anim.show_ghost(True)
         if os.environ.get("ASMFEA_VIEWER_LOAD"):           # tests: the animation's frame at this load fraction
             anim.set_fraction(float(os.environ["ASMFEA_VIEWER_LOAD"]))
+        if os.environ.get("ASMFEA_VIEWER_RANGE"):          # tests: the coloured band ("low,high")
+            band.set(*(float(v) for v in os.environ["ASMFEA_VIEWER_RANGE"].split(",")))
         pl.screenshot(shot)
         pl.close()
         return
     min_max.attach()                                # before the probe: a press on a label is a drag, not a click
     spot.attach()
+    see_through.attach()
     pl.show()
 
 
@@ -167,10 +199,379 @@ ANIMATION_PERIOD_S = 6.0    # the load animation: 3 s rising from zero to the fu
 ANIMATION_FRAME_MS = 33     # about 30 frames a second
 DEFORM_SLIDER_MAX = 3.0     # the deformation slider runs from 0 to 3 x the automatic exaggeration
 GHOST_FEATURE_DEG = 30.0    # the undeformed ghost: edges where the surface turns more than this, and outlines
+OUTLINE_COLOUR = (0.15, 0.17, 0.20)   # a right-clicked part's outline: darker than the undeformed ghost's grey
+OUTLINE_PICK_TOLERANCE = 0.004        # a right-click this near an outline (fraction of the window) restores it
 KEY_TITLE_GAP_PX = 14            # pixels between the key's title and its bar
 KEY_BOTTOM, KEY_TOP = 0.12, 0.78   # the colour key's extent (fractions of the window), inside the border
 CONTROLS_BAND_PX = 72       # the band of controls below the border: buttons, tickboxes and the slider with its value
 MARKER_OFFSET_PX = 70       # a min / max label's centre sits this far out from its point (away from the model)
+
+
+PLAIN_GREY = (0.75, 0.75, 0.77)    # outside the coloured band: about SolidWorks' default part colour
+PEAK_COLOUR = (0.85, 0.30, 0.85)   # local peaks beyond the assessed stress (as post.plots)
+LUT_ENTRIES = 4096                 # the colour table's rows over a linear key (a band 1/100 of it still gets 40)
+LUT_ENTRIES_LOG = 1024             # and over a log key (four decades: 256 a decade)
+LEADER_DASH_PX = 6                 # the min / max leader lines: black and white dashes this many pixels long
+MARKER_SIZE_PX = 9                 # the band markers: triangles this many pixels long, pointing at the key's bar
+KEY_FRAME_PAD_PX = MARKER_SIZE_PX + 3   # the key's frame this far outside the bar, its numbers and title: the markers'
+                                        # triangles inside it, their values just outside
+LOG_KEY_SHARE = 0.05               # a log key when 90 % of the values would sit in the bottom 5 % of a linear one
+LOG_KEY_DECADES = 4                # a log key spans at most this many decades below its top
+
+
+def _case_parts(results_dir: Path, case: str) -> dict | None:
+    try:
+        res = json.loads((results_dir / "results.json").read_text(encoding="utf-8-sig"))
+        return res["load_cases"][case]["parts"]
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def _assessed_peak(results_dir: Path, case: str) -> float | None:
+    """The highest assessed stress in a load case (results.json; membrane plus bending, the factor of safety's own):
+    the key's top for stress (the user's choice, 2026-10-09). Raw peaks at joints (5 290 MPa at a hinge on a folding
+    step whose structure carried 125 MPa) pushed everything that matters into the bottom few percent of the key."""
+    from .plots import assessed_top
+    parts = _case_parts(results_dir, case)
+    return assessed_top(parts) if parts else None
+
+
+def _assessed_fos(results_dir: Path, case: str) -> float | None:
+    """The lowest assessed factor of safety in a load case (results.json): the key's bottom for FoS."""
+    parts = _case_parts(results_dir, case)
+    return min((p["min_fos"] for p in parts.values() if p.get("min_fos")), default=None) if parts else None
+
+
+class _ColourRange:
+    """The coloured band (the user's requests, 2026-10-09: with most of a structure near zero it was all dark blue and
+    no detail showed; then markers on the key itself, as in the user's sketch Sliders.jpg). Two markers on the colour
+    key's left edge set the band; the colour map is stretched between them (blue at the lower, red at the upper) and
+    everything outside the band, on the model and on the key, is plain grey. Local peaks beyond the assessed stress
+    (above the stress key's top, below the FoS key's bottom: ``beyond``) are magenta. The key has a black frame so the
+    grey stands out from the background.
+
+    The key is logarithmic when a linear one would squeeze most of the model into its bottom: 90 % of the values below
+    LOG_KEY_SHARE of its top. The colouring is a continuous colour function, so a narrow band still gets the whole
+    gradient; the model and the key share it."""
+
+    def __init__(self, pl, surface, clim, cmap: str, key, values=None, allow_log: bool = True,
+                 raw_max: float | None = None, beyond: str | None = None):
+        self.pl, self.surface, self.key, self.cmap = pl, surface, key, cmap
+        self.beyond = beyond
+        lo, hi = float(clim[0]), float(clim[1])
+        v = np.asarray(values, float) if values is not None else np.asarray([lo, hi])
+        v = v[np.isfinite(v)] if np.isfinite(v).any() else np.asarray([lo, hi])    # joint zones (NaN) left out
+        self.log = bool(allow_log and hi > 0 and np.percentile(v, 90) < LOG_KEY_SHARE * hi)
+        if self.log:
+            positive = v[v > 0]
+            floor = hi * 10.0 ** -LOG_KEY_DECADES
+            lo = max(float(np.percentile(positive, 1)) if len(positive) else floor, floor, lo)
+        self.full = (lo, hi)
+        self.lo, self.hi = self.full
+        self.frame = None                  # the viewer's own frame round the key (add_sliders), else VTK's
+        self.above = raw_max is not None and raw_max > hi * (1 + 1e-6)     # values beyond the key's top exist
+        self.low = self.high = None
+        key.DrawFrameOn()
+        key.GetFrameProperty().SetColor(0, 0, 0)
+        key.GetFrameProperty().SetLineWidth(1.0)
+        # no "above" box on the key: the bar's rectangle would take it in, and the markers (which follow the bar) would
+        # read wrong values; values above the key's top show grey on the model, as everything outside the band does
+        self.set(*self.full, render=False)
+
+    # the markers move linearly along the key: in log10 of the value on a log key
+    def _to_track(self, v: float) -> float:
+        return float(np.log10(max(v, 1e-300))) if self.log else float(v)
+
+    def _from_track(self, t: float) -> float:
+        return float(10.0 ** t) if self.log else float(t)
+
+    def _function(self):
+        """The colours: a large lookup table over the key's range (linear, or log10 on a log key), grey outside the
+        band and the colour map stretched across it. A table, not a continuous colour function: the key draws a log
+        scale only for a lookup table (with a colour function it drew its ticks linearly, under log-placed markers).
+        LUT_ENTRIES rows keep a band a few hundredths of the range smooth."""
+        import matplotlib
+        from vtkmodules.util.numpy_support import numpy_to_vtk
+        from vtkmodules.vtkCommonCore import vtkLookupTable
+        cm = matplotlib.colormaps[self.cmap]
+        n = LUT_ENTRIES_LOG if self.log else LUT_ENTRIES
+        a, b = self._to_track(self.full[0]), self._to_track(self.full[1])
+        track = a + (np.arange(n) + 0.5) / n * (b - a)           # each row's value, on the key's own scale
+        t = (track - self._to_track(self.lo)) / max(self._to_track(self.hi) - self._to_track(self.lo), 1e-30)
+        rgb = np.asarray(cm(np.clip(t, 0.0, 1.0)))[:, :3]
+        rgb[(t < 0) | (t > 1)] = PLAIN_GREY
+        lut = vtkLookupTable()
+        lut.SetNumberOfTableValues(n)
+        if self.log:
+            lut.SetScaleToLog10()
+        lut.SetRange(*self.full)
+        table = np.column_stack([rgb, np.ones(n)])
+        lut.SetTable(numpy_to_vtk((table * 255).round().astype(np.uint8), deep=True))
+        # above the key's top: magenta for the local peaks past the assessed stress, else grey; below its bottom:
+        # magenta for a FoS below the assessed one, else the bottom row's colour (a log key's near-zero values: blue
+        # with the lower marker at the bottom, grey with it raised)
+        lut.SetAboveRangeColor(*(PEAK_COLOUR if self.beyond == "above" else PLAIN_GREY), 1.0)
+        lut.SetNanColor(*PLAIN_GREY, 1.0)                     # joint edges: no assessed stress
+        lut.UseAboveRangeColorOn()
+        if self.beyond == "below":
+            lut.SetBelowRangeColor(*PEAK_COLOUR, 1.0)
+            lut.UseBelowRangeColorOn()
+        lut.Build()
+        return lut
+
+    def _bar_rect(self):
+        """The key's colour bar in window pixels (x0, y0, x1, y1). The key lays itself out only while it draws (after a
+        plain render its rectangle reads -1 x -1), so it is laid out here once more, with the window's graphics
+        context current (without it, OpenGL errors)."""
+        self.pl.ren_win.MakeCurrent()
+        self.key.RenderOpaqueGeometry(self.pl.renderer)
+        r = [0, 0, 0, 0]
+        self.key.GetScalarBarRect(r, self.pl.renderer)
+        return r[0], r[1], r[0] + r[2], r[1] + r[3]
+
+    def _frame_box(self):
+        ren = self.pl.renderer
+        a = self.key.GetPositionCoordinate().GetComputedDisplayValue(ren)
+        b = self.key.GetPosition2Coordinate().GetComputedDisplayValue(ren)
+        return a[0], a[1], b[0], b[1]
+
+    def _measure(self) -> None:
+        """The bar's place within the key's frame, as fractions, so the markers follow it however the window is sized
+        (measured once: the bar is laid out only while the key draws)."""
+        x0, y0, x1, y1 = self._bar_rect()
+        fx0, fy0, fx1, fy1 = self._frame_box()
+        fw, fh = max(fx1 - fx0, 1), max(fy1 - fy0, 1)
+        if y1 > y0:
+            self._rel = ((x0 - fx0) / fw, (y0 - fy0) / fh, (y1 - fy0) / fh)
+            self._content = self._content_size(x1 - x0)
+
+    def _content_size(self, bar_w: float) -> tuple:
+        """(bar width, widest number, number half-height) in pixels, the numbers measured with the key's own font
+        (with a margin: a display's text scaling can draw them a little wider)."""
+        from vtkmodules.vtkRenderingCore import vtkTextRenderer
+        import vtkmodules.vtkRenderingFreeType  # noqa: F401  (the text renderer's implementation)
+        tr = vtkTextRenderer()
+        dpi = self.pl.ren_win.GetDPI()
+
+        def size(prop, text):
+            bb = [0, 0, 0, 0]
+            tr.GetBoundingBox(prop, text, bb, dpi)
+            return bb[1] - bb[0], bb[3] - bb[2]
+        fmt = self.key.GetLabelFormat() or "%.3g"
+        n = max(self.key.GetNumberOfLabels(), 2)
+        a, b = self._to_track(self.full[0]), self._to_track(self.full[1])
+
+        def label(v):
+            try:
+                return fmt % v
+            except (TypeError, ValueError):             # a format VTK takes but Python's % does not
+                return f"{v:.3g}"
+        texts = [label(self._from_track(a + (b - a) * k / (n - 1))) for k in range(n)]
+        lw, lh = max(size(self.key.GetLabelTextProperty(), t) for t in texts)
+        return bar_w, 1.25 * lw, lh / 2
+
+    def _place_frame(self) -> None:
+        """The frame and the title, centred on the bar: the frame reaches KEY_FRAME_PAD_PX beyond the numbers (right,
+        and the same on the left, where the markers sit) or the title, whichever is wider; the title, measured as
+        drawn, sits above the bar."""
+        if self.frame is None or getattr(self, "_rel", None) is None:
+            return
+        bx, by0, by1 = self.bar()
+        bar_w, label_w, half_h = self._content
+        p = KEY_FRAME_PAD_PX
+        cx = bx + bar_w / 2
+        self.title.SetPosition(cx, by1 + half_h + 6)
+        tb = [0.0, 0.0, 0.0, 0.0]
+        self.title.GetBoundingBox(self.pl.renderer, tb)
+        tw, th = tb[1] - tb[0], tb[3] - tb[2]
+        half = max(bar_w / 2 + self.key.GetTextPad() + label_w, tw / 2) + p
+        x0, x1 = cx - half, cx + half
+        y0 = by0 - half_h - p
+        y1 = by1 + half_h + 6 + th + p * 0.75
+        pts = self.frame.GetMapper().GetInput().GetPoints()
+        for i, (x, y) in enumerate([(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]):
+            pts.SetPoint(i, x, y, 0.0)
+        pts.Modified()
+
+    def bar(self):
+        """The bar's left edge and its bottom and top, in window pixels, now."""
+        fx0, fy0, fx1, fy1 = self._frame_box()
+        rx, ry0, ry1 = self._rel
+        fh = fy1 - fy0
+        return fx0 + rx * (fx1 - fx0), fy0 + ry0 * fh, fy0 + ry1 * fh
+
+    def _y_of(self, v: float) -> float:
+        _, y0, y1 = self.bar()
+        a, b = self._to_track(self.full[0]), self._to_track(self.full[1])
+        return y0 + (self._to_track(v) - a) / (b - a) * (y1 - y0)
+
+    def _value_at(self, y: float) -> float:
+        _, y0, y1 = self.bar()
+        a, b = self._to_track(self.full[0]), self._to_track(self.full[1])
+        return self._from_track(a + (min(max(y, y0), y1) - y0) / max(y1 - y0, 1e-9) * (b - a))
+
+    def add_sliders(self) -> None:
+        """The two markers: a triangle on the key's left edge at the band's bottom and at its top, pointing at the bar,
+        its value beside it (no titles, the user's choice), dragged with the left button. Drawn by the viewer, not VTK
+        slider widgets: those kept their knobs up to a fifth of the track in from each end, so a marker at the
+        band's 20 MPa edge sat at 33 MPa on the key."""
+        import pyvista as pv
+        from vtkmodules.vtkRenderingCore import vtkActor2D, vtkPolyDataMapper2D, vtkTextActor
+        lo, hi = self.full
+        if not hi > lo:
+            return                                      # a uniform field: nothing to filter (VTK's frame stays)
+        # the frame: the viewer's own, round the bar, its numbers and title with even margins; VTK's runs along the
+        # bar's left edge (the user's Plot.jpg, 2026-10-10)
+        from vtkmodules.vtkCommonCore import vtkPoints
+        from vtkmodules.vtkCommonDataModel import vtkCellArray, vtkPolyData
+        pts = vtkPoints()
+        pts.SetNumberOfPoints(5)
+        for i in range(5):
+            pts.SetPoint(i, 0.0, 0.0, 0.0)
+        line = vtkCellArray()
+        line.InsertNextCell(5)
+        for i in range(5):
+            line.InsertCellPoint(i)
+        poly = vtkPolyData()
+        poly.SetPoints(pts)
+        poly.SetLines(line)
+        fmap = vtkPolyDataMapper2D()
+        fmap.SetInputData(poly)
+        self.frame = vtkActor2D()
+        self.frame.SetMapper(fmap)
+        self.frame.GetProperty().SetColor(0, 0, 0)
+        self.frame.GetProperty().SetLineWidth(1.0)
+        self.frame.PickableOff()
+        self.pl.renderer.AddViewProp(self.frame)
+        self.key.DrawFrameOff()
+        # the title drawn by the viewer, centred over the bar and measured as drawn (VTK's ran past the frame on the
+        # user's display)
+        self.title = vtkTextActor()
+        self.title.SetInput(self.key.GetTitle().strip())
+        tprop = self.title.GetTextProperty()
+        tprop.ShallowCopy(self.key.GetTitleTextProperty())
+        tprop.SetJustificationToCentered()
+        tprop.SetVerticalJustificationToBottom()
+        self.title.PickableOff()
+        self.pl.renderer.AddViewProp(self.title)
+        self.key.SetTitle(" ")
+        s = MARKER_SIZE_PX
+        tri = pv.PolyData(np.array([[-s, -s * 0.6, 0], [0, 0, 0], [-s, s * 0.6, 0]], float), faces=np.array([3, 0, 1, 2]))
+        self._items = []
+        for which in ("low", "high"):
+            mapper = vtkPolyDataMapper2D()
+            mapper.SetInputData(tri)
+            mark = vtkActor2D()
+            mark.SetMapper(mapper)
+            mark.GetProperty().SetColor(0.20, 0.45, 0.85)
+            mark.PickableOff()
+            label = vtkTextActor()
+            tp = label.GetTextProperty()
+            tp.SetFontSize(13)
+            tp.SetBold(True)
+            tp.SetColor(0, 0, 0)
+            tp.SetJustificationToRight()
+            tp.SetVerticalJustificationToCentered()
+            label.PickableOff()
+            self.pl.renderer.AddViewProp(mark)
+            self.pl.renderer.AddViewProp(label)
+            self._items.append({"which": which, "mark": mark, "label": label})
+        self._rel = None
+        self.drag = None
+        self._tags = {}
+        self.pl.renderer.AddObserver("StartEvent", self._follow)
+        if self.pl.off_screen:
+            self.pl.render()
+            self._measure()
+            return
+        state = {"done": False}
+
+        def first_draw(*_args):                         # measured after the first draw, from a one-shot timer
+            if state["done"] or self.pl.iren is None:
+                return
+            state["done"] = True
+            iren = self.pl.iren.interactor
+            obs = []
+
+            def measure(*_a):
+                self._measure()
+                self.pl.render()
+                iren.RemoveObserver(obs[0])
+            obs.append(iren.AddObserver("TimerEvent", measure))
+            iren.CreateOneShotTimer(1)
+        self.pl.ren_win.AddObserver("EndEvent", first_draw)
+        iren = self.pl.iren.interactor
+        self._tags["press"] = iren.AddObserver("LeftButtonPressEvent", self._press, 11.0)
+        self._tags["move"] = iren.AddObserver("MouseMoveEvent", self._move, 11.0)
+        iren.AddObserver("LeftButtonReleaseEvent", self._release, 11.0)
+        self.pl.iren.add_observer("LeftButtonReleaseEvent", self._release)    # the route the mouse style passes on
+
+    def _follow(self, *_args) -> None:
+        """Before each draw: each marker at its value on the bar, its label beside it, and the key's frame."""
+        on = getattr(self, "_rel", None) is not None
+        if self.frame is not None:
+            self.frame.SetVisibility(on)
+            self.title.SetVisibility(on)
+            self._place_frame()
+        for it in getattr(self, "_items", []):
+            it["mark"].SetVisibility(on)
+            it["label"].SetVisibility(on)
+            if not on:
+                continue
+            x, _, _ = self.bar()
+            v = self.lo if it["which"] == "low" else self.hi
+            y = self._y_of(v)
+            it["mark"].SetPosition(x - 2, y)
+            it["label"].SetInput(f"{v:.3g}")
+            it["label"].SetPosition(x - MARKER_SIZE_PX - 6, y)
+
+    def _hit(self, x: float, y: float):
+        if getattr(self, "_rel", None) is None:
+            return None
+        bx, _, _ = self.bar()
+        best = None
+        for it in self._items:
+            v = self.lo if it["which"] == "low" else self.hi
+            dy = abs(y - self._y_of(v))
+            if bx - 70 <= x <= bx + 4 and dy <= MARKER_SIZE_PX and (best is None or dy < best[0]):
+                best = (dy, it)
+        return None if best is None else best[1]
+
+    def _press(self, iren, _event) -> None:
+        hit = self._hit(*iren.GetEventPosition())
+        if hit is not None:
+            self.drag = hit
+            iren.GetCommand(self._tags["press"]).SetAbortFlag(1)     # not a rotate, nor a probe click
+
+    def _move(self, iren, _event) -> None:
+        if self.drag is None:
+            return
+        v = self._value_at(iren.GetEventPosition()[1])
+        self.set(v, None) if self.drag["which"] == "low" else self.set(None, v)
+        iren.GetCommand(self._tags["move"]).SetAbortFlag(1)
+
+    def _release(self, *_args) -> None:
+        self.drag = None
+
+    def set(self, lo=None, hi=None, render: bool = True) -> None:
+        """The band from lo to hi (values; None keeps that end); kept in order (the markers do not cross) and within
+        the key's range."""
+        full_lo, full_hi = self.full
+        gap = (full_hi / full_lo) ** 1e-6 if self.log else None
+        eps = 1e-6 * max(full_hi - full_lo, 1e-30)
+        if lo is not None:
+            lo = min(max(float(lo), full_lo), full_hi)
+            self.lo = min(lo, self.hi / gap) if self.log else min(lo, self.hi - eps)
+        if hi is not None:
+            hi = max(min(float(hi), full_hi), full_lo)
+            self.hi = max(hi, self.lo * gap) if self.log else max(hi, self.lo + eps)
+        f = self._function()
+        mapper = self.surface.mapper
+        mapper.SetLookupTable(f)
+        mapper.SetScalarRange(*self.full)
+        self.key.SetLookupTable(f)
+        if render:
+            self.pl.render()
 
 
 class _Markers:
@@ -227,8 +628,14 @@ class _Markers:
             a.GetProperty().SetLineWidth(width)
             a.PickableOff()
             return a
-        leader = pv.PolyData(np.zeros((2, 3)), lines=np.array([2, 0, 1]))
-        line = actor2d(leader, (0, 0, 0), 1.5)
+        # the leader: alternating black and white dashes, rebuilt as it moves (_follow), so it shows on any
+        # background (the user's Max.jpg, 2026-10-10: a thin black line was lost on a dark model)
+        from .plots import dashed
+        line = actor2d(dashed([[0, 0, 0]], [[1, 0, 0]], 1.0), (0, 0, 0), 2.0)
+        lmap = line.GetMapper()
+        lmap.SetScalarModeToUseCellData()
+        lmap.SetColorModeToDirectScalars()
+        lmap.ScalarVisibilityOn()
         ang = np.linspace(0, 2 * np.pi, 20, endpoint=False)
 
         def disc(r):                                     # a filled circle of radius r pixels round (0, 0)
@@ -238,7 +645,7 @@ class _Markers:
         label.PickableOff()
         for a in (line, outer, inner, label):
             self.pl.renderer.AddViewProp(a)
-        return {"label": label, "line": line, "leader": leader.GetPoints(), "dots": (outer, inner), "custom": None}
+        return {"label": label, "line": line, "dots": (outer, inner), "custom": None}
 
     def positions(self) -> list:
         """The markers' points on the shape as now shown (deformation scale x load fraction)."""
@@ -304,9 +711,8 @@ class _Markers:
             for a in it["dots"]:
                 a.SetVisibility(self.on and inside)
             sx, sy = (dx, dy) if inside else _clip_to(ex, ey, dx, dy, (fx0, fy0, fx1, fy1))
-            it["leader"].SetPoint(0, sx, sy, 0.0)
-            it["leader"].SetPoint(1, ex, ey, 0.0)
-            it["leader"].Modified()
+            from .plots import dashed
+            it["line"].GetMapper().SetInputData(dashed([[sx, sy, 0.0]], [[ex, ey, 0.0]], LEADER_DASH_PX))
 
     # ---------------------------------------------------------------- dragging
 
@@ -526,7 +932,7 @@ class _LoadAnimation:
             if "yield MPa" in self.base.point_data:
                 vm = np.asarray(self.base.point_data["von Mises MPa"], float) * t
                 fy = np.asarray(self.base.point_data["yield MPa"], float)
-                vals = np.where(vm > 1e-12, fy / np.maximum(vm, 1e-12), cap)
+                vals = np.where(np.isnan(vm), np.nan, np.where(vm > 1e-12, fy / np.maximum(vm, 1e-12), cap))
             else:
                 vals = full / max(t, 1e-12)
             vals = np.minimum(vals, cap)
@@ -731,13 +1137,144 @@ def probe_values(mesh, cell: int, x, meta: dict, values=None) -> dict:
         if name not in data.point_data:
             return None
         return float(np.asarray(data.point_data[name])[ids[corners]] @ w_all)
-    vm, um, fy = at("von Mises MPa"), at("|U| mm"), at("yield MPa")
+    vm, um, fy, fu = at("von Mises MPa"), at("|U| mm"), at("yield MPa"), at("ultimate MPa")
     parts = meta.get("parts") or []
     k = int(np.asarray(data.point_data["part"])[ids[corners[int(np.argmax(w_all))]]]) if "part" in data.point_data \
         else None
+    edge = at("joint edge")
     return {"part": parts[k] if k is not None and k < len(parts) else None, "von_mises": vm, "displacement": um,
+            "joint_edge": edge is not None and edge >= 0.5,
             "fos": (fy / vm if vm and vm > 1e-12 else float("inf")) if fy is not None else at("FoS on yield"),
+            "fos_ultimate": (fu / vm if vm and vm > 1e-12 else float("inf")) if fu is not None and np.isfinite(fu)
+            else None,
             "ids": ids[corners], "weights": w_all}
+
+
+def feature_edges(points, cells: list, feature_deg: float) -> np.ndarray:
+    """The outline of a set of facets, as point-id pairs (m x 2): edges on one facet only (open edges), on
+    three or more (junctions), and edges where the two facets turn more than feature_deg. cells: one array
+    of point ids per facet (triangles and quads). Ids index ``points`` (the whole model's), so the outline
+    can follow the deformed shape."""
+    P = np.asarray(points, float)
+    edges, owner, normals = [], [], np.zeros((len(cells), 3))
+    for i, c in enumerate(cells):
+        c = np.asarray(c, np.int64)
+        edges.append(np.c_[c, np.roll(c, -1)])
+        owner.append(np.full(len(c), i))
+        normals[i] = np.cross(P[c[2 % len(c)]] - P[c[0]], P[c[-1]] - P[c[1]])  # the diagonals (a triangle: an edge pair)
+    if not edges:
+        return np.zeros((0, 2), np.int64)
+    E, f = np.sort(np.concatenate(edges), axis=1), np.concatenate(owner)
+    normals /= np.maximum(np.linalg.norm(normals, axis=1), 1e-30)[:, None]
+    key, inv, count = np.unique(E, axis=0, return_inverse=True, return_counts=True)
+    inv = inv.ravel()
+    order = np.argsort(inv, kind="stable")
+    first = np.searchsorted(inv[order], np.arange(len(key)))
+    f1, f2 = f[order[first]], f[order[np.minimum(first + 1, len(order) - 1)]]
+    turned = np.einsum("ij,ij->i", normals[f1], normals[f2]) < np.cos(np.radians(feature_deg))
+    return key[(count != 2) | turned]
+
+
+class _Outlines:
+    """A right-click on a part draws it as its outline (its feature edges, as the undeformed shape is drawn)
+    instead of a coloured surface, so the parts it hides can be seen and probed. A right-click on an outline
+    brings that part back; a right-click on the background brings them all back. A right drag still pans.
+    The outlines follow the shape as the deformation slider and the load animation move it."""
+
+    def __init__(self, pl, surface_actor, mesh):
+        from vtkmodules.vtkRenderingCore import vtkCellPicker
+        from vtkmodules.util.numpy_support import vtk_to_numpy
+        self.pl, self.surface, self.mesh = pl, surface_actor, mesh
+        polys = mesh.GetPolys()
+        offsets = vtk_to_numpy(polys.GetOffsetsArray()).astype(np.int64)
+        conn = vtk_to_numpy(polys.GetConnectivityArray()).astype(np.int64)
+        self.cells = [conn[a:b] for a, b in zip(offsets[:-1], offsets[1:])]   # every facet, as first drawn
+        self.faces = np.asarray(mesh.faces).copy()                           # the same, as a pyvista face list
+        sizes = np.diff(offsets)
+        self.entry_cell = np.repeat(np.arange(len(sizes)), sizes + 1)       # each face-list entry's facet
+        part = np.asarray(mesh.point_data["part"]) if "part" in mesh.point_data else np.zeros(mesh.n_points, int)
+        self.cell_part = part[conn[offsets[:-1]]] if len(sizes) else np.zeros(0, int)
+        self.lines: dict = {}            # part index -> (line actor, its polydata, its points' ids in the model)
+        self.picker = vtkCellPicker()
+        self.picker.SetTolerance(OUTLINE_PICK_TOLERANCE)
+        self.picker.PickFromListOn()
+        self.picker.AddPickList(surface_actor)
+        self.down = None
+        self.points_time = 0
+        pl.renderer.AddObserver("StartEvent", self._follow)
+
+    def attach(self) -> None:
+        # through pyvista's add_observer, as the probe: the mouse style passes the release on that way
+        self.pl.iren.add_observer("RightButtonPressEvent", self._press)
+        self.pl.iren.add_observer("RightButtonReleaseEvent", self._release)
+
+    def _press(self, *_args) -> None:
+        self.down = self.pl.iren.interactor.GetEventPosition()
+
+    def _release(self, *_args) -> None:
+        up, down, self.down = self.pl.iren.interactor.GetEventPosition(), self.down, None
+        if down is not None and abs(up[0] - down[0]) <= CLICK_PX and abs(up[1] - down[1]) <= CLICK_PX:
+            self.click(*up)
+
+    def click(self, x: int, y: int) -> None:
+        """x, y: window pixels from the bottom left. A part's surface: outline it; an outline: restore that
+        part; the background: restore every part. Outside the border nothing changes."""
+        x0, y0, x1, y1 = frame_rect(*self.pl.renderer.GetRenderWindow().GetSize())
+        if not (x0 < x < x1 and y0 < y < y1):
+            return
+        hit = self.picker.Pick(x, y, 0, self.pl.renderer) and self.picker.GetCellId() >= 0
+        actor = self.picker.GetActor() if hit else None
+        if actor is self.surface:
+            # the picked facet's part, read from the facets drawn now (outlined parts' facets are gone)
+            k = int(np.asarray(self.mesh.point_data["part"])[self.mesh.get_cell(self.picker.GetCellId()).point_ids[0]]) \
+                if "part" in self.mesh.point_data else 0
+            self.outline(k)
+        elif actor is not None:
+            self.restore(next(k for k, v in self.lines.items() if v[0] is actor))
+        else:
+            for k in list(self.lines):
+                self.restore(k, show=False)
+            self._show_facets()
+        self.pl.render()
+
+    def outline(self, k: int) -> None:
+        """Draw part k as its outline instead of its coloured surface."""
+        import pyvista as pv
+        if k in self.lines:
+            return
+        cells = [c for c, p in zip(self.cells, self.cell_part) if p == k]
+        pairs = feature_edges(self.mesh.points, cells, GHOST_FEATURE_DEG)
+        ids, local = np.unique(pairs, return_inverse=True)
+        poly = pv.PolyData(np.asarray(self.mesh.points)[ids],
+                           lines=np.c_[np.full(len(pairs), 2), local.reshape(-1, 2)].ravel())
+        actor = self.pl.add_mesh(poly, color=OUTLINE_COLOUR, line_width=1.5, reset_camera=False, render=False)
+        self.picker.AddPickList(actor)
+        self.lines[k] = (actor, poly, ids)
+        self._show_facets()
+
+    def restore(self, k: int, show: bool = True) -> None:
+        """Draw part k as a coloured surface again."""
+        actor = self.lines.pop(k)[0]
+        self.picker.DeletePickList(actor)
+        self.pl.remove_actor(actor, render=False)
+        if show:
+            self._show_facets()
+
+    def _show_facets(self) -> None:
+        # the coloured surface keeps only the facets of parts not outlined; its points (and so their values and
+        # the probe's facets) are unchanged
+        keep = ~np.isin(self.cell_part, list(self.lines))
+        self.mesh.faces = self.faces[keep[self.entry_cell]]
+
+    def _follow(self, *_args) -> None:
+        """Move the outlines with the shape (before each render; only when the shape has moved)."""
+        t = self.mesh.GetPoints().GetMTime()
+        if not self.lines or t == self.points_time:
+            return
+        self.points_time = t
+        X = np.asarray(self.mesh.points)
+        for _actor, poly, ids in self.lines.values():
+            poly.points = X[ids]
 
 
 class _Probe:
@@ -804,9 +1341,17 @@ class _Probe:
         vm = None if v["von_mises"] is None else v["von_mises"] * t
         um = None if v["displacement"] is None else v["displacement"] * t
         fos = None if v["fos"] is None else (v["fos"] / t if t > 1e-9 else float("inf"))
-        rows = {"vonmises": f"von Mises {vm:.3g} MPa" if vm is not None else None,
+        fu = v.get("fos_ultimate")
+        fu = None if fu is None else (fu / t if t > 1e-9 else float("inf"))
+        joint = vm is not None and np.isnan(vm)            # a part not assessed (a bush): no stress or FoS
+        beside = " (joint edge: the stress beside it)" if v.get("joint_edge") else ""
+        rows = {"vonmises": "not assessed (bearing check by hand)" if joint else
+                (f"von Mises {vm:.3g} MPa{beside}" if vm is not None else None),
                 "displacement": f"displacement {um:.3g} mm" if um is not None else None,
-                "fos": None if fos is None else ("FoS > 1000" if fos > 1000 else f"FoS {fos:.3g}")}
+                "fos": None if fos is None or joint else ("FoS > 1000" if fos > 1000 else
+                                                          f"FoS {fos:.3g} yield" + (f", {fu:.3g} ultimate"
+                                                                                    if fu is not None and fu <= 1000
+                                                                                    else ""))}
         order = [self.field] + [f for f in ("vonmises", "displacement", "fos") if f != self.field]
         lines = ([short_part(v["part"], self.meta.get("parts") or [])] if v["part"] else []) + [rows[f] for f in order if rows[f]]
         if self.meta.get("run_mode") == "fast":

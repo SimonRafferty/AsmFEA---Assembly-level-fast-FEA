@@ -192,6 +192,7 @@ class MeshPrefs(_M):
     solver: Literal["auto", "calculix", "hybrid"] = "auto"                # advanced override of the solver
     size: Optional[float] = None
     convergence_check: Optional[bool] = None                              # advanced override (None: the planner)
+    refine_unconverged: Optional[bool] = None                             # advanced override: a third, local pass
 
 
 class Limits(_M):

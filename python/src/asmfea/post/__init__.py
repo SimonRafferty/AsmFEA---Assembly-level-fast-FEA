@@ -40,8 +40,11 @@ def _wall_thickness(model: Model, deck_info: dict | None = None) -> dict:
 
 def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
               tie_nodes: dict[str, np.ndarray], model_size: float,
-              singular_by_imbalance: bool = True) -> tuple[dict, list[Diagnostic]]:
-    """tie_nodes: per part, global ids of nodes within one element of a tie boundary.
+              singular_by_imbalance: bool = True,
+              edge_nodes: dict[str, np.ndarray] | None = None) -> tuple[dict, list[Diagnostic]]:
+    """tie_nodes: per part, global ids of nodes within the joint band (a part wholly inside is not assessed).
+    edge_nodes: per part, the joint edges (the elements on a joint's edge line), left out of the peak; the band
+    when not given.
     model_size: diagonal of the assembly bounding box, mm. singular_by_imbalance: an unbalanced reaction on
     its own declares the model singular (the full run); a fast run needs huge displacements as well, because
     a tie whose master face holds fixed nodes passes load into the supports that CalculiX's RF omits (a 17 %
@@ -68,18 +71,27 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
                 continue
             ids, v = sn[sel], vm[sel]
             i = int(np.argmax(v))
-            excl = np.isin(ids, tie_nodes.get(inst["part"], np.empty(0, dtype=np.int64)))
-            if (~excl).any():
-                j = int(np.argmax(np.where(excl, -np.inf, v)))
-            else:
-                j = i
+            none = np.empty(0, dtype=np.int64)
+            in_band = np.isin(ids, tie_nodes.get(inst["part"], none))
+            excl = in_band if edge_nodes is None else np.isin(ids, edge_nodes.get(inst["part"], none))
+            # a part lying wholly within joint bands (a bush between hinges) has no stress to assess: its peaks
+            # are all at its joints, so it gives no factor of safety (bearing on bushes and pins is a hand check);
+            # its raw peak stays for reference. It used to fall back to the raw peak and governed (2026-10-09)
+            joint_only = not (~in_band).any() or not (~excl).any()
+            j = i if joint_only else int(np.argmax(np.where(excl, -np.inf, v)))
             mat = model.material(inst["material"])
             usel = (un >= lo) & (un <= hi)
             ju = int(np.argmax(np.where(usel, umag, -np.inf)))
             parts[inst["part"]] = {
                 "peak_vm": float(v[i]), "peak_vm_node": int(ids[i]), "peak_vm_at": at(ids[i]),
-                "peak_vm_excl_ties": float(v[j]), "peak_vm_excl_ties_at": at(ids[j]),
-                "min_fos": mat.yield_ / float(v[j]) if v[j] > 0 else None,
+                "peak_vm_excl_ties": None if joint_only else float(v[j]),
+                "peak_vm_excl_ties_at": None if joint_only else at(ids[j]),
+                "joint_only": joint_only,
+                "min_fos": mat.yield_ / float(v[j]) if v[j] > 0 and not joint_only else None,
+                # on ultimate too (the user's request, 2026-10-10): the margin left before fracture, beside the one
+                # before yield; whether some yielding is acceptable is the engineer's judgement
+                "min_fos_ultimate": (mat.ultimate / float(v[j]) if mat.ultimate and v[j] > 0 and not joint_only
+                                     else None),
                 "max_disp": float(umag[ju]) if usel.any() else 0.0,
                 "max_disp_at": at(un[ju]) if usel.any() else None,
             }
@@ -265,11 +277,22 @@ def _rel(a: float, b: float) -> float:
     return abs(b - a) / ref if ref > 0 else 0.0
 
 
-def convergence(base: dict, refined: dict) -> tuple[dict, list[Diagnostic]]:
-    """Change in max displacement and peak stress per part between the two meshes.
+def assessed_stress(p: dict) -> float | None:
+    """A part's stress as the factor of safety has it: membrane plus bending where it was classified (D34; at
+    joints too, 2026-10-10), else the peak away from the joint edges. None for a part not assessed (joint only)."""
+    if p.get("joint_only"):
+        return None
+    v = p.get("membrane_bending")
+    return v if v is not None else p.get("peak_vm_excl_ties")
 
-    The check uses the stress peak excluding tie boundaries; the raw peak is reported
-    too but sits on singular points (tie edges, re-entrant corners) that never converge.
+
+def convergence(base: dict, refined: dict) -> tuple[dict, list[Diagnostic]]:
+    """Change in max displacement and assessed stress per part between the two meshes.
+
+    The stress graded is the one the factor of safety uses (assessed_stress: membrane plus bending), not the peak:
+    a peak at a joint's sharp edge or a re-entrant corner has no finite value and moves with every mesh (20.6 % on
+    the folding step's plates, worse on the finest mesh; the user's run, 2026-10-10). The peaks' own changes are
+    kept for reference (peak_vm_excl_ties, peak_vm_raw).
     """
     out, worst, offenders, singular = {}, 0.0, {}, {}
     for case, r in refined["load_cases"].items():
@@ -277,22 +300,40 @@ def convergence(base: dict, refined: dict) -> tuple[dict, list[Diagnostic]]:
         if b is None:
             continue
         rows = {}
+        # a part's displacement change is measured against the model's largest displacement, not the part's own:
+        # a small part that barely moves (a plastic bush on a hinge) changed by 68 % of its own 0.01 mm and made a
+        # whole folding step "Indicative", while every structural part had settled within 6 % (the user's
+        # observation, 2026-10-09: the deflections were right). The part's own change is kept as max_disp_own
+        model_disp = max(abs(b["max_disp"]), abs(r["max_disp"]), 1e-30)
+        # and a part's stress change against the model's highest assessed stress, for the grade: a step plate at
+        # 20 MPa (factor of safety 10) changed by 20 % (4 MPa) while the governing 125 MPa cheek changed 4 %; the
+        # part's own change is kept (stress) and still finds singular points
+        model_vm = max([v for lc_ in (b, r) for x in lc_["parts"].values()
+                        if (v := assessed_stress(x)) is not None] or [1e-30])
         for part, p in r["parts"].items():
             q = b["parts"].get(part)
             if q is None:
                 continue
-            d = {"max_disp": _rel(q["max_disp"], p["max_disp"]),
-                 "peak_vm_excl_ties": _rel(q["peak_vm_excl_ties"], p["peak_vm_excl_ties"]),
+            sp, sq = assessed_stress(p), assessed_stress(q)
+            assessed = sp is not None and sq is not None
+            peaks = p.get("peak_vm_excl_ties") is not None and q.get("peak_vm_excl_ties") is not None
+            d = {"max_disp": abs(p["max_disp"] - q["max_disp"]) / model_disp,
+                 "max_disp_own": _rel(q["max_disp"], p["max_disp"]),
+                 # a part wholly within joint bands has no assessed stress to converge (see results)
+                 "stress": _rel(sq, sp) if assessed else 0.0,
+                 "stress_model": abs(sp - sq) / model_vm if assessed else 0.0,
+                 "peak_vm_excl_ties": _rel(q["peak_vm_excl_ties"], p["peak_vm_excl_ties"]) if peaks else 0.0,
                  "peak_vm_raw": _rel(q["peak_vm"], p["peak_vm"])}
             rows[part] = d
-            # deflection settled but the peak keeps rising with refinement: a singular point (D32)
-            rise = (p["peak_vm_excl_ties"] - q["peak_vm_excl_ties"]) / max(q["peak_vm_excl_ties"], 1e-30)
+            # deflection settled but the stress keeps rising with refinement: a singular point (D32)
+            rise = (sp - sq) / max(sq, 1e-30) if assessed else 0.0
             if d["max_disp"] <= defaults.CONVERGENCE_TOL and rise > defaults.SINGULAR_RISE:
                 p["singular"] = True
-                singular.setdefault(part, []).append(f"{case}: +{rise:.0%} at {p.get('peak_vm_excl_ties_at')}")
+                at = p.get("membrane_bending_at") or p.get("peak_vm_excl_ties_at")
+                singular.setdefault(part, []).append(f"{case}: +{rise:.0%} at {at}")
                 d["singular"] = True
                 continue
-            w = max(d["max_disp"], d["peak_vm_excl_ties"])
+            w = max(d["max_disp"], d["stress_model"])
             worst = max(worst, w)
             if w > defaults.CONVERGENCE_TOL:
                 offenders.setdefault(part, []).append(f"{case}: {w:.1%}")
@@ -316,6 +357,19 @@ def convergence(base: dict, refined: dict) -> tuple[dict, list[Diagnostic]]:
     return {"worst_change": worst, "by_case": out}, diags
 
 
+# Poor convergence on the finest fidelity already (Optimise for Accuracy): "use a finer mesh" is no help there (the
+# user's point, 2026-10-10)
+CONVERGENCE_AT_FINEST = [
+    "The study is already on the finest mesh (Optimise for Accuracy). Look at the parts named in the convergence "
+    "warning: the change is usually at one place, a joint or a notch where the elements are large next to the wall "
+    "or the detail.",
+    "The refined mesh's result is the one reported, and it is the more accurate of the two. Where the stress there "
+    "rose on the finer mesh, the true value may be somewhat higher again: allow for the change shown before relying "
+    "on a small margin.",
+    "If the place is a sharp corner, a fillet in the model (as made) settles it: a sharp corner has no finite stress.",
+]
+
+
 # What each check means and what to do when it fails, for the task pane's More Info (the user's request) and the
 # report. {case}, {part}, {tol} are filled in per row.
 CHECK_TEXT = {
@@ -328,21 +382,30 @@ CHECK_TEXT = {
                    ["If it fails: stiffen the part that moves most (a deeper section, a brace, a shorter span) or "
                     "relax the limit if it was too strict."]),
     "fos": ("The lowest factor of safety under load case {case}, in {part}: the material's yield strength divided by "
-            "the von Mises stress. Away from bonded joints the peak stress is used; at bonded joints the structural "
-            "(membrane plus bending) stress, so the spikes at sharp tie edges, which are not real, do not count. "
+            "the von Mises stress of membrane plus bending: the stress averaged through the wall plus its linear "
+            "part, everywhere including round the joints. Local peaks (notches, the spikes at sharp joint edges, "
+            "which have no finite value in a model with sharp corners) are left out, as static design codes do. "
             "Compared with the minimum set under Pass / fail criteria on the Study tab.",
             ["If it fails: look at the stress plot for where it peaks, then strengthen there (thicker, a larger "
              "section, a gusset or a bigger weld) or use a stronger material.",
              "A peak marked singular is at a sharp corner or edge where stress has no finite value: refine there "
              "or judge it by the stress just away from it."]),
-    "stress": ("The highest von Mises stress under load case {case}, away from bonded joints, in {part}, against "
+    "fos_ultimate": ("The lowest factor of safety on ultimate strength under load case {case}, in {part}: the material's "
+                     "ultimate tensile strength divided by the same assessed stress (membrane plus bending). It shows the "
+                     "margin left before fracture beside the one before yield; for information, with no pass or fail. "
+                     "The analysis is linear: past yield its stresses are no longer the real ones, so this is an index of "
+                     "the reserve, not a predicted failure load (on the safe side for ductile metals).",
+                     ["Whether some yielding before that is acceptable is the engineer's judgement: compare the factor "
+                      "on yield (no permanent set) with this one (no fracture)."]),
+    "stress": ("The highest von Mises stress of membrane plus bending under load case {case}, in {part}, against "
                "the allowable stress set under Pass / fail criteria on the Study tab.",
                ["If it fails: strengthen where the stress plot peaks, or use a material with a higher allowable."]),
     "buckling": ("The lowest buckling load factor for load case {case}: how many times the load the structure can "
                  "carry before it buckles. Below 1 it buckles under the load as applied.",
                  ["If it fails: brace the member that buckles (see the buckling mode plot), shorten its free "
                   "length or use a stiffer section."]),
-    "convergence": ("How much the results changed between the base mesh and a finer one. Under {tol} the mesh is "
+    "convergence": ("How much the results changed between the base mesh and a finer one: deflections, and the "
+                    "assessed stress (membrane plus bending, the factor of safety's own). Under {tol} the mesh is "
                     "fine enough for these results; more means the results depend on the mesh.",
                     ["If it fails: optimise for Accuracy (a finer mesh), or look at the part named in the "
                      "convergence warning."]),
@@ -357,16 +420,19 @@ CHECK_TEXT = {
 
 
 def checks(model: Model, results: dict, open_exceptions: int, mesh_failed: int = 0,
-           floating: int = 0) -> list[dict]:
+           floating: int = 0, fidelity: str | None = None) -> list[dict]:
     """PASS / WARN / FAIL rows with measured value and limit, and for More Info what each means (`explain`), where
     it governs (`where`: load case and part) and what to do (`actions`)."""
     rows = []
     lim = model.study.limits if model.study else None
 
     def row(name, value, limit, ok, bad="WARN", kind=None, case=None, part=None, tol=None):
-        r = {"check": name, "value": value, "limit": limit, "status": "PASS" if ok else bad}
+        # ok None: for information only, no pass or fail (status INFO)
+        r = {"check": name, "value": value, "limit": limit, "status": "INFO" if ok is None else "PASS" if ok else bad}
         if kind:
             text, actions = CHECK_TEXT[kind]
+            if kind == "convergence" and fidelity == "fine":
+                actions = CONVERGENCE_AT_FINEST          # a finer mesh is not on offer: say what to do instead
             r["explain"] = text.format(case=case or "-", part=part or "-", tol=tol or "-")
             r["actions"] = actions
             r["where"] = {"load_case": case, "parts": [part] if part else []}
@@ -393,10 +459,16 @@ def checks(model: Model, results: dict, open_exceptions: int, mesh_failed: int =
             # a governing peak flagged singular (D32) is not a real stress: a warning, not a fail
             row(f"Min factor of safety [{case}]" + (" (singular peak, see warning)" if sing else ""), v, lim.min_fos,
                 v is not None and v >= lim.min_fos, "WARN" if sing else "FAIL", kind="fos", case=case, part=where)
+        # on ultimate too, for information: the margin before fracture; whether some yield is acceptable is the
+        # engineer's judgement (the user's request, 2026-10-10)
+        fu = [(p["min_fos_ultimate"], n) for n, p in r["parts"].items() if p.get("min_fos_ultimate")]
+        if fu:
+            v, where = min(fu)
+            row(f"Min factor of safety on ultimate [{case}]", v, None, None, kind="fos_ultimate", case=case, part=where)
         if lim and lim.max_stress:
-            # the peak away from bonded joints, as min_fos uses (D53); a singular peak warns, as there
-            pk = [(p["peak_vm_excl_ties"], bool(p.get("singular")), n) for n, p in r["parts"].items()
-                  if p.get("peak_vm_excl_ties") is not None]
+            # the stress min_fos uses (membrane plus bending, at joints too; D53, 2026-10-10); a singular one warns
+            pk = [(v, bool(p.get("singular")), n) for n, p in r["parts"].items()
+                  if (v := assessed_stress(p)) is not None]
             v, sing, where = max(pk) if pk else (None, False, None)
             row(f"Max stress [{case}]" + (" (singular peak, see warning)" if sing else ""), v, lim.max_stress,
                 v is not None and v <= lim.max_stress, "WARN" if sing else "FAIL", kind="stress", case=case, part=where)

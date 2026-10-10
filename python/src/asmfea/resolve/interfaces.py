@@ -153,20 +153,42 @@ def _plane_cyl(pa, fa, pb, fb, gap, lines):
         lines.append(rec)
 
 
-def find_interferences(geoms: dict[str, PartGeometry]) -> list[dict]:
+def _shape_key(g: PartGeometry) -> list:
+    """What a part's overlap with another depends on: its solid (file, index, volume, faces) where it stands
+    (its assembly-frame box)."""
+    return [g.step, g.solid_index, round(g.volume, 6), [round(float(x), 6) for x in g.bbox], len(g.faces),
+            round(sum(f.area for f in g.faces), 6)]
+
+
+def find_interferences(geoms: dict[str, PartGeometry], cache: dict | None = None) -> list[dict]:
     """Pairs of solids overlapping by more than OVERLAP_VOL_TOL (mm^3). Pairs bonded across an
-    overlap within the bond tolerance are dropped by the caller."""
-    out = []
+    overlap within the bond tolerance are dropped by the caller.
+
+    ``cache``: {pair key: overlap volume} from earlier analyses, read and updated. The overlap of two solids is a
+    boolean intersection, by far the slowest step of the connection analysis (326 s of 327 on an 18-part folding
+    step with a detailed window regulator), and depends only on the two parts' shapes and positions: a hinge or
+    a connection setting changes neither, so the pair is not intersected again (the user's question, 2026-10-09)."""
+    import hashlib
+    import json
+    out, used = [], set()
     ids = sorted(geoms)
     for i, pa in enumerate(ids):
         for pb in ids[i + 1:]:
             ga, gb = geoms[pa], geoms[pb]
             if not bbox_overlap(ga.bbox, gb.bbox, -defaults.OVERLAP_TOL):
                 continue
-            res = common(ga.solid, gb.solid)
-            if res is None:
-                continue
-            vol, _ = volume_props(res)
+            key = hashlib.sha1(json.dumps([_shape_key(ga), _shape_key(gb)]).encode()).hexdigest()
+            used.add(key)
+            if cache is not None and key in cache:
+                vol = cache[key]
+            else:
+                res = common(ga.solid, gb.solid, defaults.OVERLAP_FUZZY_MM)
+                vol = 0.0 if res is None else volume_props(res)[0]
+                if cache is not None and res is not None:
+                    cache[key] = vol
             if vol > defaults.OVERLAP_VOL_TOL:
                 out.append({"parts": [pa, pb], "volume": vol})
+    if cache is not None:
+        for k in [k for k in cache if k not in used]:   # pairs that no longer exist (a part changed or moved)
+            del cache[k]
     return out

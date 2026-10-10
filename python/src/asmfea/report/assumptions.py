@@ -14,10 +14,18 @@ ALWAYS = [
     "through the thickness or along the member (one element through a wall), other regions with tetrahedra. "
     "Regions and parts are joined by tied constraints; no conformal mesh is made across them.",
 
-    "Peak stresses at sharp re-entrant corners, at fixture edges and at the edges of tied interfaces are "
-    "singular and do not converge with mesh refinement. Each part therefore reports two peaks: the raw peak, and "
-    "the peak excluding nodes within one element of a tie boundary. The factor of safety uses the second. "
-    "Neither figure excludes singular points at fixture edges or sharp corners.",
+    "Peak stresses at sharp re-entrant corners, at fixture edges and at the edges of joints are singular: in a "
+    "model with sharp corners they have no finite value and grow with every mesh refinement. Static strength is "
+    "therefore judged, as in ASME VIII Div. 2 Part 5, on the membrane plus bending stress: the stress averaged "
+    "through the wall plus its linear part, found at the most stressed points of every part, round the joints as "
+    "well as away from them. Local peaks above it (notches, the stress next to a joint's edge) matter for fatigue, "
+    "not for static strength; the plots show them in magenta beyond the colour key, so they do not hide the rest. "
+    "On the joint edges themselves (the elements along the edge of a bond, a slide's footprint or a hinge's face) "
+    "the stress is a modelling artefact and is not used; the plots show the stress just beside them there.",
+    "The factor of safety is given on yield (no permanent deformation) and on ultimate strength (the margin left "
+    "before fracture). The analysis is linear elastic: past yield its stresses are no longer the real ones, so the "
+    "factor on ultimate is an index of the reserve, not a predicted failure load; for ductile metals it is on the "
+    "safe side. Whether some yielding is acceptable is the engineer's judgement.",
     "Fixtures are rigid: a fixed face cannot move at all, which stiffens the structure next to it compared with "
     "a real support.",
 ]
@@ -110,6 +118,9 @@ def joints(revolute: int, sliding: int) -> list[str]:
     if revolute:
         out.append(f"{revolute} revolute joint(s) are linear idealisations: rigid couplings that leave rotation about "
                    "the joint axis free, with no friction or clearance.")
+        out.append("Parts that lie wholly within a hinge's joint band (bushes, washers) are not assessed: a hinge's "
+                   "rigid coupling gives a peak there that grows with mesh refinement. Check the bearing pressure on "
+                   "pins and bushes by hand. The parts round a hinge are assessed by their membrane plus bending stress.")
     if sliding:
         out.append(f"{sliding} sliding joint(s) are linear idealisations that leave translation along the slide free.")
     return out
@@ -170,14 +181,13 @@ def joint_band(bonded: bool) -> list[str]:
     from .. import defaults
     return [f"Bonded joints are assessed by their structural stress: the membrane plus bending stress of the member's "
             f"section at the joint, from the forces the joint carries (Dong's mesh-insensitive method, Battelle). The "
-            f"stress right at a sharp bonded edge is singular (it grows as the mesh is refined) and is not used; member "
-            f"peaks are read at least {defaults.JOINT_BAND_T:g} x the wall thickness (and {defaults.JOINT_BAND_MIN:g} mm) "
-            f"from a bond. The raw peak is shown in brackets. Weld throats and the wall of the part a member is bonded "
-            f"onto are not assessed by this method.",
+            f"stress right at a sharp bonded edge is singular (it grows as the mesh is refined) and is not used. The "
+            f"wall a member is bonded onto is assessed by its membrane plus bending stress through the wall at the "
+            f"joint. Weld throats are not assessed.",
             "Member stresses are classified as in ASME VIII Div. 2 Part 5: the factor of safety uses the membrane plus "
             "bending stress, linearised along a line through the material at the most stressed points (across the "
-            "ligament at a notch in a sheet's outline, through the wall elsewhere). Local notch peaks above it are "
-            "relevant to fatigue, not static strength, and are shown for reference only."]
+            "ligament at a notch in a sheet's outline, through the wall elsewhere), including round the joints. Local "
+            "peaks above it are relevant to fatigue, not static strength, and are shown for reference only."]
 
 
 def weldment(butts: int, edges: int, tolerance: float | None) -> list[str]:
