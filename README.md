@@ -34,16 +34,6 @@ The bundled Python runtime is the official embeddable package, <https://www.pyth
 
 The SolidWorks models of the verification cases are in [`cases/verification`](cases/verification): each case's `sw` folder holds its assembly and parts, with the study stored in the assembly. They use the SHS 100×100×5 weldment profile in `_profiles` and the material "S355 verification" from `_materials/AsmFEA Verification.sldmat` (copy it into SolidWorks' Custom Materials folder).
 
-## Material libraries
-
-[`materials`](materials) holds SolidWorks material libraries to copy into SolidWorks' Custom Materials folder:
-
-- **igus iglidur.sldmat:** 13 iglidur plain-bearing grades from igus' published data (modulus, compressive strength as yield, flexural strength, density, thermal properties; Poisson's ratio, which igus do not publish, estimated from each grade's stiffness and description). Each material's description gives its maximum recommended surface pressure for the bearing check.
-- **Structural steel EN 10025-2.sldmat:** S275 and S355, with the minimum yield of each thickness band (up to 16, 16-40 and 40-63 mm) and minimum tensile strength, and EN 1993-1-1 physical properties.
-- **Stainless 304 by supply condition.sldmat:** 1.4301 and 1.4307 (304 / 304L) cold-rolled 2B sheet and hot-rolled 1D plate to EN 10088-2, and 304 1/4 and 1/2 hard to ASTM A666, at the standards' minimum values.
-
-`make_sldmat.py` writes them from `igus_data.json` and the tables in the script.
-
 ## How it works
 
 1. **The SolidWorks add-in** (`addin/`, C#, .NET Framework 4.8) extracts the model: geometry as one STEP file per part, materials, members, mates, fasteners, loads and fixtures. It does no analysis and never modifies your documents.
