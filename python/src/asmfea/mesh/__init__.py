@@ -315,7 +315,9 @@ def mesh_parts(tasks: list[dict], workers: int, on_done: Callable[[dict, dict], 
     results: dict[str, dict] = {}
     todo = []
     for t in tasks:
-        if Path(t["out"]).exists() and not force:
+        # a cached mesh holding a flat tet (made before D86 refused them) is meshed again
+        flat = _report(t).get("quality", {}).get("min_tet_quality", 1.0) < defaults.TET_FLAT_QUALITY
+        if Path(t["out"]).exists() and not force and not flat:
             results[t["key"]] = {**_report(t), "ok": True, "cached": True}
             on_done(t, results[t["key"]])
         else:

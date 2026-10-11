@@ -21,7 +21,11 @@ ALWAYS = [
     "well as away from them. Local peaks above it (notches, the stress next to a joint's edge) matter for fatigue, "
     "not for static strength; the plots show them in magenta beyond the colour key, so they do not hide the rest. "
     "On the joint edges themselves (the elements along the edge of a bond, a slide's footprint or a hinge's face) "
-    "the stress is a modelling artefact and is not used; the plots show the stress just beside them there.",
+    "the stress is a modelling artefact and is not used; the plots show the stress just beside them there. The "
+    "same holds within a band round the edge of a loaded face, where the load's even spread stops abruptly: the "
+    "stress there belongs to the idealised load, not the structure, and is not assessed. Where the stress read "
+    "beside a joint rose on the finer mesh while the deflection settled (a singular point), the part's factor of "
+    "safety uses its peak away from the joint and load edges instead, provided that held steady between the meshes.",
     "The factor of safety is given on yield (no permanent deformation) and on ultimate strength (the margin left "
     "before fracture). The analysis is linear elastic: past yield its stresses are no longer the real ones, so the "
     "factor on ultimate is an index of the reserve, not a predicted failure load; for ductile metals it is on the "
@@ -55,6 +59,27 @@ def removed(removed_parts: dict[str, str]) -> list[str]:
     if loose:
         out.append(f"Parts with no connection to a fixture and no load ({', '.join(loose)}) are left out of the "
                    "analysis; their weight is not included.")
+    user = [p for p, why in removed_parts.items() if why == "user"]
+    if user:
+        out.append(f"Parts left out of the analysis by the user ({', '.join(user)}); their stiffness and weight are not "
+                   "included. They are not suppressed in SolidWorks.")
+    return out
+
+
+def bond_first(method: str, why: str | None, n_bonded: int, small: list[dict], small_fraction: float) -> list[str]:
+    """Bond-first connections (D81) and the small parts it left out."""
+    if method != "bond_first":
+        return []
+    out = [f"Connections were found bond-first ({why or 'a model with many parts'}): every pair of parts touching within "
+           "the bond tolerance, or overlapping, is bonded, and a mate's joint is kept only where it frees a motion. "
+           f"{n_bonded} joint(s) between parts already held together through the structure, or on a pinned face, "
+           "were bonded."]
+    if small:
+        mass = sum(s.get("mass", 0.0) for s in small) * 1000.0
+        out.append(f"{len(small)} small part(s), each under {100 * small_fraction:g} % of the model's volume, carrying "
+                   f"no load or fixture and not the only link between parts, are left out as negligible "
+                   f"(together {mass:.3g} kg, not included in self-weight): "
+                   + ", ".join(s["part"] for s in small) + ".")
     return out
 
 
@@ -231,3 +256,43 @@ def hybrid(used: bool) -> list[str]:
             "moves as a smooth field (polynomials of degree up to 4 over the joint) rather than node by node. "
             "Against CalculiX on models both can solve it agreed within about 1-3 % on displacement and on stresses "
             "away from joints, with exact reactions; peak stresses right at a joint can differ more."]
+
+
+def weld_checks(load_cases: dict, names: bool = True) -> list[str]:
+    """Recommended further checks of the joints (the user's request, 2026-10-11): where the stress beside a joint has
+    no settled value in the linear model (flagged singular, or set aside for the steady peak, D88/D89), and the
+    joints' structural stress (D33, information in the checks). A static factor of safety does not cover a weld's
+    strength or fatigue life there. names=False for the summary, whose readers do not know the parts by name."""
+    spots: dict[str, list] = {}
+    low = None
+    for case, lc in load_cases.items():
+        for part, p in lc.get("parts", {}).items():
+            if p.get("singular") or p.get("singular_fallback"):
+                at = p.get("read_out_singular_at") or p.get("membrane_bending_at") or p.get("peak_vm_excl_ties_at")
+                spots.setdefault(part, []).append(at)
+            jf = p.get("joint_fos")
+            if jf and (low is None or jf < low[0]):
+                low = (jf, part, p.get("joint_with"))
+    out = []
+    if spots:
+        short = lambda pid: pid.split("/body:")[-1].split("/")[-1]  # noqa: E731
+        where = (": " + "; ".join(f"{short(pid)} at ({', '.join(f'{c:.0f}' for c in at[0])}) mm"
+                                  if at and at[0] else short(pid) for pid, at in sorted(spots.items()))
+                 if names else "")
+        out.append(f"Weld or fatigue check recommended at {len(spots)} joint location(s) where the stress beside the "
+                   f"joint has no settled value in this linear model (it keeps rising as the mesh is refined){where}. "
+                   "The factor of safety above uses the stress just away from them; the joint itself needs a weld "
+                   "assessment (weld size and throat, and the structural hot-spot or structural stress against the "
+                   "weld's detail category if the loads are repeated).")
+    if low is not None:
+        joint = ""
+        if names and low[1]:
+            short = lambda pid: pid.split("/body:")[-1].split("/")[-1]  # noqa: E731
+            joint = f" ({short(low[1])}" + (f" at {short(low[2])})" if low[2] else ")")
+        out.append(f"The lowest joint structural stress factor is {low[0]:.2f}{joint}: yield over the structural "
+                   "stress the joint's forces put into the wall, a measure for the weld rather than the parent "
+                   "metal. Check the welds against it with their actual size and type.")
+    if out:
+        out.append("If the loads are repeated (cyclic), a fatigue assessment of the welded joints is recommended; "
+                   "this static analysis does not cover fatigue.")
+    return out

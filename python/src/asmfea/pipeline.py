@@ -79,6 +79,9 @@ def stage_resolve(study: Path, js: JobState) -> None:
         js.add_diags([d for d in diags if d.severity != "blocking"])
         raise_if_blocking(diags)
         return
+    # this analysis's list from here on: a failure further in must not leave the last analysis's on show (found live:
+    # "material missing" still listed after the materials were set, the new analysis having crashed later)
+    _write(study / "exceptions.json", _exceptions_doc(diags))
     js.activity(f"resolve: loading {n} parts from STEP", 0, n)
     steps = {study / p.step for p in model.parts}
     with perf.span("step_load", parts=n, files=len(steps), bytes=sum(s.stat().st_size for s in steps if s.exists())):
@@ -98,7 +101,8 @@ def stage_resolve(study: Path, js: JobState) -> None:
     except Exception:                                   # noqa: BLE001 - unreadable: start again
         overlaps = {}
     with perf.span("resolver", pairs=n * (n - 1) // 2) as pinfo:
-        conns, removed, rdiags = resolve(model, geoms, face_map, overlaps)
+        pin_info: dict = {}
+        conns, removed, rdiags = resolve(model, geoms, face_map, overlaps, out=pin_info)
         pinfo["interfaces"] = len(conns)
     _write(overlaps_path, overlaps)
     # a duplicate hinge is no problem (the newest on an axis is used): not an exception (the user's choice,
@@ -113,7 +117,18 @@ def stage_resolve(study: Path, js: JobState) -> None:
                                      "face_map": {k: list(v) for k, v in face_map.items()}})
     _write(study / "connections.json", {"schema_version": SCHEMA_VERSION, "connections": conns,
                                         "removed_parts": removed,
-                                        "left_out_hinges": [dict(d.evidence) for d in dupes]})
+                                        "left_out_hinges": [dict(d.evidence) for d in dupes],
+                                        # pins: their axes (aligned where near-coaxial) and those whose own turn is
+                                        # held as well (resolve; the deck holds them so)
+                                        "pin_axes": pin_info.get("pin_axes", {}),
+                                        "held_spins": pin_info.get("held_spins", []),
+                                        # how connections were found (D81) and what bond-first did: small parts
+                                        # left out (report only), joints bonded as freeing nothing
+                                        "method": pin_info.get("method", "classic"),
+                                        "method_why": pin_info.get("why"),
+                                        "small_parts": pin_info.get("small_parts", []),
+                                        "bonded_redundant": pin_info.get("bonded_redundant", []),
+                                        "bonded_on_pins": pin_info.get("bonded_on_pins", [])})
     _write(study / "exceptions.json", _exceptions_doc(diags))
     counts = defaultdict(int)
     for c in conns:
@@ -121,6 +136,10 @@ def stage_resolve(study: Path, js: JobState) -> None:
     line = (f"resolve: {len(geoms)} parts, {len(conns)} connections ("
             + ", ".join(f"{v} {t}" for t, v in sorted(counts.items())) + f"), {len(removed)} parts removed, "
             f"{len(diags)} exceptions")
+    if pin_info.get("method") == "bond_first":
+        nb = len(pin_info.get("bonded_redundant", [])) + len(pin_info.get("bonded_on_pins", []))
+        js.result(f"resolve: bond-first connections ({pin_info.get('why') or 'many parts'}): {nb} joint(s) bonded as "
+                  f"freeing nothing, {len(pin_info.get('small_parts', []))} small part(s) left out (listed in the report)")
     check = f"{len(face_map)}/{len(model.face_refs)} referenced faces matched to STEP geometry"
     js.result(line)
     js.verify(check)
@@ -370,9 +389,33 @@ def stage_mesh(study: Path, js: JobState) -> None:
         return js.cancel_requested()
 
     js.activity(f"mesh: {len(tasks)} unique parts ({len(model.parts)} instances)", 0, len(tasks))
+    deferred = False
     try:
         with perf.span("meshing", unique=len(tasks), instances=len(model.parts), workers=cfg.threads) as pinfo:
-            results = mesh_parts(list(tasks.values()), cfg.threads, on_done, on_tick, force=force_requested(js))
+            base_keys = {k for k, t in tasks.items() if t["level"] == "base"}
+            results = mesh_parts([t for k, t in tasks.items() if k in base_keys], cfg.threads, on_done, on_tick,
+                                 force=force_requested(js))
+            # a big model is refined only where it is most stressed, chosen after the base solve (D73): its
+            # refined meshes wait (the user's rigs: 55 M DOF refined would not solve in this machine's memory)
+            later = {k: t for k, t in tasks.items() if k not in base_keys}
+            if later and mode != FAST:
+                base_dof = 3 * sum(results[m["base"]["key"]].get("nodes") or 0 for m in manifest.values()
+                                   if m.get("base", {}).get("key") in results)
+                if base_dof * defaults.REFINE_GROWTH > defaults.REFINE_FULL_MAX_DOF:
+                    deferred = True
+                    for m in manifest.values():
+                        if "refined" in m:
+                            m["refined"]["deferred"] = True
+                    js.result(f"mesh: the refined model would have ~{int(base_dof * defaults.REFINE_GROWTH):,} DOF: only "
+                              "its most stressed parts are refined, after the base solve")
+                    later = {}
+            # a part whose base mesh failed is not meshed finer: it would fail again, after another timeout
+            ok_parts = {p for p, m in manifest.items() if results.get(m.get("base", {}).get("key"), {}).get("ok")}
+            later = {k: t for k, t in later.items() if t["part"] in ok_parts}
+            if later:
+                results.update(mesh_parts(list(later.values()), cfg.threads, on_done, on_tick,
+                                          force=force_requested(js)))
+            tasks = {k: t for k, t in tasks.items() if k in results}
             pinfo["cached"] = sum(1 for r in results.values() if r.get("cached"))
             note_reuse(js, "mesh", f"reused for {pinfo['cached']} of {len(tasks)} unique meshes")
             pinfo["part_seconds"] = {t["part"] + "/" + t["level"]: round(results[k].get("seconds") or 0.0, 2)
@@ -412,6 +455,8 @@ def stage_mesh(study: Path, js: JobState) -> None:
     js.add_diags(diags)
     raise_if_blocking(diags)
     for level, _ in levels_for(model, mode):
+        if deferred and level == "refined":
+            continue
         nodes = sum(PartMesh.load(study / "mesh" / f"{m[level]['key']}.npz").nodes.shape[0]
                     for m in manifest.values())
         js.result(f"mesh ({level}): {len(manifest)} parts, {nodes:,} nodes, ~{3 * nodes:,} DOF")
@@ -424,10 +469,15 @@ def build_instances(study: Path, model: Model, level: str = "base", mode: str = 
     """The parts' meshes at one level, placed in the assembly. The local pass's meshes (D65) are listed in its run
     (run/local/manifest.json: which parts it refined depends on that run's results); run: that run, else the
     latest solved one."""
-    if level == "local":
-        run = run or study / "run" / latest_solve_file(study, mode).read_text().strip()
-        manifest = read_json(run / "local" / "manifest.json")["parts"]
-    else:
+    manifest = None
+    if level in ("refined", "local"):
+        # a level whose meshes depend on the run's own results (the local pass; the refined level of a big model,
+        # refined only where most stressed, D73) lists them in the run
+        if run is None and latest_solve_file(study, mode).exists():
+            run = study / "run" / latest_solve_file(study, mode).read_text().strip()
+        if run is not None and (run / level / "manifest.json").exists():
+            manifest = read_json(run / level / "manifest.json")["parts"]
+    if manifest is None:
         manifest = read_json(study / "mesh" / ("manifest_fast.json" if mode == FAST else "manifest.json"))["parts"]
     removed = set(read_json(study / "connections.json").get("removed_parts", []))
     out, node0, elem0 = [], 0, 0
@@ -605,6 +655,56 @@ def joint_zones(instances: list[Instance], conns: list[dict], model: Model | Non
     return zones, edges
 
 
+def load_edge_zones(instances: list[Instance], model: Model, face_map: dict,
+                    measured: dict | None = None) -> dict[str, list[int]]:
+    """Global ids of nodes per part within the joint band's width (joint_band) of the edge of a loaded area (D87).
+
+    A force or pressure spread evenly over a face stops abruptly at the face's edge: the stress there is the load's
+    idealisation, not the structure's, and has no settled value. On a pinned cradle frame a loaded vertical's peak sat where
+    its load face's edge met a weld; the two meshes classed it differently (assessed 99 MPa on one, 38 on the other,
+    a 45 % "convergence" change) while its stress a wall thickness away read 39.1 and 38.7 MPa. The edge is that of
+    all of a part's loaded faces together (a face shared by two loaded faces is no edge), and only the edge: the load
+    is real over the rest of the face. Hydrostatic loads are left out (their pressure falls to nothing at the free
+    surface, without a step)."""
+    from collections import Counter
+    from scipy.spatial import cKDTree
+    from .mesh.elements import FACE_NODES, FACES
+    by = {i.part_id: i for i in instances}
+    parts = {p.id: p for p in model.parts}
+    faces: dict[str, set[int]] = {}
+    for ld in model.loads:
+        if ld.type not in ("force", "pressure", "remote_force"):
+            continue
+        for fid in getattr(ld, "faces", None) or []:
+            if fid in face_map and face_map[fid][0] in by:
+                faces.setdefault(face_map[fid][0], set()).add(int(face_map[fid][1]))
+    out: dict[str, list[int]] = {}
+    for pid, idxs in faces.items():
+        inst = by[pid]
+        facets = [([int(conn[i]) for i in FACES[et][fnum - 1]], [int(conn[i]) for i in FACE_NODES[et][fnum - 1]])
+                  for idx in sorted(idxs) for _, fnum, et, conn in inst.face_elements(idx)]
+        count = Counter(frozenset(e) for corners, _ in facets for e in zip(corners, corners[1:] + corners[:1]))
+        # the nodes ON the edge: each outer facet edge's two corners and the mid-side node between them (all of an
+        # outer facet's nodes reached the middle of a coarsely meshed face)
+        edge_set: set[int] = set()
+        for corners, nodes in facets:
+            for a, b in zip(corners, corners[1:] + corners[:1]):
+                if count[frozenset((a, b))] != 1:
+                    continue
+                edge_set.update((a, b))
+                mid = 0.5 * (inst.X[a - 1] + inst.X[b - 1])
+                tol = 0.25 * np.linalg.norm(inst.X[a - 1] - inst.X[b - 1])   # on a curved face it sits off the chord
+                edge_set.update(n for n in nodes if n not in corners and np.linalg.norm(inst.X[n - 1] - mid) <= tol)
+        edge = sorted(edge_set)
+        if not edge:
+            continue
+        band = joint_band(parts.get(pid), (measured or {}).get(pid))
+        d, _ = cKDTree(inst.X[np.asarray(edge, dtype=np.int64) - 1]).query(inst.X, k=1,
+                                                                          distance_upper_bound=band + 1e-9)
+        out[pid] = sorted(int(inst.node0 + 1 + i) for i in np.nonzero(np.isfinite(d))[0])
+    return out
+
+
 def _history_path(name: str = "solve_history.json") -> Path:
     base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "asmfea"
     base.mkdir(parents=True, exist_ok=True)
@@ -728,7 +828,8 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg, plan=N
                 perf.span("deck", level=level, dof=dof) as pinfo:
             deck = write_deck(rd / "study.inp", spec.get("model", model), instances, spec["conns"], face_map, spec["cases"],
                               bolts=[dict(b) for b in spec["bolts"]], stabilise=stabilise if spec["kind"] == "contact" else [],
-                              buckling=spec["buckling"])
+                              buckling=spec["buckling"], pin_axes=conn_doc.get("pin_axes"),
+                              held_spins=conn_doc.get("held_spins"))
             pinfo["inp_bytes"] = sum(f.stat().st_size for f in rd.glob("*") if f.suffix in (".inp", ".nam", ".sur", ".equ"))
         _record_deck_history(dof, time.time() - t_deck)
         if deck.diagnostics:
@@ -737,9 +838,10 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg, plan=N
         with perf.span("tie_zones", level=level):
             more: dict = {}
             zones, edges = joint_zones(instances, spec["conns"], model, deck.info.get("wall_thickness"), out=more)
+            loaded = load_edge_zones(instances, spec.get("model", model), face_map, deck.info.get("wall_thickness"))
         deck.info.update({"dof": dof, "level": level, "kind": spec["kind"], "tie_zone_nodes": zones,
                           "joint_edge_nodes": edges, "joint_line_nodes": more["line"],
-                          "joint_inside_nodes": more["inside"],
+                          "joint_inside_nodes": more["inside"], "load_edge_nodes": loaded,
                           "elements": sum(i.mesh.n_elements for i in instances)})
         if "model" in spec:
             from .superpose import solved_map
@@ -975,7 +1077,12 @@ def stage_solve(study: Path, js: JobState) -> None:
     plan = plan_study(model.study, fast=(mode == FAST))
     for line in plan.notes:
         js.log(f"plan: {line}")
-    stats = {level: solve_level(study, js, model, level, cfg, plan) for level in levels}
+    stats = {}
+    manifest_all = read_json(study / "mesh" / ("manifest_fast.json" if mode == FAST else "manifest.json"))["parts"]
+    for level in levels:
+        if level == "refined" and any(m.get("refined", {}).get("deferred") for m in manifest_all.values()):
+            _select_refine(study, js, model, cfg, mode)    # a big model: refined where most stressed (D73)
+        stats[level] = solve_level(study, js, model, level, cfg, plan)
     solved = list(levels)
     if plan.refine_unconverged and levels == ["base", "refined"]:
         local = _local_pass(study, js, model, cfg, plan, mode)
@@ -985,8 +1092,67 @@ def stage_solve(study: Path, js: JobState) -> None:
     _write(js.dir / "plan.json", plan.as_dict())
     _write(js.dir / "solve_stats.json", stats)
     latest_solve_file(study, mode).write_text(js.dir.name)
-    extra = [js.dir / n for n in ("local_pass.json", "local/manifest.json") if (js.dir / n).exists()]
+    extra = [js.dir / n for n in ("local_pass.json", "local/manifest.json", "refine_selection.json",
+                                  "refined/manifest.json") if (js.dir / n).exists()]
     cache.put(stage, k, run_outputs(js.dir, solved) + extra, {**js.data(), "run": js.dir.name})
+
+
+def _select_refine(study: Path, js, model: Model, cfg, mode: str = FULL) -> None:
+    """The refined level of a big model (D73; the user's item 2, 2026-10-10): only the parts whose assessed stress
+    in the base solve is at least REFINE_SELECT_FRACTION of the model's highest are meshed finer (the fraction
+    raised until the unknowns it adds fit REFINE_EXTRA_MAX_DOF); the rest keep their base mesh. Writes
+    run/refined/manifest.json (which mesh each part uses) and run/refine_selection.json."""
+    from .post import assessed_stress
+    run = js.dir
+    js.activity("refined pass: choosing the most stressed parts from the base solve")
+    from .superpose import prepare_cases
+    if any(r.get("superposed_from") for r in read_json(run / "base" / "runs.json")):
+        prepare_cases(run / "base", model)
+    per, _, diags, _ = _read_levels(study, js, model, run, ["base"], mode)
+    # a base result that cannot be trusted (a mechanism found from its imbalance) stops here: choosing parts from
+    # it chose none and refined nothing (the cradle, 2026-10-10)
+    blocking = [d for d in diags if d.severity == "blocking"]
+    if blocking:
+        raise Blocked(blocking)
+    _stress_classification(study, model, "base", run, per["base"], js, mode)
+    stress: dict = {}
+    for lc in per["base"]["load_cases"].values():
+        for pid, p in lc["parts"].items():
+            v = assessed_stress(p)
+            if v is not None:
+                stress[pid] = max(stress.get(pid, 0.0), v)
+    tasks, manifest = mesh_tasks(study, model, cfg, mode)
+    nodes = {pid: (PartMesh.load(study / "mesh" / f"{m['base']['key']}.npz").nodes.shape[0]) for pid, m in manifest.items()}
+    top = max(stress.values(), default=0.0)
+    frac, chosen = defaults.REFINE_SELECT_FRACTION, []
+    while True:
+        chosen = sorted(p for p, v in stress.items() if top > 0 and v >= frac * top)
+        # the unknowns the refinement adds (a cap on the total chose one part when the base model alone was over it)
+        extra = 3 * sum(nodes[p] * (defaults.REFINE_GROWTH - 1.0) for p in chosen)
+        if extra <= defaults.REFINE_EXTRA_MAX_DOF or frac >= 0.95 or len(chosen) <= 1:
+            break
+        frac = min(0.95, frac + 0.05)
+    js.result(f"refined pass: {len(chosen)} of {len(manifest)} parts refined (assessed stress at least {frac:.0%} of "
+              f"the highest, {top:.4g} MPa); the rest keep their base mesh")
+    todo = [t for t in tasks.values() if t["level"] == "refined" and t["part"] in set(chosen)]
+    done = [0]
+
+    def on_done(task, res):
+        done[0] += 1
+        js.activity(f"refined pass: {done[0]}/{len(todo)} parts meshed finer (last: {task['part']})", done[0], len(todo))
+    try:
+        results = mesh_parts(todo, cfg.threads, on_done, lambda _l: js.cancel_requested(), force=False)
+    except MeshCancelled:
+        raise Cancelled()
+    failed = {t["part"] for t in todo if not results[t["key"]]["ok"]}
+    chosen = [p for p in chosen if p not in failed]
+    (run / "refined").mkdir(parents=True, exist_ok=True)
+    _write(run / "refined" / "manifest.json", {"schema_version": SCHEMA_VERSION, "parts": {
+        pid: {"refined": {k: v for k, v in (m["refined"] if pid in chosen else m["base"]).items() if k != "deferred"}}
+        for pid, m in manifest.items()}})
+    _write(run / "refine_selection.json", {"schema_version": SCHEMA_VERSION, "parts": chosen, "fraction": frac,
+                                           "of": len(manifest), "highest_MPa": top,
+                                           "not_meshed": sorted(failed)})
 
 
 def _unconverged_parts(conv: dict) -> list[str]:
@@ -1027,6 +1193,11 @@ def _local_pass(study: Path, js, model: Model, cfg, plan, mode: str = FULL) -> d
     js.result(f"local pass: {len(parts)} part(s) changed by more than {defaults.CONVERGENCE_TOL:.0%} between the meshes "
               f"and are meshed finer again: " + ", ".join(p.split("/")[-1] for p in parts))
     tasks, manifest = mesh_tasks(study, model, cfg, mode, local=set(parts))
+    if (run / "refined" / "manifest.json").exists():         # a big model's refined level, chosen in this run (D73)
+        own = read_json(run / "refined" / "manifest.json")["parts"]
+        for pid, m in manifest.items():
+            if pid not in parts and pid in own:
+                m["local"] = dict(own[pid]["refined"])
     todo = [t for t in tasks.values() if t["level"] == "local"]
     done = [0]
 
@@ -1063,7 +1234,7 @@ def _local_pass(study: Path, js, model: Model, cfg, plan, mode: str = FULL) -> d
 def _stress_classification(study: Path, model: Model, lv: str, run: Path, res: dict, js: JobState, mode: str = FULL) -> None:
     """Per load case: each part's membrane-plus-bending stress (its static FoS uses it) and the
     Battelle structural stress in the wall each section tie's member is bonded onto (D34)."""
-    instances = build_instances(study, model, lv, mode)
+    instances = build_instances(study, model, lv, mode, run=run)
     topo: dict = {}
     with perf.span("stress_classification", level=lv):
         _classify(study, model, lv, run, res, js, instances, topo, mode)
@@ -1075,19 +1246,21 @@ _CLS: dict = {}          # a classification worker's model, meshes and results, 
 def _joint_sets(info: dict) -> dict:
     """{part: {"edge", "line", "inside"}} global node id sets from deck_info (pipeline.joint_zones)."""
     out: dict = {}
-    for key, name in (("edge", "joint_edge_nodes"), ("line", "joint_line_nodes"), ("inside", "joint_inside_nodes")):
+    for key, name in (("edge", "joint_edge_nodes"), ("line", "joint_line_nodes"), ("inside", "joint_inside_nodes"),
+                      ("load", "load_edge_nodes")):
         for pid, ids in (info.get(name) or {}).items():
             out.setdefault(pid, {})[key] = set(ids)
     return out
 
 
-def _classify_init(study: str, lv: str, mode: str, rd: str, thick: dict, band: dict, joints: dict | None = None) -> None:
+def _classify_init(study: str, lv: str, mode: str, rd: str, thick: dict, band: dict, joints: dict | None = None,
+                   run: str | None = None) -> None:
     """A classification worker: load the model, the meshes and the results once (the results from the arrays
     read_frd keeps beside the .frd, so quickly)."""
     from .post.frd import read_frd
     study_p = Path(study)
     model = load_model(study_p)
-    _CLS.update(inst={i.part_id: i for i in build_instances(study_p, model, lv, mode)},
+    _CLS.update(inst={i.part_id: i for i in build_instances(study_p, model, lv, mode, run=Path(run) if run else None)},
                 frd=read_frd(Path(rd) / "study.frd"), thick=thick, band={k: set(v) for k, v in band.items()},
                 joints={pid: {k: set(v) for k, v in z.items()} for pid, z in (joints or {}).items()},
                 topo={}, stress={})
@@ -1173,7 +1346,7 @@ def _classify(study, model, lv, run, res, js, instances, topo, mode: str = FULL)
                                            initargs=(str(study), lv, mode, str(rd), thick,
                                                      {k: sorted(v) for k, v in band.items()},
                                                      {pid: {k: sorted(v) for k, v in z.items()}
-                                                      for pid, z in joints.items()}))
+                                                      for pid, z in joints.items()}, str(run)))
             except Exception:                                       # noqa: BLE001 - classified here instead
                 pool = None
         try:
@@ -1296,11 +1469,13 @@ def _read_levels(study: Path, js, model: Model, run: Path, levels: list[str], mo
             tz = {k: np.asarray(v, dtype=np.int64) for k, v in info.get("tie_zone_nodes", {}).items()}
             edge = ({k: np.asarray(v, dtype=np.int64) for k, v in info["joint_edge_nodes"].items()}
                     if "joint_edge_nodes" in info else None)
+            loaded = {k: np.asarray(v, dtype=np.int64) for k, v in (info.get("load_edge_nodes") or {}).items()}
             if r["cases"]:
                 with perf.span("summarise", level=lv, frd_bytes=(rd / "study.frd").stat().st_size,
                                dat_bytes=(rd / "study.dat").stat().st_size if (rd / "study.dat").exists() else 0):
                     part_res, d = summarise(model, info, rd / "study.frd", rd / "study.dat", tz, model_size,
-                                            singular_by_imbalance=mode != FAST, edge_nodes=edge)
+                                            singular_by_imbalance=mode != FAST, edge_nodes=edge,
+                                            load_nodes=loaded)
                 per[lv]["load_cases"].update(part_res["load_cases"])
                 for c in r["cases"]:
                     frds.setdefault(lv, {})[c] = rd
@@ -1328,6 +1503,88 @@ def richardson(s0: float, s1: float, s2: float, r: float) -> dict | None:
     p = math.log(e21 / e32) / math.log(r)
     k = r ** p - 1.0
     return {"order": p, "extrapolated": s2 + e32 / k, "gci": 1.25 * abs(e32 / s2) / k}
+
+
+def _three_mesh_singular(per: dict, levels: list[str], local: dict, conv: dict, cdiags: list) -> list:
+    """The local pass's three meshes judged together (D89, extending D88; the user's decision, 2026-10-11): a part's
+    read-out that rises at every refinement without closing in (no extrapolation) is singular, whatever the last
+    step's rise. Where its peak away from the joint and load edges closes in (an extrapolation, or a last change
+    within CONVERGENCE_TOL), the factor of safety uses the finest mesh's peak, and its convergence is graded on it;
+    otherwise the part is flagged singular. Found: a pinned cradle frame's member, at a pivot where five bonds
+    meet, read 103.9, 120.8, 138.9 MPa beside its joints (the last step +14.99 %, just under SINGULAR_RISE, so it
+    governed as a pass at 1.59) while its peak away from the edges went 58.9, 84.3, 90.3 MPa.
+    Returns the convergence diagnostics rebuilt (cdiags with these parts graded again)."""
+    from .post import _rel
+    r = 1.0 / defaults.LOCAL_REFINE_RATIO
+    extra: dict = {}                                     # part -> notes
+    for case, lc in per["local"]["load_cases"].items():
+        rows = conv["by_case"].get(case, {}).get("parts", {})
+        model_vm = max([v for lv in ("refined", "local") for x in per[lv]["load_cases"][case]["parts"].values()
+                        if (v := (x.get("membrane_bending") if not x.get("singular_fallback") else
+                                  x.get("peak_vm_excl_ties"))) is not None] or [1e-30])
+        for part in local["parts"]:
+            ps = [per[lv]["load_cases"].get(case, {}).get("parts", {}).get(part) for lv in levels]
+            d = rows.get(part)
+            if any(p is None for p in ps) or d is None or ps[2].get("singular_fallback"):
+                continue
+            reads = [p.get("membrane_bending") for p in ps]
+            peaks = [p.get("peak_vm_excl_ties") for p in ps]
+            if any(v is None for v in reads) or d["max_disp"] > defaults.CONVERGENCE_TOL:
+                continue
+            if not (reads[0] < reads[1] < reads[2]) or richardson(*reads, r) is not None:
+                continue                                 # closing in, or not rising: an ordinary result
+            p = ps[2]
+            note = f"{case}: beside the joint {reads[0]:.1f}, {reads[1]:.1f}, {reads[2]:.1f} MPa on the three meshes"
+            steady = (all(v for v in peaks) and (richardson(*peaks, r) is not None
+                                                 or _rel(peaks[1], peaks[2]) <= defaults.CONVERGENCE_TOL))
+            if steady:
+                scale = reads[2] / peaks[2]
+                p.update(singular_fallback=True, read_out_singular=reads[2],
+                         read_out_singular_at=p.get("membrane_bending_at"))
+                if p.get("min_fos"):
+                    p["min_fos"] *= scale
+                if p.get("min_fos_ultimate"):
+                    p["min_fos_ultimate"] *= scale
+                ex = richardson(*peaks, r)
+                note += (f"; factor of safety from the steady peak away from the edges, {peaks[2]:.1f} MPa"
+                         + (f" (extrapolated {ex['extrapolated']:.1f})" if ex else ""))
+                d.update(stress=_rel(peaks[1], peaks[2]), stress_model=abs(peaks[2] - peaks[1]) / model_vm,
+                         singular=True, fallback=True)
+            else:
+                p["singular"] = True
+                d["singular"] = True
+            extra.setdefault(part, []).append(note)
+    # the convergence grade and its diagnostics again, from the rows as they now stand
+    worst, offenders, singular = 0.0, {}, {}
+    for d0 in cdiags:
+        if d0.code == "STRESS_SINGULAR":
+            for k, v in (d0.evidence or {}).get("by_part", {}).items():
+                singular.setdefault(k, []).extend(v)
+    for k, v in extra.items():
+        singular.setdefault(k, []).extend(v)
+    for case, c in conv["by_case"].items():
+        for part, d in (c.get("parts") or {}).items():
+            if d.get("singular") and not d.get("fallback"):
+                continue
+            w = max(d["max_disp"], d.get("stress_model", 0.0))
+            worst = max(worst, w)
+            if w > defaults.CONVERGENCE_TOL:
+                offenders.setdefault(part, []).append(f"{case}: {w:.1%}")
+    for key, c in conv["by_case"].items():
+        if key.startswith("buckling:") and c.get("lowest_factor") is not None:
+            worst = max(worst, c["lowest_factor"])
+            if c["lowest_factor"] > defaults.CONVERGENCE_TOL:
+                offenders.setdefault(key.replace(":", " "), []).append(f"{c['lowest_factor']:.1%}")
+    conv["worst_change"] = worst
+    out = [d0 for d0 in cdiags if d0.code not in ("CONVERGENCE_POOR", "STRESS_SINGULAR")]
+    if singular:
+        out.append(make("STRESS_SINGULAR", where={"parts": sorted(singular)}, parts=", ".join(sorted(singular)),
+                        rise=defaults.SINGULAR_RISE, evidence={"by_part": singular}))
+    if offenders:
+        out.append(make("CONVERGENCE_POOR", where={"parts": sorted(offenders)}, worst=worst,
+                        tol=defaults.CONVERGENCE_TOL, parts=", ".join(sorted(offenders)),
+                        evidence={"by_part": offenders}))
+    return out
 
 
 def _post(study: Path, js, model: Model, run: Path, levels: list[str], mode: str = FULL) -> None:
@@ -1362,6 +1619,8 @@ def _post(study: Path, js, model: Model, run: Path, levels: list[str], mode: str
                     ex = richardson(*vals, r)
                     local["extrapolated"].setdefault(case, {})[part] = {"stress": vals, **(ex or {"note": (
                         "the three meshes' stresses do not close in steadily: no extrapolation")})}
+        diags = [d for d in diags if d.code not in ("CONVERGENCE_POOR", "STRESS_SINGULAR")] + \
+            _three_mesh_singular(per, levels, local, conv, cdiags)
         conv["first"] = {"worst_change": first["worst_change"], "by_case": first["by_case"]}
     # The refined solve is reported; the base solve is the convergence reference (D12).
     res = per[reported]
@@ -1376,6 +1635,8 @@ def _post(study: Path, js, model: Model, run: Path, levels: list[str], mode: str
         "reported_mesh": reported,
         "convergence": conv,
         "local_pass": local,
+        # a big model refined only where most stressed (D73)
+        "refine_selection": read_json(run / "refine_selection.json") if (run / "refine_selection.json").exists() else None,
         # the convergence reference: the mesh before the reported one
         "base": per[levels[-2]] if len(levels) >= 2 else None,
         "mesh": {lv: {"dof": infos[lv]["dof"], "elements": infos[lv].get("elements"),

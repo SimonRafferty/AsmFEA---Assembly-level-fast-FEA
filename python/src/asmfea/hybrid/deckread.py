@@ -113,7 +113,9 @@ def _opts(line: str) -> dict:
     return out
 
 
-def read(path: Path) -> Deck:
+def read(path: Path, rigid_ok: bool = False) -> Deck:
+    """rigid_ok: the deck's rigid bodies and equations (pins, joints, sliding faces) are described in deck_info
+    ("hybrid"), so their cards are passed over here."""
     d = Deck()
     lines = Path(path).read_text(errors="replace").splitlines()
     i, n = 0, len(lines)
@@ -215,7 +217,7 @@ def read(path: Path) -> Deck:
                 step.gravity.append((v[0], float(v[2]), tuple(float(x) for x in v[3:6])))
         elif kw == "*NODE PRINT":
             step.prints.append((o["NSET"], str(o.get("TOTALS", "")).upper() == "ONLY"))
-        elif kw in IGNORED:
+        elif kw in IGNORED or (rigid_ok and kw in ("*RIGID BODY", "*EQUATION")):
             pass
         else:
             raise Unsupported(f"keyword {kw}")

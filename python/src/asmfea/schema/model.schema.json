@@ -304,6 +304,8 @@
         "buckling_modes": {"type": "integer", "minimum": 1},
         "load_superposition": {"type": "boolean", "description": "Solve each load on its own once; a load case is then the sum of its loads, so changing only load sizes needs no new solve (linear static only; D39)"},
         "bond_tolerance": {"type": "number", "minimum": 0, "description": "Faces this close (a gap or an overlap, mm) count as touching and are bonded; default 0.5"},
+        "connection_method": {"enum": ["auto", "classic", "bond_first"], "description": "How connections are found: bond_first bonds everything touching and keeps a mate's joint only where it frees something (D81); auto chooses bond_first on models with many parts"},
+        "excluded_parts": {"type": "array", "items": {"type": "string"}, "description": "Parts left out of the analysis by the user (the floating-parts dialog); never suppressed in SolidWorks"},
         "mesh": {
           "type": "object",
           "additionalProperties": false,

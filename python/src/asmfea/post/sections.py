@@ -260,6 +260,9 @@ def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exc
             for a, da in zip(sorted(nrm_node), d):
                 if a not in side_nodes and da < defaults.SCL_EDGE_T * thin:
                     skip.add(a)
+    # the bands round loaded faces' edges (D87): the load's idealisation, read nowhere (sections, hot spots)
+    loaded = {int(g - inst.node0) for g in (zones.get("load") or ())}
+    skip |= loaded
     local = {int(g - inst.node0): v for g, v in vm_nodes}
     ranked = [a for a in sorted(nrm_node, key=lambda a: -local.get(a, 0.0)) if a in local and a not in skip]
     # The most stressed points away from the joints; on a thick part as many again in the joint bands (``exclude``),
@@ -288,7 +291,8 @@ def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exc
                     break
     hot = None
     if thin and zones.get("line"):
-        hot = hot_spots(inst, nrm_node, local, stress, thin, zones["line"], zones.get("inside") or set(), h)
+        hot = hot_spots(inst, nrm_node, local, stress, thin, zones["line"],
+                        (zones.get("inside") or set()) | (zones.get("load") or set()), h)
     if not cands and hot is None:
         return None
     ids = np.array(sorted(local), dtype=np.int64)
@@ -342,7 +346,7 @@ def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exc
 
 def hot_spots(inst, nrm_node: dict, local: dict, stress, t: float, line: set, inside: set,
               h: float = 0.0) -> dict | None:
-    """The worst hot-spot stress along a thin part's joint edges (IIW structural hot-spot stress, type "a", the
+    """The worst stress beside a thin part's joint edges, read as the IIW structural hot-spot stress is (type "a", the
     coarse-mesh read-out for elements about a wall thick: Hobbacher, IIW recommendations, 2016, 4.2.3): the surface
     stress read between HOT_SPOT_NEAR_T and HOT_SPOT_FAR_T wall thicknesses from the edge and extrapolated in a
     straight line back to it. The edge's own spike (the notch, and the singular point a sharp modelled edge makes)
@@ -355,7 +359,9 @@ def hot_spots(inst, nrm_node: dict, local: dict, stress, t: float, line: set, in
     Elements longer than the wall (h, the median element edge) widen the read-out to at least two elements beyond
     its nearest point, as IIW's coarse read-out at the first two elements' midpoints does: a 7.5 mm mesh on a 5 mm
     wall left most of a joint edge with too few points in 0.4-1.6 t.
-    line, inside: global node ids. Returns {"membrane_bending": von Mises, "at", "method": "hot spot"} or None."""
+    The static value is the fit's stress at the read-out's nearest point (HOT_SPOT_NEAR_T from the edge, D83); the
+    value extrapolated to the edge (the hot spot proper, a fatigue measure) is returned beside it.
+    line, inside: global node ids. Returns {"membrane_bending": von Mises, "at", "method", "hot_spot"} or None."""
     from scipy.spatial import cKDTree
     n0 = inst.node0
     line_l = np.array(sorted(a - n0 for a in line if (a - n0) in nrm_node), dtype=np.int64)
@@ -400,10 +406,14 @@ def hot_spots(inst, nrm_node: dict, local: dict, stress, t: float, line: set, in
             continue
         A = np.column_stack([np.ones(len(keep)), r[keep]])
         coef, *_ = np.linalg.lstsq(A, S[keep], rcond=None)   # (2, 6): the value at the line, the slope
-        v = _vm(coef[0])
+        # the static assessment (D83): the fitted stress at the read-out's nearest point (HOT_SPOT_NEAR_T from the
+        # edge), not extrapolated into it. The extrapolated hot spot is a weld fatigue measure (IIW): taken as the
+        # static stress it read above any stress in the part (181 MPa where the part's highest was 158, the
+        # a pinned cradle frame). It is kept beside it for a fatigue check.
+        v = _vm(coef[0] + coef[1] * lo)
         if best is None or v > best["membrane_bending"]:
-            best = {"membrane_bending": float(v), "at": p.round(3).tolist(), "method": "hot spot",
-                    "points": int(len(keep))}
+            best = {"membrane_bending": float(v), "at": p.round(3).tolist(), "method": "beside the joint",
+                    "hot_spot": float(_vm(coef[0])), "points": int(len(keep))}
     return best
 
 

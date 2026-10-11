@@ -209,6 +209,8 @@ class Study(_M):
     buckling_cases: list[str] = []
     buckling_modes: int = 5
     bond_tolerance: Optional[float] = None   # mm, gap or overlap still bonded; None = defaults.GAP_TOL
+    connection_method: Literal["auto", "classic", "bond_first"] = "auto"   # D81: bond-first on big models
+    excluded_parts: list[str] = []           # left out of the analysis by the user (never suppressed in SolidWorks)
     load_superposition: bool = False         # solve each load once, cases are sums (superpose.py, D39)
     mesh: MeshPrefs = MeshPrefs()
     limits: Limits = Limits()

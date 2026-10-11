@@ -41,10 +41,11 @@ def _wall_thickness(model: Model, deck_info: dict | None = None) -> dict:
 def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
               tie_nodes: dict[str, np.ndarray], model_size: float,
               singular_by_imbalance: bool = True,
-              edge_nodes: dict[str, np.ndarray] | None = None) -> tuple[dict, list[Diagnostic]]:
+              edge_nodes: dict[str, np.ndarray] | None = None,
+              load_nodes: dict[str, np.ndarray] | None = None) -> tuple[dict, list[Diagnostic]]:
     """tie_nodes: per part, global ids of nodes within the joint band (a part wholly inside is not assessed).
     edge_nodes: per part, the joint edges (the elements on a joint's edge line), left out of the peak; the band
-    when not given.
+    when not given. load_nodes: per part, the bands round the edges of loaded faces (D87), left out of the peak too.
     model_size: diagonal of the assembly bounding box, mm. singular_by_imbalance: an unbalanced reaction on
     its own declares the model singular (the full run); a fast run needs huge displacements as well, because
     a tie whose master face holds fixed nodes passes load into the supports that CalculiX's RF omits (a 17 %
@@ -74,6 +75,8 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
             none = np.empty(0, dtype=np.int64)
             in_band = np.isin(ids, tie_nodes.get(inst["part"], none))
             excl = in_band if edge_nodes is None else np.isin(ids, edge_nodes.get(inst["part"], none))
+            if load_nodes:                                  # a load face's edge: the load's idealisation (D87)
+                excl = excl | np.isin(ids, load_nodes.get(inst["part"], none))
             # a part lying wholly within joint bands (a bush between hinges) has no stress to assess: its peaks
             # are all at its joints, so it gives no factor of safety (bearing on bushes and pins is a hand check);
             # its raw peak stays for reference. It used to fall back to the raw peak and governed (2026-10-09)
@@ -100,6 +103,12 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
         # writer computed that share, so the balance compares like with like.
         supports = np.asarray(deck_info["load_cases"][case].get("into_supports", [0.0, 0.0, 0.0]))
         reaction = dat["totals"].get(k, {}).get("FIXALL")
+        # load passed into a pin through a joint on it goes to the pin's reference node, where no reaction is
+        # printed: the joint's side B nodes print it instead (deck "pin_joint_sets")
+        for pset in deck_info.get("pin_joint_sets", []):
+            more = dat["totals"].get(k, {}).get(pset)
+            if more is not None:
+                reaction = (np.asarray(reaction, float) if reaction is not None else np.zeros(3)) + np.asarray(more, float)
         extra = _contact_and_bolts(deck_info, blocks, dat, k, applied, case, un, uv, diags,
                                    frd.get(0, {}).get("COORDS"))
         # RF also misses forces that reach the supports through equations (a bolt end on a
@@ -282,6 +291,8 @@ def assessed_stress(p: dict) -> float | None:
     joints too, 2026-10-10), else the peak away from the joint edges. None for a part not assessed (joint only)."""
     if p.get("joint_only"):
         return None
+    if p.get("singular_fallback"):                       # the read-out rose with the mesh: the steady peak (D88)
+        return p.get("peak_vm_excl_ties")
     v = p.get("membrane_bending")
     return v if v is not None else p.get("peak_vm_excl_ties")
 
@@ -328,10 +339,32 @@ def convergence(base: dict, refined: dict) -> tuple[dict, list[Diagnostic]]:
             # deflection settled but the stress keeps rising with refinement: a singular point (D32)
             rise = (sp - sq) / max(sq, 1e-30) if assessed else 0.0
             if d["max_disp"] <= defaults.CONVERGENCE_TOL and rise > defaults.SINGULAR_RISE:
-                p["singular"] = True
                 at = p.get("membrane_bending_at") or p.get("peak_vm_excl_ties_at")
-                singular.setdefault(part, []).append(f"{case}: +{rise:.0%} at {at}")
+                note = f"{case}: +{rise:.0%} at {at}"
                 d["singular"] = True
+                # the read-out rose with the mesh, so it has no settled value: where the part's peak away from the
+                # joint and load edges held steady, the factor of safety uses that instead (the user's decision,
+                # D88). A pinned cradle frame's governing tube read 82 then 135 MPa beside its joint, its steady peak 90.9
+                # then 89.5. Otherwise the read-out stays, flagged singular (a warning, not a fail)
+                pk_p, pk_q = p.get("peak_vm_excl_ties"), q.get("peak_vm_excl_ties")
+                if peaks and pk_p and pk_p > 0 and _rel(pk_q, pk_p) <= defaults.CONVERGENCE_TOL:
+                    scale = sp / pk_p
+                    p.update(singular_fallback=True, read_out_singular=sp, read_out_singular_at=at)
+                    if p.get("min_fos"):
+                        p["min_fos"] *= scale
+                    if p.get("min_fos_ultimate"):
+                        p["min_fos_ultimate"] *= scale
+                    note += f"; factor of safety from the steady peak away from the edges, {pk_p:.1f} MPa"
+                    d["stress"] = _rel(pk_q, pk_p)
+                    d["stress_model"] = abs(pk_p - pk_q) / model_vm
+                    singular.setdefault(part, []).append(note)
+                    w = max(d["max_disp"], d["stress_model"])
+                    worst = max(worst, w)
+                    if w > defaults.CONVERGENCE_TOL:
+                        offenders.setdefault(part, []).append(f"{case}: {w:.1%}")
+                    continue
+                p["singular"] = True
+                singular.setdefault(part, []).append(note)
                 continue
             w = max(d["max_disp"], d["stress_model"])
             worst = max(worst, w)
@@ -397,6 +430,13 @@ CHECK_TEXT = {
                      "the reserve, not a predicted failure load (on the safe side for ductile metals).",
                      ["Whether some yielding before that is acceptable is the engineer's judgement: compare the factor "
                       "on yield (no permanent set) with this one (no fracture)."]),
+    "joint_fos": ("The lowest factor of safety at a bonded joint by its structural stress under load case {case}, in "
+                  "{part}: the yield strength divided by the stress the joint's line force and moment put into the wall "
+                  "at a member's end (the measure weld fatigue methods use). For information, with no pass or fail: "
+                  "the static check above uses the stress beside the joint, as static design codes do; this one is the "
+                  "starting point for a weld or fatigue check.",
+                  ["Check the weld at the named part's end by hand (throat size, EN 1993-1-8), or with a fatigue "
+                   "assessment if the load cycles."]),
     "stress": ("The highest von Mises stress of membrane plus bending under load case {case}, in {part}, against "
                "the allowable stress set under Pass / fail criteria on the Study tab.",
                ["If it fails: strengthen where the stress plot peaks, or use a material with a higher allowable."]),
@@ -452,13 +492,17 @@ def checks(model: Model, results: dict, open_exceptions: int, mesh_failed: int =
                 r["max_disp"] <= lim.max_deflection, "FAIL", kind="deflection", case=case,
                 part=worst(r["parts"], "max_disp", False))
         if lim and lim.min_fos:
-            # members away from joints, and bonded joints by their structural stress (D33)
+            # the parts' assessed stress (membrane plus bending, beside the joints too). The joints' structural stress
+            # (D33) is a weld and fatigue measure: shown below for information, not in the static check (D83)
             fos = [(p["min_fos"], bool(p.get("singular")), n) for n, p in r["parts"].items() if p["min_fos"]]
-            fos += [(p["joint_fos"], False, n) for n, p in r["parts"].items() if p.get("joint_fos")]
             v, sing, where = min(fos) if fos else (None, False, None)
             # a governing peak flagged singular (D32) is not a real stress: a warning, not a fail
             row(f"Min factor of safety [{case}]" + (" (singular peak, see warning)" if sing else ""), v, lim.min_fos,
                 v is not None and v >= lim.min_fos, "WARN" if sing else "FAIL", kind="fos", case=case, part=where)
+        jf = [(p["joint_fos"], n) for n, p in r["parts"].items() if p.get("joint_fos")]
+        if jf:
+            v, where = min(jf)
+            row(f"Joint structural stress factor [{case}]", v, None, None, kind="joint_fos", case=case, part=where)
         # on ultimate too, for information: the margin before fracture; whether some yield is acceptable is the
         # engineer's judgement (the user's request, 2026-10-10)
         fu = [(p["min_fos_ultimate"], n) for n, p in r["parts"].items() if p.get("min_fos_ultimate")]

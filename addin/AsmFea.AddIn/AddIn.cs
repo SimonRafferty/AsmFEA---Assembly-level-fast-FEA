@@ -15,8 +15,8 @@ using SolidWorks.Interop.swconst;
 using SolidWorks.Interop.swpublished;
 
 [assembly: AssemblyTitle("AsmFEA SolidWorks add-in")]
-[assembly: AssemblyVersion("0.7.0.0")]
-[assembly: AssemblyFileVersion("0.7.0.0")]
+[assembly: AssemblyVersion("0.8.0.0")]
+[assembly: AssemblyFileVersion("0.8.0.0")]
 
 namespace AsmFea.AddIn
 {
@@ -494,6 +494,15 @@ namespace AsmFea.AddIn
                 comp.Select4(true, null, false);
             }
             doc.GraphicsRedraw2();
+        }
+
+        public void ZoomToSelection(IModelDoc2 doc)
+        {
+            try
+            {
+                if (((ISelectionMgr)doc.SelectionManager).GetSelectedObjectCount2(-1) > 0) doc.ViewZoomToSelection();
+            }
+            catch { }                                   // a zoom that fails leaves the view as it was
         }
 
         private static bool SelectBody(IComponent2 comp, string name)

@@ -122,13 +122,21 @@ explain = "These parts have no path, through touching faces, mates or bolts, to 
 likely_causes = ["A gap between the parts and their neighbours larger than the bond tolerance.", "Duplicate or stray bodies left in a part.", "A connection set to 'none' by an override."]
 actions = ["Select the parts from this message and check how they meet their neighbours.", "Raise the bond tolerance on the Study tab if the gaps are intended to be bonded."]
 
+[MECHANISM_LOADED]
+severity = "blocking"
+stage = "resolve"
+what = "{parts} carry load ({loads}) but are free to move: {motions}. Leaving them out would lose the load."
+explain = "Parts that nothing holds in some direction are normally left out (they would only move out of the way of a load). These carry a load, so leaving them out would quietly drop it: the run stops instead."
+likely_causes = ["A hinge or sliding joint where the parts are really fixed together.", "A missing fixture or connection: the part is held in reality by something not in the model.", "A load put on the wrong part."]
+actions = ["If the part should not turn on its concentric mate, set the mate to lock rotation in SolidWorks (Lock rotation in the mate's options) and analyse the connections again.", "Or hold it another way: set its connection to Fixed (Connections tab, Edit), or add a fixture.", "If the load belongs elsewhere, move it to the part that carries it."]
+
 [PART_EXCLUDED_MECHANISM]
 severity = "warning"
 stage = "resolve"
 what = "The assembly is not fully constrained: {count} part(s) are free to move and are left out of the analysis: {parts} ({motions}). Loads on them, not carried: {loads}."
 explain = "These parts can move without straining anything, for example a part held only by a hinge that nothing stops turning. Under a load they would just move out of the way, so they carry nothing: they are left out so the rest of the model can be solved, and their loads and weight are not included. Click this message to select them in SolidWorks. If they should carry load, add a fixture, another connection, or lock the hinge's rotation."
 likely_causes = ["A part on a hinge (concentric mate) with nothing else holding it.", "A sliding joint with nothing stopping the slide.", "A connection set to 'none' or 'sliding, no separation' that was the part's only hold."]
-actions = ["Select the parts from this message and check how they should be held.", "Tick Lock rotation on the hinge (or the concentric mate) if the parts should not turn.", "Add a fixture or a connection that stops the named motion."]
+actions = ["Select the parts from this message and check how they should be held.", "If the parts should not turn, set their concentric mate to lock rotation in SolidWorks (Lock rotation in the mate's options), or tick Lock rotation on a hinge you added, and analyse the connections again.", "Add a fixture or a connection that stops the named motion."]
 
 [LOAD_HYDROSTATIC_DRY]
 severity = "warning"
@@ -157,9 +165,9 @@ actions = ["Open the part's STEP file in PrePoMax and inspect the geometry.", "S
 [MESH_INVERTED]
 severity = "blocking"
 stage = "mesh"
-what = "Part {part} has {count} inverted elements after meshing."
-explain = "Some elements in this part's mesh are turned inside out. Results from such elements are meaningless, so the run stops. It usually comes from distorted geometry such as very thin slivers or knife edges; simplify those regions or choose a different mesh fidelity."
-likely_causes = ["Curved second-order nodes on small radii folded over the element."]
+what = "Part {part} has {count} inverted or flat elements after meshing."
+explain = "Some elements in this part's mesh are turned inside out, or flat (no volume at all). Results from such elements are meaningless, and a flat element's stiffness swamps the rest of the part, so the run stops. It usually comes from distorted geometry such as very thin slivers or knife edges; simplify those regions or choose a different mesh fidelity."
+likely_causes = ["Curved second-order nodes on small radii folded over the element.", "The mesher closed a gap between two triangulations of a face with a flat element."]
 actions = ["Set a finer mesh size.", "Remove small fillets from the part."]
 
 [SOLVER_NOT_FOUND]
@@ -295,8 +303,8 @@ severity = "blocking"
 stage = "resolve"
 what = "The model is a mechanism: {count} free motion(s) without straining anything. {motions}."
 explain = "Checked before meshing: some parts can move freely without stretching anything, for example a part on a sliding joint with nothing stopping the slide, or parts touching only through contact. The solver could not find an answer. The listed motions show what is free; add a fixture or change a connection on the Connections tab."
-likely_causes = ["A joint (revolute, sliding, line contact) leaves a motion that no fixture or other connection stops.", "A fixture constrains too few directions.", "Two parts are joined only along a line, which acts as a hinge."]
-actions = ["Add a fixture that stops the named motion.", "Change the joint to a tie with a decision on the connection.", "Check the mates on the named parts."]
+likely_causes = ["A concentric mate lets parts turn that are really fixed together: AsmFEA makes it a hinge.", "A joint (revolute, sliding, line contact) leaves a motion that no fixture or other connection stops.", "A fixture constrains too few directions.", "Two parts are joined only along a line, which acts as a hinge."]
+actions = ["If the named parts should not turn on their concentric mate, set the mate to lock rotation in SolidWorks (Lock rotation in the mate's options) and analyse the connections again; or set the connection to Fixed (Connections tab, Edit).", "Add a fixture that stops the named motion.", "Check the other mates on the named parts."]
 
 [INTERFERENCE]
 severity = "warning"
@@ -449,6 +457,14 @@ what = "The {joint} joint between {parts} has no axis or direction: no cylindric
 explain = "A hinge or sliding joint needs a direction to turn about or slide along. None could be found: the parts do not meet on a cylinder and no mate gives a direction. On the Connections tab choose Sliding joint and pick the direction, or change the connection."
 likely_causes = ["The joint was classified from mates whose geometry was not exported with a direction.", "The parts touch only on flat faces."]
 actions = ["Mate the parts with a concentric or slot mate on a cylindrical face, or decide the connection as a tie."]
+
+[TIE_EMPTY]
+severity = "warning"
+stage = "deck"
+what = "The bond between {parts} ({area} mm^2) joins no nodes: those parts are not connected there."
+explain = "A bonded connection was found between these parts, but when the model was built every mesh node on its face was already held by another connection, so this one joins nothing. The structure is solved without it, which can make it much more flexible than it is (a splice plate left loose, for example). It usually means a plate lies across several parts and one connection claimed the whole face."
+likely_causes = ["A plate or face lies across several parts, and another connection took all of its nodes.", "The faces only meet along an edge already bonded by the faces beside it."]
+actions = ["Click this message to see the parts in SolidWorks and check how they meet.", "Report the model: a connection that joins nothing is a defect in AsmFEA's connection building."]
 
 [BOLT_NO_BEARING_FACE]
 severity = "blocking"

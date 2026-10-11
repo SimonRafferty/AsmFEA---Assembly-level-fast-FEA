@@ -144,6 +144,11 @@
         <span class="btn">Sliding with friction...</span>, <span class="btn">Sliding joint...</span> or
         <span class="btn">Not connected</span>. <span class="btn">Automatic</span> undoes your choice.</li>
       <li>Weld beads appear as their own rows.</li>
+      <li>On a large model (over 50 parts) every part is first bonded to the parts it touches, and mates are
+        applied where they free a motion that matters; small parts hanging off the structure are left out and listed in
+        the report. Advanced &gt; Connections chooses the method yourself.</li>
+      <li>If parts are still floating, a window lists them with the gap to their nearest neighbour: raise the bond
+        tolerance to join them, or leave them out of the analysis (they stay in SolidWorks).</li>
     </ul>
     <div class="tip">Hover over any button for a tip. Double-click a connection or a warning, or press
       <span class="btn">?</span>, for a full explanation.</div>

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -200,6 +201,10 @@ def _in_footprint(X: np.ndarray, c: dict) -> np.ndarray:
     nodes it cannot tie: a node is the dependent of one constraint only, and a whole face claimed
     by its first tie left the next ties on it with none (found live: a plate meeting stand-off
     edges floated)."""
+    if c.get("geometry") == "overlap" and c.get("box"):
+        # an overlap bonded across its box (bond-first, D81): the nodes inside it
+        b = np.asarray(c["box"], float)
+        return np.all((X >= b[:3]) & (X <= b[3:]), axis=1)
     S = np.asarray(c.get("samples") or [], float)
     if c.get("geometry") != "plane" or c.get("normal") is None or len(S) < 3 or c.get("butt"):
         return np.ones(len(X), bool)
@@ -309,13 +314,67 @@ def plan_joints(model: Model, connections: list[dict], by_part: dict, first_node
     return out, diags
 
 
+def mean_motion(X: np.ndarray, w: np.ndarray, at: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """A face's mean motion from its nodes' displacements (D84): translation t = sum(wn_i u_i) and best-fit rotation
+    theta = sum(C_i u_i) about ``at`` (the weighted centroid), the least-squares rigid motion of the nodes
+    (J theta = sum(wn_i r_i x u_i), J = sum(wn_i (|r_i|^2 I - r_i r_i^T))). Returns (wn (n,), C (n, 3, 3)).
+    The same coefficients serve CalculiX's equations and the hybrid solver's rows."""
+    wn = np.asarray(w, float) / float(np.sum(w))
+    r = np.asarray(X, float) - np.asarray(at, float)
+    J = np.einsum("i,ij,ik->jk", wn, r, r)
+    J = np.trace(J) * np.eye(3) - J
+    Jinv = np.linalg.pinv(J)
+    skew = np.zeros((len(r), 3, 3))
+    skew[:, 0, 1], skew[:, 0, 2] = -r[:, 2], r[:, 1]
+    skew[:, 1, 0], skew[:, 1, 2] = r[:, 2], -r[:, 0]
+    skew[:, 2, 0], skew[:, 2, 1] = -r[:, 1], r[:, 0]
+    C = wn[:, None, None] * np.einsum("jk,ikl->ijl", Jinv, skew)
+    return wn, C
+
+
+def _rotation_holds(vectors) -> dict:
+    """The turns a pin's rotation node must not make, as {"spc": [dofs held outright], "equations": [[(dof, coef),
+    ...], ...]}: held directions along X, Y or Z are plain boundary conditions; others (a pin's axis at an angle) are
+    equations, each with its own first (dependent) DOF, none of which is also held outright."""
+    V = np.array([np.asarray(v, float) / np.linalg.norm(v) for v in vectors], float).reshape(-1, 3)
+    if len(V) == 0:
+        return {"spc": [], "equations": []}
+    _, sv, vt = np.linalg.svd(V)
+    basis = vt[:int(np.sum(sv > 1e-9))]                  # the held directions, independent
+    if len(basis) == 3:
+        return {"spc": [1, 2, 3], "equations": []}
+    # reduced row echelon form: each row's leading DOF appears in no other row
+    R = basis.copy()
+    piv = []
+    for r in range(len(R)):
+        cands = [c for c in range(3) if c not in piv]
+        c = max(cands, key=lambda c: abs(R[r, c]))
+        R[r] /= R[r, c]
+        for q in range(len(R)):
+            if q != r:
+                R[q] -= R[q, c] * R[r]
+        piv.append(c)
+    spc, eqs = [], []
+    for r, c in enumerate(piv):
+        others = [(d, R[r, d]) for d in range(3) if d != c and abs(R[r, d]) > 1e-12]
+        if not others:
+            spc.append(c + 1)
+        else:
+            eqs.append([(c + 1, 1.0)] + [(d + 1, float(v)) for d, v in others])
+    return {"spc": sorted(spc), "equations": eqs}
+
+
 def write_deck(path: Path, model: Model, instances: list[Instance], connections: list[dict],
                face_map: dict[str, tuple[str, int]], load_cases: list[str], threads_hint: int = 0,
                bolts: Optional[list[dict]] = None, stabilise: Optional[list[str]] = None,
-               buckling: bool = True) -> DeckResult:
+               buckling: bool = True, pin_axes: Optional[dict] = None,
+               held_spins: Optional[list[str]] = None) -> DeckResult:
     """bolts: preloaded-bolt plans (pipeline.plan_preloaded_bolts); stabilise: parts held
     only by contact, which get weak springs to ground; buckling=False leaves out the
-    buckling steps (contact decks)."""
+    buckling steps (contact decks). pin_axes: {face id: {axis, axis_point}} of the pinned cylindrical faces (pins,
+    turning only about their own axis); held_spins: pin faces whose own turn is held too (resolve)."""
+    pin_axes = pin_axes or {}
+    held_spins = set(held_spins or [])
     bolts = bolts or []
     stabilise = stabilise or []
     diags: list[Diagnostic] = []
@@ -329,25 +388,41 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         part, idx = face_map[fid]
         return by_part[part], idx
 
-    # Pinned fixtures: the face is a rigid body whose reference node (at the face
-    # centroid) is held in the chosen translations and rotations; rotation is free
-    # otherwise. Their extra nodes are numbered after every mesh node.
+    # Pinned fixtures: each face is a rigid body of its own (a pin), whose reference node at the face centroid is
+    # held in the chosen translations; a cylindrical face turns only about its own axis (its other two turns held by
+    # equations on the rotation node, its own turn as well when held_spins says so); a flat face's turns are held as
+    # hold_rotations says. One rigid body for all of a fixture's faces (as before 2026-10-10) let four separate pins
+    # turn together, every way, about their common centroid. Extra nodes are numbered after every mesh node.
     next_node = max((i.node0 + len(i.X) for i in instances), default=0) + 1
     pins = []
     for fx in model.fixtures:
         if fx.type != "pinned":
             continue
-        ids, cen, area = set(), np.zeros(3), 0.0
         for fid in fx.faces:
             inst, idx = faces_of(fid)
-            ids.update(int(inst.node0 + n) for n in inst.face_nodes(idx))
-            c = _face_centroid(inst, idx)
-            a = float(inst.face_areas(idx).sum())
-            cen += a * c
-            area += a
-        pins.append({"fx": fx, "nodes": sorted(ids), "ref": next_node, "rot": next_node + 1,
-                     "at": (cen / area).tolist()})
-        next_node += 2
+            ids = sorted({int(inst.node0 + n) for n in inst.face_nodes(idx)})
+            hold = [np.eye(3)[d - 1] for d in fx.hold_rotations]
+            pa = pin_axes.get(fid)
+            if pa is not None:
+                a = np.asarray(pa["axis"], float) / np.linalg.norm(pa["axis"])
+                hold += list(np.linalg.svd(a[None])[2][1:])
+                if fid in held_spins:
+                    hold.append(a)
+            # each node's share of the face's area: the weights of the face's mean motion (D84)
+            share: dict[int, float] = defaultdict(float)
+            for _, fn, e, cn in inst.face_elements(idx):
+                a_f, _, fnodes = _face_geom(inst, e, cn, fn)
+                for n in fnodes:
+                    share[int(inst.node0 + n)] += a_f / len(fnodes)
+            wts = np.array([share.get(n, 0.0) for n in ids])
+            if wts.sum() <= 0:
+                wts = np.ones(len(ids))
+            Xp = inst.X[np.asarray(ids) - inst.node0 - 1]
+            at = (wts[:, None] * Xp).sum(axis=0) / wts.sum()
+            pins.append({"fx": fx, "face": fid, "nodes": ids, "ref": next_node, "rot": next_node + 1,
+                         "at": at.tolist(), "weights": wts.tolist(), "X": Xp, "hold": _rotation_holds(hold),
+                         "hold_vectors": [np.asarray(v, float).tolist() for v in hold]})
+            next_node += 2
 
     joints, jdiags = plan_joints(model, connections, by_part, next_node)
     diags += jdiags
@@ -478,8 +553,8 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             # elements) reports zero: the reaction is read on the face nodes instead.
             reaction_sets.append(name)
             fixed_nodes.update(p["nodes"])
-            info["fixtures"][p["fx"].id] = {"set": name, "nodes": len(p["nodes"]), "ref_node": p["ref"],
-                                            "at": p["at"]}
+            info["fixtures"].setdefault(p["fx"].id, {"pins": []})["pins"].append(
+                {"face": p["face"], "set": name, "nodes": len(p["nodes"]), "ref_node": p["ref"], "at": p["at"]})
         if reaction_sets:
             # Explicit unique node list: a union of named sets counts nodes shared by two
             # fixture faces twice in the printed totals (milestone 6 plate case).
@@ -666,6 +741,13 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 tie_rec.update(section=True, node_area={str(g): round(v, 6) for g, v in share.items()}, facets=facets)
                 section_sets.append(f"{name}S")
             info["ties"].append(tie_rec)
+            if not slave and c.get("geometry") != "line":
+                # a face bond that bonds nothing: its nodes were all taken by other constraints. Silent, it left
+                # a pinned cradle frame's chord splices unjoined and the cradle 2.5x too soft (2026-10-10). An edge strip
+                # (line) whose nodes the faces beside it already bond is incidental and not reported.
+                diags.append(make("TIE_EMPTY", where={"parts": sorted({pa, pb}), "connections": [c["id"]]},
+                                  parts=" and ".join(sorted({pa, pb})), area=round(float(c.get("area", 0.0)), 1),
+                                  evidence={"slave_part": si.part_id, "master_part": mi.part_id}))
             if not slave:
                 continue
             f.write(f"*NSET, NSET={name}S\n")
@@ -675,7 +757,8 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             for face in (master_faces or [mf]):
                 for eid, fnum, _, _ in mi.face_elements(face):
                     f.write(f"{eid}, S{fnum}\n")
-            tol = (float(butt["tolerance"]) if butt else bond_tol) + 0.05
+            # an overlap bonded deeper than the tolerance (bond-first, D81) needs its own depth
+            tol = (float(butt["tolerance"]) if butt else max(bond_tol, -float(c.get("gap", 0.0) or 0.0))) + 0.05
             # A butt joint across a gap (D31): ADJUST=YES moves the butting end's nodes onto the surface
             # it meets, as if the member were extended to it (the gap filled by weld), instead of rigid
             # links across the gap, whose ends gave a false stress peak.
@@ -684,7 +767,40 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
 
         # Faces that slide but do not separate (a hinge's parts): each slave node keeps the master face's
         # displacement along the face normal, by one equation, and is free in the face's plane
+        # which joints hinge on a pin (decided here, before the sliding faces: see below and the joints)
+        pin_of = {n: pk for pk, p in enumerate(pins) for n in p["nodes"]}
+        for j in joints:
+            pa, pb = j["bodies"][0][0], j["bodies"][1][0]
+            # a side lying on a pin (a pivot bar's pinned face that the bosses also hinge on): the pin holds those
+            # nodes, so that side is the pin's own rigid ring and the joint turns against it. Left as it was, the
+            # side lost every node to the pin and the joint held nothing there (found 2026-10-10)
+            on_pin = {sd: Counter(pin_of[n] for n in j["nodes"][sd] if n in pin_of) for sd in (pa, pb)}
+            if on_pin[pb] and (not on_pin[pa] or max(on_pin[pb].values()) > max(on_pin[pa].values())):
+                pa, pb = pb, pa                            # the pin's side is side A
+            share = None
+            if on_pin[pa]:
+                pk, cnt = on_pin[pa].most_common(1)[0]
+                if cnt >= 0.5 * max(len(j["nodes"][pa]), 1):
+                    share = pk
+            j["_sides"], j["_pin"] = (pa, pb), share
+        # nodes that hang from a pin: its face, and side B of each joint on it. No sliding equation leans on them:
+        # its force would pass along the chain to the pin's reference node, where no reaction is reported (+4.8 %
+        # on the pinned hinged plates, 2026-10-10)
+        on_pins = {n for p in pins for n in p["nodes"]}
+        # ... nor on a joint's nodes at all: they are driven by its rigid body or its equations, and an equation
+        # leaning on another's driven node gave nonsense in CalculiX (a 100 N load reacted by 1443 N, when the
+        # sliding face's master side became the face with the hinge's nodes; found 2026-10-10)
+        on_pins |= {n for j in joints for sd in j["nodes"].values() for n in sd}
+        # (and none on a fixed node, below: force through an equation into a held node is left out of CalculiX's
+        # printed reactions; found 2026-10-10 when a refined part's face became a sliding face's slave and the
+        # masters met the fixture: 1444 N of reaction for a 100 N load)
         info["slides"] = []
+        # pins, joints and sliding faces as the hybrid solver reads them (it cannot parse rigid bodies and
+        # equations): each as node sets and the motions left free (deck_info["hybrid"], 2026-10-10)
+        hybrid = info["hybrid"] = {"pins": [], "joints": [], "slides": [], "unsupported": []}
+        for c in connections:
+            if c["type"] in ("gear", "rack_pinion"):
+                hybrid["unsupported"].append(f"{c['type']} coupling")
         for k, c in enumerate(c for c in connections if c["type"] == "slide" and c.get("sides")):
             (pa, fa), (pb, fb) = [(s["part"], s["face"]) for s in c["sides"]]
             ia, ib = by_part[pa], by_part[pb]
@@ -692,13 +808,53 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             (si, sf), (mi, mf) = ((ia, fa), (ib, fb)) if mean(ia, fa) <= mean(ib, fb) else ((ib, fb), (ia, fa))
             slave = [int(si.node0 + n) for n in _tie_nodes(si, sf, c)]
             slave = [n for n in slave if n not in slaved and n not in fixed_nodes]
-            n_eq = _write_slide(f, c, si, mi, mf, slave, bond_tol)
-            slaved.update(slave)
+            used: list = []
+            n_eq = _write_slide(f, c, si, mi, mf, slave, bond_tol, hybrid["slides"],
+                                skip_masters=on_pins | fixed_nodes, used=used)   # nor on fixed nodes (D73)
+            slaved.update(used)                        # only nodes given an equation: the rest stay free for others
             info["slides"].append({"connection": c["id"], "slave_part": si.part_id, "master_part": mi.part_id,
                                    "slave_nodes": n_eq})
 
         for k, p in enumerate(pins, start=1):
-            f.write(f"*RIGID BODY, NSET=PIN{k}, REF NODE={p['ref']}, ROT NODE={p['rot']}\n")
+            hybrid["pins"].append({"nodes": p["nodes"], "at": p["at"], "hold_trans": sorted(p["fx"].dofs),
+                                   "hold_rot": p["hold_vectors"], "weights": p["weights"]})
+            # the pin holds the face's mean motion, not every node rigidly (D84): a rigid ring stiffened the bore
+            # and the tube beside it (a pinned cradle frame's highest stresses sat beside its pivots). The reference node
+            # takes the face's weighted mean translation and the rotation node its best-fit rotation, each by an
+            # equation whose dependent is a face node (the reference node is held, so cannot be dependent)
+            wn, C = mean_motion(p["X"], np.asarray(p["weights"]), np.asarray(p["at"]))
+            nodes = list(p["nodes"])
+            n_f = 3 * len(nodes)
+            # the six equations as rows over the face's DOFs (node i, direction c at column 3 i + c), then the
+            # reference node's translations and the rotation node's turns
+            A = np.zeros((6, n_f + 6))
+            for c in range(3):
+                A[c, c:n_f:3] = wn
+                A[c, n_f + c] = -1.0
+                A[3 + c, :n_f] = C[:, c, :].reshape(-1)
+                A[3 + c, n_f + 3 + c] = -1.0
+            # reduced form: six well-conditioned face DOFs (pivoted QR) made dependent, each appearing in its own
+            # equation only. Written as they came, every dependent appeared in the other equations too, and
+            # CalculiX's cascade cancelled them ("zero coefficient on the dependent side", 2026-10-10)
+            import scipy.linalg as sla
+            piv = sla.qr(A[:, :n_f], pivoting=True, mode="r")[1][:6]
+            R = np.linalg.solve(A[:, piv], A)
+            cols = [(nodes[j // 3], j % 3 + 1) for j in range(n_f)] + [(p["ref"], d) for d in (1, 2, 3)] + \
+                   [(p["rot"], d) for d in (1, 2, 3)]
+            for r_i in range(6):
+                lead = int(piv[r_i])
+                big = np.abs(R[r_i]).max()
+                terms = [(cols[lead][0], cols[lead][1], 1.0)]
+                terms += [(cols[j][0], cols[j][1], float(R[r_i, j])) for j in range(n_f + 6)
+                          if j != lead and abs(R[r_i, j]) > 1e-13 * big]
+                f.write(f"*EQUATION\n{len(terms)}\n")
+                flat = [f"{nn}, {dd}, {cf:.12g}" for nn, dd, cf in terms]
+                for i0 in range(0, len(flat), 4):
+                    f.write(", ".join(flat[i0:i0 + 4]) + "\n")
+            # the held turns not along X, Y or Z (a pin's axis at an angle): one equation each on the rotation node
+            for terms in p["hold"]["equations"]:
+                f.write(f"*EQUATION\n{len(terms)}\n")
+                f.write(", ".join(f"{p['rot']}, {d}, {c:.12g}" for d, c in terms) + "\n")
 
         # Joints: rigid reference on each side, equations leave the free motion free.
         info["joints"] = []
@@ -708,25 +864,41 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         joint_dummies = []
         subst = _coupling_substitutions(joints, connections)
         info["couplings"] = [{"connection": cid, "joints": js} for cid, js in subst.pop("_records", [])]
+        pin_joint_sets = info["pin_joint_sets"] = []     # their nodes on side B: force into a pin (printed)
         for k, j in enumerate(joints, start=1):
-            (pa, ra, qa), (pb, _, free) = j["bodies"]
-            nodes_a = [n for n in sorted(j["nodes"][pa]) if n not in slaved and n not in fixed_nodes]
-            fixed_nodes.update(nodes_a)
-            f.write(f"*NSET, NSET=J{k}A\n")
-            _ids(f, nodes_a)
-            f.write(f"*RIGID BODY, NSET=J{k}A, REF NODE={ra}, ROT NODE={qa}\n")
+            (_, ra, qa), (_, _, free) = j["bodies"]
+            (pa, pb), share = j["_sides"], j["_pin"]       # decided before the sliding faces (above)
+            if share is not None:
+                ra, qa = pins[share]["ref"], pins[share]["rot"]
+                x_ref = np.asarray(pins[share]["at"], float)
+                nodes_a = []
+            else:
+                nodes_a = [n for n in sorted(j["nodes"][pa]) if n not in slaved and n not in fixed_nodes]
+                fixed_nodes.update(nodes_a)
+                f.write(f"*NSET, NSET=J{k}A\n")
+                _ids(f, nodes_a)
+                f.write(f"*RIGID BODY, NSET=J{k}A, REF NODE={ra}, ROT NODE={qa}\n")
+                x_ref = np.asarray(j["at"])
             nodes_b = [n for n in sorted(j["nodes"][pb]) if n not in slaved and n not in fixed_nodes]
             fixed_nodes.update(nodes_b)
+            if share is not None and nodes_b:
+                # the load through this joint goes into the pin's held reference node by equations, where
+                # CalculiX reports no reaction: printed here instead (the internal force at side B's nodes), and
+                # post counts it with the supports
+                f.write(f"*NSET, NSET=PJ{k}\n")
+                _ids(f, nodes_b)
+                pin_joint_sets.append(f"PJ{k}")
             ib = coords[pb]
             a = np.asarray(j["axis"])
-            x_ref = np.asarray(j["at"])
+            x_joint = np.asarray(j["at"])
             for n in nodes_b:
                 r = ib.X[n - ib.node0 - 1] - x_ref
+                rj = ib.X[n - ib.node0 - 1] - x_joint      # the free turn is about the joint's own axis line
                 # free coordinate: rotation phi about a (u += phi a x r) or slide s along a (u += s a)
                 if j["kind"] in ("revolute", "hinge"):
-                    g = np.cross(a, r)
+                    g = np.cross(a, rj)
                 elif j["kind"] == "screw":                 # turn plus the advance it drives
-                    g = np.cross(a, r) + j["lead"] / (2 * np.pi) * a
+                    g = np.cross(a, rj) + j["lead"] / (2 * np.pi) * a
                 else:
                     g = a
                 # a joint coupled to another (gear, rack and pinion): its free motion is a multiple of that one's
@@ -745,6 +917,20 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                     for s in range(0, len(flat), 4):  # at most 12 entries (4 terms) per line
                         f.write(", ".join(flat[s:s + 4]) + "\n")
             joint_dummies.append((free, j.get("locked", False) or free in subst))
+            # the hybrid solver gets each side's whole face: where it shares nodes with another ring (the cradle's
+            # bosses, boss tubes and pins on one pivot face) the two agree there. CalculiX allows a node in one
+            # rigid ring only, so its sets above leave such nodes to the first ring, and a later joint could be
+            # left with an empty side, joining nothing (its free turn then unresisted: a singular joint system,
+            # found on the cradle 2026-10-10)
+            hybrid["joints"].append({"kind": j["kind"], "at": j["at"], "axis": j["axis"],
+                                     "nodes_a": [] if share is not None else sorted(int(n) for n in j["nodes"][pa]),
+                                     "nodes_b": sorted(int(n) for n in j["nodes"][pb]),
+                                     "locked": bool(j.get("locked", False)),
+                                     "coupled": free in subst, "lead": j.get("lead", 0.0), "pin": share})
+            if j["kind"] == "screw" and not j.get("locked", False):
+                hybrid["unsupported"].append("screw joint")
+            if free in subst:
+                hybrid["unsupported"].append("coupled joint")
             info["joints"].append({"kind": j["kind"], "parts": j["parts"], "connections": j["connections"],
                                    "axis": j["axis"], "at": j["at"], "nodes": j["new_nodes"]})
 
@@ -760,7 +946,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             for p in pins:
                 for d in sorted(p["fx"].dofs):
                     f.write(f"{p['ref']}, {d}, {d}\n")
-                for d in sorted(p["fx"].hold_rotations):
+                for d in p["hold"]["spc"]:
                     f.write(f"{p['rot']}, {d}, {d}\n")
 
         # Constrained DOFs per node. CalculiX's RF leaves out external load applied
@@ -785,6 +971,10 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         # One step per load case
         total_mass = 0.0
         held_mass = np.zeros(3)     # mass whose weight lands directly on held DOFs, per direction
+        # the pins' faces' share of it, kept apart: the hybrid solver reads a pin's reaction itself and adds
+        # this back to print what CalculiX prints (D85)
+        pin_nodes = {n for p in pins for n in p["nodes"]}
+        pin_mass = 0.0
         for inst in instances:
             rho = model.material(inst.material).density
             vols_all = 0.0
@@ -799,6 +989,8 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                     for r in rows:
                         for k in np.nonzero(hit[r])[0]:
                             held_mass += rho * vols[r] * w[k] * held[int(gids[r, k])]
+                            if int(gids[r, k]) in pin_nodes:
+                                pin_mass += rho * vols[r] * w[k]
             total_mass += vols_all * rho
         info["total_mass"] = total_mass
         remote_points: dict[str, dict] = {}      # remote loads: their faces' centroid, point, moment
@@ -807,9 +999,11 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         info["hydrostatic_loads"] = hydro_points
 
         def build_loads(loads):
-            """(cload {node: force}, dload lines, applied total, share applied onto held DOFs)."""
+            """(cload {node: force}, dload lines, applied total, share applied onto held DOFs, the pins' faces'
+            part of that share)."""
             applied = np.zeros(3)
             supports = np.zeros(3)   # part of `applied` that lands on constrained DOFs
+            on_pins = np.zeros(3)
             cload: dict[int, np.ndarray] = {}
             dload_lines = []
             for ld in loads:
@@ -917,12 +1111,15 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                     dload_lines.append(f"EALL, GRAV, {ld.magnitude:.9g}, {d[0]:.9g}, {d[1]:.9g}, {d[2]:.9g}")
                     applied += total_mass * ld.magnitude * d
                     supports += held_mass * ld.magnitude * d
+                    on_pins += pin_mass * ld.magnitude * d
                 else:
                     diags.append(make("FEATURE_NOT_IMPLEMENTED", where={"loads": [ld.id]},
                                       feature=f"load type '{ld.type}'"))
             for gid, v in cload.items():
                 supports += into_supports(gid, v)
-            return cload, dload_lines, applied, supports
+                if gid in pin_nodes:
+                    on_pins += v
+            return cload, dload_lines, applied, supports, on_pins
 
         def write_loads(cload, dload_lines):
             # OP=NEW: each step carries only its own loads (CalculiX otherwise accumulates),
@@ -959,7 +1156,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         # One static step per load case
         for case in load_cases:
             loads = [ld for ld in model.loads if ld.load_case == case]
-            cload, dload_lines, applied, supports = build_loads(loads)
+            cload, dload_lines, applied, supports, on_pins = build_loads(loads)
             f.write("*STEP\n" + static)
             write_loads(cload, dload_lines)
             f.write(f"*NODE FILE{fq}\nU\n*EL FILE{fq}\nS\n")
@@ -967,6 +1164,8 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 f.write(f"*CONTACT FILE{fq}\nCDIS, CSTR\n")
             if reaction_sets:
                 f.write(f"*NODE PRINT, NSET=FIXALL, TOTALS=ONLY{fq}\nRF\n")
+            for pset in info.get("pin_joint_sets", []):
+                f.write(f"*NODE PRINT, NSET={pset}, TOTALS=ONLY{fq}\nRF\n")
             if bolts:
                 f.write(f"*NODE PRINT, NSET=BOLTNODES{fq}\nU\n")
             for sset in section_sets:
@@ -977,7 +1176,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             step += 1
             info["steps"].append({"kind": "static", "case": case, "step": step})
             info["load_cases"][case] = {"applied": applied.tolist(), "into_supports": supports.tolist(),
-                                        "loads": [ld.id for ld in loads]}
+                                        "into_pins": on_pins.tolist(), "loads": [ld.id for ld in loads]}
 
         # Linear buckling (CalculiX manual 7.5 *BUCKLE, 7.124 *STEP): with PERTURBATION the
         # last static step is the reference state and its loads are the preload; only the
@@ -990,13 +1189,13 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 loads = [ld for ld in model.loads if ld.load_case == case]
                 pre = [ld for ld in loads if not scales_in_buckling(ld)]
                 scal = [ld for ld in loads if scales_in_buckling(ld)]
-                c1, d1, a1, _ = build_loads(pre)
+                c1, d1, a1, _, _ = build_loads(pre)
                 f.write("*STEP\n*STATIC, SOLVER=PARDISO\n")
                 write_loads(c1, d1)
                 f.write("*END STEP\n")
                 step += 1
                 info["steps"].append({"kind": "preload", "case": case, "step": step})
-                c2, d2, a2, _ = build_loads(scal)
+                c2, d2, a2, _, _ = build_loads(scal)
                 f.write(f"*STEP, PERTURBATION\n*BUCKLE, SOLVER=PARDISO\n{st.buckling_modes}\n")
                 write_loads(c2, d2)
                 f.write("*NODE FILE\nU\n*END STEP\n")
@@ -1046,8 +1245,12 @@ def _coupling_substitutions(joints: list[dict], connections: list[dict]) -> dict
     return out
 
 
-def _write_slide(f, c: dict, si: Instance, mi: Instance, mf: int, slave: list[int], tol: float) -> int:
-    """*EQUATIONs holding each slave node to the master face along the face normal only. Returns the count."""
+def _write_slide(f, c: dict, si: Instance, mi: Instance, mf: int, slave: list[int], tol: float,
+                 record: list | None = None, skip_masters: set | None = None, used: list | None = None) -> int:
+    """*EQUATIONs holding each slave node to the master face along the face normal only. Returns the count.
+    record: each equation also appended as {slave, normal, masters [[node, weight]]} (for the hybrid solver).
+    skip_masters: nodes no equation may lean on (a pin's face: its force would go to the pin's reference node,
+    where no reaction is reported; the few slave nodes over a pinned hole's rim are left free instead)."""
     from ..hybrid.solve import _face_project
     faces, ids = [], []
     for _, fn, e, cn in mi.face_elements(mf):
@@ -1064,6 +1267,8 @@ def _write_slide(f, c: dict, si: Instance, mi: Instance, mf: int, slave: list[in
         if h is None:
             continue
         j, N, _ = h
+        if skip_masters and any(m in skip_masters for m in ids[j]):
+            continue
         if given is not None:
             nrm = given
         else:
@@ -1080,6 +1285,11 @@ def _write_slide(f, c: dict, si: Instance, mi: Instance, mf: int, slave: list[in
         flat = [f"{nn}, {d}, {cf:.12g}" for nn, d, cf in terms]
         for s in range(0, len(flat), 4):
             f.write(", ".join(flat[s:s + 4]) + "\n")
+        if used is not None:
+            used.append(int(n))
+        if record is not None:
+            record.append({"slave": int(n), "normal": nrm.tolist(),
+                           "masters": [[int(m), float(w)] for m, w in zip(ids[j], N) if abs(w) > 1e-12]})
         count += 1
     return count
 

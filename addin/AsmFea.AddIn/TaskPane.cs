@@ -34,6 +34,9 @@ namespace AsmFea.AddIn
         JObj FaceRefFromSelection(IModelDoc2 doc, IFace2 face, string id);
         int HighlightFaces(IModelDoc2 doc, JObj study, IEnumerable<string> faceIds);
         void SelectComponents(IModelDoc2 doc, IEnumerable<string> partIds);
+        /// <summary>Zoom the view to what is selected (Show in SolidWorks: highlighted parts are hard to see on a large
+        /// model, the user's request 2026-10-10).</summary>
+        void ZoomToSelection(IModelDoc2 doc);
         IList<IFace2> SelectedFaces(IModelDoc2 doc);
         /// <summary>
         /// Show a temporary arrow (not part of the document) along <paramref name="direction"/>
@@ -61,6 +64,8 @@ namespace AsmFea.AddIn
         private readonly ComboBox convergence = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
         private readonly ComboBox refine = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };   // D65
         private readonly ComboBox solverBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
+        private readonly ComboBox connMethod = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };   // D81
+        private string floatShownFor;        // the job whose floating-parts dialog was shown (once per run)
         private readonly List<Control> advancedRows = new List<Control>();
         private static readonly string[] FavourNames = { "Speed", "Balanced", "Accuracy" };
         private static readonly Dictionary<string, string> LegacyFavour = new Dictionary<string, string>
@@ -576,6 +581,9 @@ namespace AsmFea.AddIn
                 minBuck.Text = Fmt(lim["min_buckling_factor"]);
                 foreach (var tb in new[] { maxDefl, minFos, minBuck, bondTol }) tb.BackColor = SystemColors.Window;
                 bondTol.Text = s["bond_tolerance"] != null ? Fmt(s["bond_tolerance"]) : "0.5";      // the pipeline's default (GAP_TOL)
+                string cm = (string)s["connection_method"];
+                connMethod.SelectedItem = cm == "classic" ? "Classic" : cm == "bond_first" ? "Bond-first" : "Auto";
+                if (cm != null && cm != "auto") { advanced.Checked = true; ShowAdvanced(); }
                 bucklingModes.Enabled = minBuck.Enabled = BucklingOn(st);
                 ShowCases(st, CurrentCaseName);
                 RefreshPlan();
@@ -988,6 +996,7 @@ namespace AsmFea.AddIn
             convergence.Items.AddRange(new object[] { "Auto", "On", "Off" });
             refine.Items.AddRange(new object[] { "Auto", "On", "Off" });
             solverBox.Items.AddRange(new object[] { "Auto", "CalculiX", "Hybrid" });
+            connMethod.Items.AddRange(new object[] { "Auto", "Classic", "Bond-first" });
             Action<string, Control> addAdvanced = (label, c) =>
             {
                 var l = new Label { Text = label, AutoSize = true, Padding = new Padding(16, 6, 0, 0) };
@@ -1004,6 +1013,7 @@ namespace AsmFea.AddIn
             addAdvanced("Convergence check", convergence);
             addAdvanced("Refine where not converged", refine);
             addAdvanced("Solver", solverBox);
+            addAdvanced("Connections", connMethod);
             add("", fastLoads);
             heading("Pass / fail criteria (used in the reports)");
             add("Max deflection, mm", maxDefl);
@@ -1038,6 +1048,16 @@ namespace AsmFea.AddIn
             convergence.SelectedIndexChanged += (s, e) => storeMesh();
             refine.SelectedIndexChanged += (s, e) => storeMesh();
             solverBox.SelectedIndexChanged += (s, e) => storeMesh();
+            // how connections are found (D81): Auto chooses bond-first on models with many parts
+            connMethod.SelectedIndexChanged += (s, e) =>
+            {
+                if (showing || Study == null) return;
+                string m = (string)connMethod.SelectedItem;
+                if (m == null || m == "Auto") Settings(Study).Remove("connection_method");
+                else Settings(Study)["connection_method"] = m == "Classic" ? "classic" : "bond_first";
+                Stored();
+                Say("Connection method stored: click Analyse connections to apply it.");
+            };
             fastLoads.CheckedChanged += (s, e) =>
             {
                 if (showing || Study == null) return;
@@ -1502,6 +1522,7 @@ namespace AsmFea.AddIn
             public string Interface;
             public JObj Connection;        // the connections.json record, for a found interface
             public JObj Diagnostic;        // the exception, in Exceptions only
+            public bool Excluded;          // a part the user left out of the analysis (the floating-parts dialog)
         }
 
         private void ExplainConnection()
@@ -1720,6 +1741,11 @@ namespace AsmFea.AddIn
                     source = "automatic (next run)";
                 connList.Items.Add(new ListViewItem(new[] { type + ": " + PartsLabel(row.Parts), source }) { Tag = row });
             }
+            // parts the user left out of the analysis (never suppressed in SolidWorks): Edit... puts one back
+            if (st != null)
+                foreach (var pid in ((Settings(st)["excluded_parts"] as List<object>) ?? new List<object>()).Cast<string>())
+                    connList.Items.Add(new ListViewItem(new[] { "Left out of the analysis: " + pid, "your choice (Edit... to put back)" })
+                    { Tag = new ConnRow { Parts = new List<string> { pid }, Excluded = true }, ForeColor = Color.DimGray });
             Fit(connList);
         }
 
@@ -1836,6 +1862,18 @@ namespace AsmFea.AddIn
         {
             var row = SelectedConnection();
             if (row == null) { Say("Select a connection first.", true); return; }
+            if (row.Excluded)
+            {
+                if (MessageBox.Show(this, "Put " + row.Parts[0] + " back into the analysis?", "AsmFEA", MessageBoxButtons.YesNo,
+                                    MessageBoxIcon.Question) != DialogResult.Yes) return;
+                var ex = (Settings(Study)["excluded_parts"] as List<object>) ?? new List<object>();
+                ex.Remove(row.Parts[0]);
+                if (ex.Count == 0) Settings(Study).Remove("excluded_parts"); else Settings(Study)["excluded_parts"] = ex;
+                Stored();
+                LoadConnections();
+                Say(row.Parts[0] + " goes back into the analysis: click Analyse connections to apply it.");
+                return;
+            }
             var options = new[] { "Fixed (bonded)", "Sliding with friction...", "Sliding joint...", "Sliding, no separation",
                                   "Not connected (delete)", "Automatic" };
             string pick = Choose("Edit connection", "Set " + PartsLabel(row.Parts) + " to:", options);
@@ -2202,14 +2240,119 @@ namespace AsmFea.AddIn
                 if (state == "done") RefreshResults(next);
                 LoadConnections();                               // a run (or Check only) rewrites connections.json
                 // a run that could not finish: what to change, in plain words, once per run
+                // floating parts: the gap each needs, a tolerance to apply or parts to leave out (D81), once per run
+                var floating = diags.Where(x => FloatingCodes.Contains((string)x["code"]) && Gaps(x).Count > 0).ToList();
+                bool floatDialog = floating.Count > 0 && floatShownFor != jobId;
+                if (floatDialog)
+                {
+                    floatShownFor = jobId;
+                    ShowFloatingDialog(floating);
+                }
                 if ((state == "blocked" || state == "failed") && fixShownFor != jobId)
                 {
                     fixShownFor = jobId;
                     var blocking = ((job["diagnostics"] as List<object>) ?? new List<object>()).OfType<JObj>()
                                    .Where(x => (string)x["severity"] == "blocking").ToList();
+                    // what the floating-parts dialog already covers is not repeated in the fix box
+                    if (floatDialog)
+                        blocking = blocking.Where(x => !FloatingCodes.Contains((string)x["code"])
+                                                       && (string)x["code"] != "LOAD_ON_FLOATING_PART").ToList();
                     if (blocking.Count > 0) ShowFixBox(blocking, Path.GetDirectoryName(jobFile));
                 }
             }
+        }
+
+        private static readonly HashSet<string> FloatingCodes = new HashSet<string> { "PART_FLOATING", "PART_EXCLUDED_DISCONNECTED" };
+
+        /// <summary>{part: (gap mm, nearest part)} from a floating-parts diagnostic's evidence (resolve).</summary>
+        private static Dictionary<string, Tuple<double, string>> Gaps(JObj d)
+        {
+            var o = new Dictionary<string, Tuple<double, string>>();
+            var ev = d["evidence"] as JObj;
+            var g = ev == null ? null : ev["gaps"] as JObj;
+            if (g == null) return o;
+            foreach (var kv in g)
+            {
+                var r = kv.Value as JObj;
+                if (r != null && r["gap"] != null) o[kv.Key] = Tuple.Create(Convert.ToDouble(r["gap"]), (string)r["nearest"]);
+            }
+            return o;
+        }
+
+        /// <summary>Parts that nothing joins to the structure after bonding (D81, the user's design): each with the gap
+        /// to its nearest part. The bond tolerance can be raised to join them (it follows the parts kept), or parts
+        /// ticked to leave them out of the analysis (never suppressed in SolidWorks); Apply analyses again.</summary>
+        private void ShowFloatingDialog(List<JObj> diags)
+        {
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var gaps = new Dictionary<string, Tuple<double, string>>();
+            foreach (var d in diags) foreach (var kv in Gaps(d)) gaps[kv.Key] = kv.Value;
+            var f = new Form
+            {
+                Text = "AsmFEA: parts not joined to the structure", Width = 640, Height = 460, StartPosition = FormStartPosition.CenterScreen,
+                MinimizeBox = false, ShowIcon = false, TopMost = true
+            };
+            var intro = new Label
+            {
+                Dock = DockStyle.Top, Height = 54, Padding = new Padding(8),
+                Text = "These parts are not within the bond tolerance of anything joined to a fixture. Raise the tolerance to the gap " +
+                       "shown to bond them, or tick parts to leave them out of the analysis (they stay in SolidWorks)."
+            };
+            var list = new ListView { Dock = DockStyle.Fill, View = System.Windows.Forms.View.Details, CheckBoxes = true, FullRowSelect = true, HideSelection = false };
+            list.Columns.Add("Leave out / part", 280);
+            list.Columns.Add("Gap, mm", 70);
+            list.Columns.Add("Nearest part", 240);
+            foreach (var kv in gaps.OrderByDescending(k => k.Value.Item1))
+                list.Items.Add(new ListViewItem(new[] { kv.Key, kv.Value.Item1.ToString("0.###", inv), kv.Value.Item2 ?? "" }) { Tag = kv.Key });
+            var tol = new TextBox { Width = 70 };
+            bool typed = false;
+            Action suggest = () =>
+            {
+                if (typed) return;
+                var kept = list.Items.Cast<ListViewItem>().Where(i => !i.Checked).Select(i => gaps[(string)i.Tag].Item1).ToList();
+                double cur = Num(bondTol.Text) ?? 0.5;
+                double need = kept.Count == 0 ? cur : Math.Max(cur, Math.Ceiling((kept.Max() + 0.05) * 10) / 10);
+                tol.Text = need.ToString("0.###", inv);
+            };
+            suggest();
+            tol.KeyPress += (s, e) => typed = true;           // a value typed by the user is kept as it is
+            list.ItemChecked += (s, e) => suggest();
+            list.SelectedIndexChanged += (s, e) =>
+            {
+                if (list.SelectedItems.Count == 0 || Doc == null) return;
+                host.SelectComponents(Doc, new[] { (string)list.SelectedItems[0].Tag });
+                host.ZoomToSelection(Doc);
+            };
+            var apply = new Button { Text = "Apply and analyse again", AutoSize = true };
+            var close = new Button { Text = "Close", AutoSize = true };
+            apply.Click += (s, e) =>
+            {
+                var st = Study;
+                if (st == null) { f.Close(); return; }
+                var v = Num(tol.Text);
+                if (v == null || v < 0) { tol.BackColor = Color.MistyRose; return; }
+                Settings(st)["bond_tolerance"] = v.Value;
+                var ex = (Settings(st)["excluded_parts"] as List<object>) ?? new List<object>();
+                foreach (ListViewItem i in list.Items)
+                    if (i.Checked && !ex.Contains((string)i.Tag)) ex.Add((string)i.Tag);
+                if (ex.Count > 0) Settings(st)["excluded_parts"] = ex;
+                showing = true;
+                try { bondTol.Text = Fmt(v.Value); } finally { showing = false; }
+                Stored();
+                f.Close();
+                AnalyseConnections();
+            };
+            close.Click += (s, e) => f.Close();
+            var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 40, Padding = new Padding(6) };
+            bar.Controls.Add(new Label { Text = "Bond tolerance, mm", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
+            bar.Controls.Add(tol);
+            bar.Controls.Add(apply);
+            bar.Controls.Add(close);
+            f.Controls.Add(list);
+            f.Controls.Add(intro);
+            f.Controls.Add(bar);
+            f.AcceptButton = apply;
+            f.Show();
         }
 
         private void HighlightProblem()
@@ -2301,9 +2444,17 @@ namespace AsmFea.AddIn
             var where = d["where"] as JObj;
             if (where == null) return;
             var faces = ((where["faces"] as List<object>) ?? new List<object>()).Cast<string>().ToList();
-            if (faces.Count > 0 && Study != null && host.HighlightFaces(Doc, Study, faces) > 0) return;
+            if (faces.Count > 0 && Study != null && host.HighlightFaces(Doc, Study, faces) > 0)
+            {
+                host.ZoomToSelection(Doc);
+                return;
+            }
             var parts = ((where["parts"] as List<object>) ?? new List<object>()).Cast<string>().ToList();
-            if (parts.Count > 0) host.SelectComponents(Doc, parts);
+            if (parts.Count > 0)
+            {
+                host.SelectComponents(Doc, parts);
+                host.ZoomToSelection(Doc);
+            }
         }
 
         // ------------------------------------------------------------------ Results

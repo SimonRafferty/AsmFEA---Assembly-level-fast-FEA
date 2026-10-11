@@ -205,7 +205,9 @@ class GmshCliBackend:
         Xp = np.vstack([np.zeros((1, 3)), X])  # row = local id
         blocks, quality = finish_blocks(Xp, [(t, remap[c]) for t, c in blocks])
         if quality["inverted"]:
-            raise RuntimeError(f"inverted: {quality['inverted']} elements with a non-positive Jacobian")
+            # flat tets count too (D86): the same retry (optimised, then the next algorithm) clears them
+            raise RuntimeError(f"inverted: {quality['inverted']} elements with a non-positive Jacobian or no volume "
+                               f"({quality.get('flat', 0)} flat)")
         out = out_dir / "mesh.npz"
         save_neutral(out, X, blocks)
         quality["algorithm"] = label

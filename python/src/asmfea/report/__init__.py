@@ -403,6 +403,11 @@ def build_report(study: Path, pdf: bool = False) -> Path:
         rows.append([case, lc["max_disp"], vmax[0], vmax[1], fmin[0], fult, fmin[1]])
     _table(doc, ["Load case", "Max displacement (mm)", "Max von Mises, membrane + bending (MPa)", "In part",
                  "Min factor of safety (yield)", "Min factor of safety (ultimate)", "In part"], rows)
+    recs = A.weld_checks(res["load_cases"])
+    if recs:
+        _para(doc, "Recommended checks", 11, True, BLUE)
+        for line in recs:
+            _para(doc, line, style="List Bullet")
 
     # ---- main body: what matters first
     # ---- 3. Results
@@ -474,10 +479,16 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                          if e["code"] == "CONTACT_ONLY_SUPPORT" for p_ in e["where"]["parts"]})
     exc_codes = read_json(exc_path)["exceptions"] if exc_path.exists() else []
     disconnected = {p_ for e in exc_codes if e["code"] == "PART_EXCLUDED_DISCONNECTED" for p_ in e["where"]["parts"]}
-    reasons = {p_: "disconnected" if p_ in disconnected
+    small = conns_doc.get("small_parts", [])
+    small_ids = {s["part"] for s in small}
+    user_out = set(model.study.excluded_parts or [])
+    reasons = {p_: "disconnected" if p_ in disconnected else "user" if p_ in user_out else "small" if p_ in small_ids
                else "weld bead" if model.part(p_) and model.part(p_).kind == "weld_bead" else "fastener" for p_ in removed}
     sentences = (A.ALWAYS + A.mesh_levels(bool(conv)) + A.ties(sum(c["type"] == "tie" for c in conns))
                  + A.removed(reasons) + A.bolted(joints)
+                 + A.bond_first(conns_doc.get("method", "classic"), conns_doc.get("method_why"),
+                                len(conns_doc.get("bonded_redundant", [])) + len(conns_doc.get("bonded_on_pins", [])),
+                                small, defaults.SMALL_PART_VOLUME_FRACTION)
                  + A.contact([c["id"] for c in conns if c["type"] == "contact"], stabilised,
                              bool(res.get("buckling")) and any(c["type"] == "contact" for c in conns))
                  + A.joints(sum(c["type"] in ("revolute", "hinge") for c in conns), sum(c["type"] == "sliding" for c in conns))
@@ -516,7 +527,11 @@ def build_report(study: Path, pdf: bool = False) -> Path:
         if p_.kind == "member" and p_.member:
             prof = p_.member.profile
             treat += f", {prof.get('type', '')} " + " x ".join(_fmt(prof[k]) for k in ("b", "h", "d", "t") if k in prof)
-        if p_.id in removed:
+        if p_.id in {x["part"] for x in conns_doc.get("small_parts", [])}:
+            treat += " (left out: small part, see Assumptions)"
+        elif p_.id in (model.study.excluded_parts or []):
+            treat += " (left out by the user)"
+        elif p_.id in removed:
             treat += " (removed: see Connections)"
         vol = p_.body.volume if p_.body is not None else _geo_volume(study, p_.id)
         rows.append([p_.id, treat, p_.material or "-", vol, vol * mat.density * 1000 if mat and vol else None,
@@ -644,6 +659,13 @@ def build_report(study: Path, pdf: bool = False) -> Path:
             for lv in ("base", "refined", "local") if lv in m])
     if m.get("fallback_parts"):
         _para(doc, "Parts meshed by a fallback mesher: " + ", ".join(m["fallback_parts"]))
+    sel = res.get("refine_selection")
+    if conv and sel:
+        # a big model refined only where most stressed (D73)
+        _para(doc, f"The model is large, so the refined solve meshed finer only the {len(sel['parts'])} of {sel['of']} "
+                   f"parts whose assessed stress was at least {sel['fraction']:.0%} of the highest "
+                   f"({_fmt(sel['highest_MPa'])} MPa) in the base solve; the others kept their base mesh, and the "
+                   "convergence check measures the refined parts and the deflection.", 9)
     lp = res.get("local_pass")
     if conv and lp:
         # the local pass (D65): what was refined, the changes, and the extrapolated stress where the three agree
@@ -699,7 +721,8 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                    "joint bands (a bush) is marked \"at joints only\".", 9)
         _table(doc, ["Part", "Membrane + bending (MPa)", "Peak excl. joint edges (MPa)", "Min FoS yield",
                      "Min FoS ultimate", "Max disp. (mm)", "Mesh change"],
-               [[name, p_.get("membrane_bending"),
+               [[name, (f"{p_['membrane_bending']:.1f} (rose with the mesh: not used)" if p_.get("singular_fallback")
+                        else p_.get("membrane_bending")),
                  p_["peak_vm_excl_ties"] if p_["peak_vm_excl_ties"] is not None else "at joints only",
                  p_["min_fos"], p_.get("min_fos_ultimate"), p_["max_disp"],
                  f"{max(conv_case.get(name, {}).get('max_disp', 0), conv_case.get(name, {}).get('stress', conv_case.get(name, {}).get('peak_vm_excl_ties', 0))):.1%}"
@@ -779,8 +802,8 @@ def build_summary(study: Path, pdf: bool = False) -> Path:
         vm = assessed_stress(parts[vm_part]) if vm_part else None
         if vm is not None and vm > worst_vm:
             worst_vm, worst_case = vm, case
-        rows.append([case, f"{_fmt(vm)}\n({vm_part})", f"{_fmt(lc['max_disp'])}", f"{_fmt(fmin[0])}\n({fmin[1]})",
-                     _fmt(fult) if fult else "-"])
+        # the values only: the summary's readers do not know the parts by name (the user's request, 2026-10-11)
+        rows.append([case, _fmt(vm), _fmt(lc["max_disp"]), _fmt(fmin[0]), _fmt(fult) if fult else "-"])
 
     _para(doc, f"Structural analysis summary: {asm_name}", 15, True, BLUE)
     _para(doc, f"Study {study_name}  |  {when:%d %B %Y}  |  AsmFEA {res['versions']['asmfea']} with CalculiX", 8.5,
@@ -820,6 +843,10 @@ def build_summary(study: Path, pdf: bool = False) -> Path:
                  "Min factor of safety (ultimate)"], rows, [3.0, 4.0, 3.5, 3.8, 3.2], size=9)
     if res.get("accuracy"):                             # one line: how far to trust the table (D60)
         _para(doc, res["accuracy"]["summary"], 8.5, bold=True)
+    recs = A.weld_checks(res["load_cases"], names=False)
+    if recs:                                            # the recommended joint checks, without part names
+        _para(doc, "Recommended: " + " ".join(r_ for r_ in recs if not r_.startswith("If the loads"))
+              + f" Locations: {study_name}_report.docx.", 8.5)
     lim = model.study.limits
     limits = []
     if lim.min_fos:

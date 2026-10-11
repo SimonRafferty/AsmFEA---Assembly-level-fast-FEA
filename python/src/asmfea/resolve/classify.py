@@ -652,8 +652,9 @@ def bolted_joints(model: Model, geoms) -> tuple[list[dict], list[Diagnostic]]:
 
 
 def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
-             face_map: dict | None = None) -> tuple[list[dict], list[str], list[Diagnostic]]:
-    """Returns (connections, removed part ids, diagnostics)."""
+             face_map: dict | None = None, exclude: dict | None = None) -> tuple[list[dict], list[str], list[Diagnostic]]:
+    """Returns (connections, removed part ids, diagnostics). exclude: {part: why} left out before anything is
+    classified (parts the user left out; small parts, bond-first)."""
     diags: list[Diagnostic] = []
     kinds = {p.id: p.kind for p in model.parts}
     steps = {p.id: (p.step, tuple(p.transform)) for p in model.parts}
@@ -665,6 +666,7 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
     for p in model.parts:
         if p.kind == "weld_bead":
             removed[p.id] = "weld bead (D7: removed, the parts it joins are tied directly)"
+    removed.update(exclude or {})
 
     conns = []
     by_pair = defaultdict(list)
@@ -829,6 +831,10 @@ def _line_strip(ln: dict) -> dict | None:
     from .welds import _strip_samples
     w = defaults.LINE_BOND_WIDTH
     length = float(np.linalg.norm(np.asarray(seg[1]) - np.asarray(seg[0])))
+    if not np.isfinite(length) or length < defaults.LINE_MIN_LENGTH:
+        # an edge contact of no length is a point contact: tubes of a weldment touching at a corner made a strip
+        # with NaN points (its direction is 0 / 0) and the mechanism check crashed on them (found live 2026-10-10)
+        return None
     return {"sides": [{"part": ln["parts"][0], "face": ln["faces"][0]}, {"part": ln["parts"][1], "face": ln["faces"][1]}],
             "region": {"segments": [seg], "width": w}, "normal": ln["normal"], "gap": 0.0, "area": w * length,
             "samples": _strip_samples(np.asarray([seg], float), ln["normal"], w)}
@@ -841,6 +847,15 @@ def _weldment_butts(conns: list[dict], geoms, tol: float | None) -> None:
     bonded over its whole area to the flat and the radii (within their radius plus the bond
     tolerance). Weldment bodies first (D29); any bonded joint since D31."""
     tol = defaults.GAP_TOL if tol is None else float(tol)
+    # faces that are a side of more than one planar bond: a plate lying across several parts (a fish plate across a
+    # splice), each bond covering its own part of the face. Not a butting end: bonded whole to one part, its first
+    # bond took every node of the face and the others were left with none (a pinned cradle frame's fish plates and pivot
+    # plates, 2026-10-10: the bottom chords' splices joined nothing and the cradle was 2.5x too soft)
+    shared = defaultdict(int)
+    for c in conns:
+        if c["type"] == "tie" and c.get("geometry") == "plane" and not c.get("region"):
+            for x in c.get("sides", []):
+                shared[(x["part"], x["face"])] += 1
     for c in conns:
         if c["type"] != "tie" or c.get("geometry") != "plane" or len(c.get("sides", [])) != 2 or c.get("region"):
             continue
@@ -851,6 +866,8 @@ def _weldment_butts(conns: list[dict], geoms, tol: float | None) -> None:
         (bp, bf), (op, of) = ((pa, fa), (pb, fb)) if fa.area <= fb.area else ((pb, fb), (pa, fa))
         if c.get("area", 0.0) >= defaults.BUTT_COVERED_FRACTION * bf.area:
             continue                       # the face is covered: nothing left to bond
+        if shared[(bp, bf.index)] > 1:
+            continue                       # a plate across several parts: each bond keeps its own footprint
         n = np.asarray(bf.normal, float)
         lo, hi = np.asarray(bf.bbox[:3]), np.asarray(bf.bbox[3:])
         masters, reach = [of.index], 0.0

@@ -39,6 +39,12 @@ FAST_FALLBACK_FACTOR = 1.6        # a part that will not mesh at the fast size i
 FAST_SWEEP_LAYER_T = 40.0         # span layers in a fast run (exact on clean spans: investigation avenue 2)
 FAST_SWEEP_SECTION_T = 3.0        # span section triangles in a fast run
 REFINE_RATIO = 0.6             # plan: refined re-solve uses 0.6 x the base size
+REFINE_FULL_MAX_DOF = 10_000_000  # a refined model larger than this (estimated from the base mesh) is refined only on
+                               # its most stressed parts (D73; the user's rigs: 55 M DOF refined), guess
+REFINE_EXTRA_MAX_DOF = 10_000_000  # ... the unknowns the selective refinement may add (D80: a cap on the refined model's
+                               # total chose one part when the base model alone was 17 M DOF, the cradle), guess
+REFINE_SELECT_FRACTION = 0.5   # ... those with an assessed stress of at least half the model's highest (raised until it fits)
+REFINE_GROWTH = (1 / 0.6) ** 2.5  # refined / base unknowns, for the estimate (swept walls grow as ^2, tets as ^3)
 LOCAL_REFINE_RATIO = 0.6       # the local pass (D65): parts that did not converge again at 0.6 x their refined size
 
 # --- Solve ---------------------------------------------------------------------------
@@ -144,6 +150,12 @@ HYDRO_DOWN = (0.0, -1.0, 0.0)  # the fluid's down direction when a load gives no
 HINGE_FIND_RADIUS = 1.0        # mm
 HINGE_FIND_RADIUS_REL = 0.15   # of the radius
 HINGE_FIND_GAP = 5.0           # mm
+BOND_FIRST_MIN_PARTS = 50       # D81: models with more parts use bond-first connections (the user's choice, 2026-10-10)
+SMALL_PART_VOLUME_FRACTION = 0.001  # ... and leave out parts under 0.1 % of the total volume that carry nothing (the user)
+FLOATING_GAP_CANDIDATES = 8     # a floating part's gap is measured exactly to this many nearest parts (by bounding box)
+NEAR_COAX_MM = 0.5             # hinges / pins within 0.5 mm of one line along their whole length share it exactly (2026-10-10), guess
+SPIN_CENTRE_FRACTION = 0.15    # a part spins on its axis (pin, boss, bush) when its box centre is within 0.15 x its box diagonal of the axis; further off it swings (2026-10-10), guess
+LINE_MIN_LENGTH = 0.01         # mm: an edge contact shorter than this is a point contact, not bonded along a line (2026-10-10)
 LINE_BOND_WIDTH = 2.0          # mm: strip bonded along an edge contact inside a weldment (D29), guess
 BUTT_ADJUST = False            # True closes a butt gap by moving nodes (*TIE ADJUST=YES); measured worse on stress (+24 %) than rigid links (-6 %), D31
 BUTT_COVERED_FRACTION = 0.97   # a weldment butting face covered less than this is bonded whole (D29), guess
@@ -157,6 +169,11 @@ MESH_CURVATURE_POINTS = 12     # gmsh Mesh.MeshSizeFromCurvature: elements per 2
 # the tet-region node count (143k -> 490k) for no gain in the measured response.
 MESH_RETRY_SIZE_FACTORS = (0.5, 0.25)  # a part no mesher can mesh is tried again at these fractions of its element size; measured: a 297-body weldment's failing bodies (surface mesh crossing itself, or still inverted after optimising) all meshed at 0.5
 MESH_SIZE_MIN_FRACTION = 0.5
+# A tet with less quality (mesh.backends.tet_quality: 1 regular, 0 flat) is refused like an inverted one (D86).
+# Measured: gmsh left three flat tets (corners on one plane through an 8 mm wall, quality 2e-15) in a pinned cradle frame's
+# tube ends; each gave stiffness entries of 1e20 against 1e7 for the rest, whose round-off (1e4 N/mm) put a 2.5 %
+# sideways reaction on its pins. Sound gmsh/netgen meshes here stay above 1e-2; 1e-6 is far below any usable tet.
+TET_FLAT_QUALITY = 1e-6
 
 # --- Swept meshing, milestone 4 (D6 option A) -----------------------------------------------
 # Member clean spans: the section is meshed in 2D at SWEEP_SECTION_T x wall thickness (one

@@ -13,6 +13,7 @@ from typing import Callable, Optional, Protocol
 
 import numpy as np
 
+from ... import defaults
 from ..elements import FLIP, corner_volume_sign, inverted_count
 
 
@@ -72,8 +73,10 @@ def load_neutral(path: Path) -> tuple[np.ndarray, list[tuple[str, np.ndarray]]]:
 
 
 def finish_blocks(X: np.ndarray, blocks: list[tuple[str, np.ndarray]]) -> tuple[list, dict]:
-    """Fix element orientation, refuse inverted elements, return quality statistics."""
-    out, inverted, worst = [], 0, 1.0
+    """Fix element orientation, refuse inverted elements, return quality statistics. A flat tet (quality below
+    TET_FLAT_QUALITY) counts as inverted: its Jacobian is only round-off from zero, so the sign test passes it, but
+    its stiffness is 1e13 times its neighbours' and swamps the part's precision (D86)."""
+    out, inverted, flat, worst = [], 0, 0, 1.0
     for etype, conn in blocks:
         neg = corner_volume_sign(etype, X[conn]) < 0
         if neg.any():
@@ -81,9 +84,11 @@ def finish_blocks(X: np.ndarray, blocks: list[tuple[str, np.ndarray]]) -> tuple[
             conn[neg] = conn[neg][:, FLIP[etype]]
         inverted += inverted_count(etype, X[conn])
         if etype == "C3D10":
-            worst = min(worst, float(tet_quality(X[conn[:, :4]]).min()))
+            qual = tet_quality(X[conn[:, :4]])
+            worst = min(worst, float(qual.min()) if len(qual) else 1.0)
+            flat += int(np.sum(qual < defaults.TET_FLAT_QUALITY))
         out.append((etype, conn))
-    return out, {"inverted": inverted, "min_tet_quality": worst}
+    return out, {"inverted": inverted + flat, "flat": flat, "min_tet_quality": worst}
 
 
 def tet_quality(P: np.ndarray) -> np.ndarray:

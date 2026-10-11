@@ -14,6 +14,7 @@ join other parts, joined through a small global system, then recovered.
 from __future__ import annotations
 
 import math
+import json
 import os
 import shutil
 import tempfile
@@ -47,6 +48,9 @@ GLOBAL_BYTES_PER_ENTRY = 50        # the global joint system's memory per conden
                                    # then left its solve 5 GB over the budget); at 100 no factor could be kept
                                    # for recovery on the frame
 DISK_RESERVE = 5 * 2 ** 30         # disk left free when interior responses wait on disk
+OOC_CORE_FRACTION = 0.5            # an out-of-core factorisation keeps at most this share of its memory limit in core
+OOC_LOCK = threading.Lock()        # MKL's out-of-core settings are process-wide: one out-of-core factor at a time
+OOC_DIR: list = []                 # the solve's spill folder, where out-of-core factors go (set by _solve)
 XT_SPILL_MAX = 2 * 2 ** 30         # a part's interior response larger than this is not kept (not even on disk):
                                    # recovery factorises the part again, one factorisation and one solve against
                                    # writing and reading it back (found: a 1 m tank panel's was 14 GB, and its
@@ -303,6 +307,34 @@ def collect_ties(deck: Deck, ties: list, held) -> dict:
                 continue
             new[s] = w
         out.update(new)
+    return out
+
+
+def internal_dependents(deck: Deck, parts: list, held) -> dict:
+    """{node: [(independent node, weight)]} for every node a part's own internal ties make dependent (the cut
+    planes between a member's swept spans and its end regions), chains followed to independent nodes. Such a
+    node has no unknowns of its own inside its part, so a joint, ring or sliding face must reach the part
+    through the nodes it depends on (2026-10-10: the cradle's tie masters and sliding-face nodes on cut planes
+    were global unknowns nothing stiffened, and its joint system was singular)."""
+    direct: dict = {}
+    for part in parts:
+        if part.internal_ties:
+            direct.update(collect_ties(deck, part.internal_ties, held))
+    out: dict = {}
+
+    def resolve(n, depth=0):
+        if n in out:
+            return out[n]
+        if n not in direct or depth > 50:
+            return [(n, 1.0)]
+        acc: dict = {}
+        for m, w in direct[n]:
+            for mm, ww in resolve(m, depth + 1):
+                acc[mm] = acc.get(mm, 0.0) + w * ww
+        out[n] = list(acc.items())
+        return out[n]
+    for n in direct:
+        resolve(n)
     return out
 
 
@@ -611,16 +643,26 @@ class Factor:
     node, their values do not matter. ``solve`` takes one or many right-hand sides; ``free`` releases the
     factor at once rather than at garbage collection."""
 
-    def __init__(self, A, definite: bool = True, budget: "MemoryBudget | None" = None):
+    def __init__(self, A, definite: bool = True, budget: "MemoryBudget | None" = None,
+                 ooc_limit: int | None = None, make_room=None):
         """``budget``: the caller holds a reservation in it; the factorisation's memory, as PARDISO's analysis
         reports it (iparm[14..16]), is added to that reservation before factorising and given back by
-        ``free``. A guess per DOF was out by 2-3x on Bench truss L's chords."""
+        ``free``. A guess per DOF was out by 2-3x on Bench truss L's chords.
+
+        ``ooc_limit`` (bytes; the budget's total by default): a factor needing more is made out of core, PARDISO
+        keeping it in files in the solve's spill folder and at most OOC_CORE_FRACTION of the limit in memory
+        (iparm 60 = 2): slower, but a part or a joint system larger than the computer's memory still solves
+        (the user's item 3, 2026-10-10: rigs of thousands of parts).
+
+        ``make_room(need) -> limit``: called first when the factor needs more than ``ooc_limit``, to free memory
+        held for later (factors kept for recovery) and give the new limit; out of core only if still too big."""
         A = sp.csr_matrix(A)
         self.n = A.shape[0]
         self._pardiso = None
         self._scale = None
         self._budget, self._held = budget, 0
         self.threads = 0
+        self.ooc = False
         pypardiso = _pardiso()
         if pypardiso is not None and self.n:
             if not definite:
@@ -647,11 +689,45 @@ class Factor:
             with _Threads(self.threads):
                 s.set_phase(11)                                   # analysis: reports the memory to come
                 s._call_pardiso(self._A, b)
+                need = 1024 * max(int(s.iparm[14]), int(s.iparm[15]) + int(s.iparm[16]))
+                limit = ooc_limit if ooc_limit is not None else (budget.total if budget is not None else None)
+                if make_room is not None and limit and need > limit:
+                    limit = make_room(need)
+                if OOC_DIR and ((limit and need > limit) or os.environ.get("ASMFEA_TEST_FORCE_OOC")):
+                    # too big for the memory it may have: out of core. The settings are process-wide, so one such
+                    # factor at a time (the lock is held until it is freed)
+                    OOC_LOCK.acquire()
+                    self.ooc = True
+                    core = max(256, int(OOC_CORE_FRACTION * (limit or need) / 2 ** 20))
+                    os.environ["MKL_PARDISO_OOC_PATH"] = str(Path(OOC_DIR[0]) / "pardiso_ooc")
+                    os.environ["MKL_PARDISO_OOC_MAX_CORE_SIZE"] = str(core)
+                    os.environ["MKL_PARDISO_OOC_KEEP_FILE"] = "0"
+                    s.free_memory(everything=True)
+                    s.set_iparm(60, 2)
+                    s.set_phase(11)
+                    s._call_pardiso(self._A, b)
+                    # PARDISO needs at least iparm(63) KB in core out of core, or the factorisation fails with
+                    # error -9 (the cradle's joint system, 2026-10-10: 512 MB allowed, more needed)
+                    least = int(np.ceil(1.1 * int(s.iparm[62]) / 1024))
+                    if least > core:
+                        core = least
+                        os.environ["MKL_PARDISO_OOC_MAX_CORE_SIZE"] = str(core)
+                        s.free_memory(everything=True)
+                        s.set_iparm(60, 2)
+                        s.set_phase(11)
+                        s._call_pardiso(self._A, b)
+                    need = min(need, core * 2 ** 20)
                 if budget is not None:
-                    self._held = 1024 * max(int(s.iparm[14]), int(s.iparm[15]) + int(s.iparm[16]))
+                    self._held = need
                     budget.acquire(self._held, holding=True)
                 s.set_phase(22)                                   # numerical factorisation
-                s._call_pardiso(self._A, b)
+                try:
+                    s._call_pardiso(self._A, b)
+                except BaseException:
+                    if self.ooc:                                  # never leave the out-of-core lock held
+                        self.ooc = False
+                        OOC_LOCK.release()
+                    raise
             self._pardiso = s
         else:
             self._lu = spla.splu(A.tocsc()) if self.n else None
@@ -692,7 +768,10 @@ class Factor:
         return X.reshape(B.shape)
 
     def release_to_kept(self) -> int:
-        """The factor's reservation ends (the caller keeps its bytes in the budget's kept count): its size."""
+        """The factor's reservation ends (the caller keeps its bytes in the budget's kept count): its size. An
+        out-of-core factor is not kept (0): it holds the process-wide out-of-core settings until freed."""
+        if self.ooc:
+            return 0
         n, self._held = self._held, 0
         if n:
             self._budget.release(n, last=False)
@@ -704,6 +783,9 @@ class Factor:
                 self._pardiso.free_memory(everything=True)
             self._pardiso = None
         self._lu = None
+        if self.ooc:
+            self.ooc = False
+            OOC_LOCK.release()
         if self._held:
             self._budget.release(self._held, last=False)
             self._held = 0
@@ -874,7 +956,7 @@ def exact_joints(feet: list, settings: Settings, node_part) -> list[bool]:
 
 
 def joint_terms(deck: Deck, external_ties: list, settings: Settings, held: set, log=print, node_part=None,
-                stats: dict | None = None):
+                stats: dict | None = None, dep: dict | None = None):
     """The joints between parts: (terms, transfer, agree, number of global unknowns). See solve."""
     # the joints between parts. Each maps its nodes to global unknowns: terms[node] = [(base, weight)], the
     # node's displacement component c being sum(weight * q[base + c]). An exact joint's master nodes are
@@ -888,6 +970,33 @@ def joint_terms(deck: Deck, external_ties: list, settings: Settings, held: set, 
     by_modes = []                                          # (slave nodes, master nodes) of joints by modes
     agree = []                                  # [(new terms, earlier terms, node)] per shared or fixed node
     feet = [tie_footprint(deck, tie, deck.nodes) for tie in external_ties]
+    dep = dep or {}
+    if dep:
+        # a joint's nodes that their own part makes dependent (internal ties): a master's weight passes on to
+        # the nodes it depends on; a slave so held is left to its part's tie, as CalculiX keeps a node's first
+        # tie; a field's nodes are the independent ones (see internal_dependents)
+        moved = 0
+        for k, (snodes, mnodes, weights) in enumerate(feet):
+            if not (dep.keys() & (snodes | mnodes)):
+                continue
+            new_w = {}
+            for sn, ws in weights.items():
+                if sn in dep:
+                    continue
+                acc: dict = {}
+                for m, w in ws:
+                    for mm, ww in dep.get(m, [(m, 1.0)]):
+                        acc[mm] = acc.get(mm, 0.0) + w * ww
+                new_w[sn] = [(m, w) for m, w in acc.items() if abs(w) > 1e-14]
+            sn2 = set(new_w)
+            mn2 = {m for ws in new_w.values() for m, _ in ws} - sn2
+            if not new_w:                                   # a field (or nothing landed): the independent nodes
+                sn2 = {n for n in snodes if n not in dep}
+                mn2 = {mm for n in mnodes for mm, _ in dep.get(n, [(n, 1.0)])} - sn2
+            moved += len((snodes | mnodes) & dep.keys())
+            feet[k] = (sn2, mn2, new_w)
+        if moved:
+            log(f"joints: {moved} node(s) on parts' own cut planes reach their parts through the nodes they follow")
     exact = exact_joints(feet, settings, node_part)
     for tie, (snodes, mnodes, weights), is_exact in zip(external_ties, feet, exact):
         if not snodes or not mnodes:
@@ -959,7 +1068,179 @@ def joint_terms(deck: Deck, external_ties: list, settings: Settings, held: set, 
     return terms, transfer, agree, nq
 
 
-def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Settings, log=print):
+_ORIGINS: dict = {}
+
+
+def _rigid_rows(x: np.ndarray, at: np.ndarray) -> np.ndarray:
+    """(3, 6): a rigid motion's displacement at x from its translation t and rotation theta about ``at``:
+    u = t + theta x (x - at)."""
+    rx, ry, rz = np.asarray(x, float) - np.asarray(at, float)
+    return np.array([[1.0, 0.0, 0.0, 0.0, rz, -ry],
+                     [0.0, 1.0, 0.0, -rz, 0.0, rx],
+                     [0.0, 0.0, 1.0, ry, -rx, 0.0]])
+
+
+def rigid_terms(deck: Deck, rigid: dict | None, held: set, terms: dict, nq: int, log=print,
+                dep: dict | None = None, grounded: list | None = None):
+    """Pins, joints and sliding faces (deck_info "hybrid") as global unknowns: (cterms, rows, nq).
+
+    cterms[node] = [(component, unknown, weight)]: a node's displacement component as a sum over unknowns, for
+    motions that mix components (a rigid ring's turn). rows: [[(unknown, weight)], ...] held to zero in the global
+    system by penalty, as the joints' agreement rows: where a node already follows a joint field, where a rigid ring
+    meets a fixed node, and each sliding face's normal equation.
+
+    - A pin: its face as one rigid ring about its centroid, free in the motions its fixture leaves (the turn about a
+      cylindrical pin's own axis): one unknown each.
+    - A joint (hinge, revolute, sliding): both sides one rigid motion about the joint point (six unknowns), side B
+      also free in the joint's motion (one more unknown), unless it is locked.
+    - A sliding face: each slave node keeps the master face's displacement along the normal; slave and master
+      nodes not already moved by a joint get three unknowns of their own (as an exact tie's masters).
+
+    ``grounded`` (filled when given): each pin's held motions are unknowns too, kept at zero by the caller, so
+    the force on them after the solve is the pin's reaction: [(unknown, 6-vector of the motion)]. Force reaches a
+    pin through its own face and through the rings agreeing with it by penalty, which no node's element force
+    shows (the cradle's reactions missed 57 % of its load, 2026-10-10)."""
+    cterms: dict = {}
+    rows: list = []
+    dep = dep or {}                                        # nodes their own part makes dependent (internal ties)
+    _ORIGINS.clear()                                       # investigation (ASMFEA_HYBRID_DUMP): who owns each unknown
+    if not rigid:
+        return cterms, rows, nq
+
+    def existing(nd, c):
+        out = [(base + c, w) for base, w in terms.get(nd, ())]
+        out += [(qq, w) for cc, qq, w in cterms.get(nd, ()) if cc == c]
+        return out
+
+    def place(nd, comp):
+        """comp: three lists [(unknown, weight)] for the node's x, y and z."""
+        if nd in held:
+            rows.extend(c for c in comp if c)              # the ring's motion is nil at a fixed node
+        elif nd in terms or nd in cterms:
+            for c in range(3):                             # it already follows another joint: the two agree
+                rows.append(comp[c] + [(qq, -w) for qq, w in existing(nd, c)])
+        else:
+            cterms[nd] = [(c, qq, w) for c in range(3) for qq, w in comp[c]]
+
+    def ring(nodes, at, M, qidx):
+        """Each node follows the rigid motion M @ q[qidx] (M: 6 x len(qidx)) about ``at``."""
+        for nd in nodes:
+            nd = int(nd)
+            if nd not in deck.nodes or nd in dep:          # a dependent node follows its part's own tie
+                continue
+            A = _rigid_rows(deck.nodes[nd], at) @ M if M.shape[1] else np.zeros((3, 0))
+            place(nd, [[(qidx[j], float(A[c, j])) for j in range(A.shape[1]) if abs(A[c, j]) > 1e-14]
+                       for c in range(3)])
+
+    n_pins = n_joints = 0
+    pin_maps = []                                          # each pin's (motion basis M, its unknowns, centre)
+    for pin in rigid.get("pins", []):
+        held_t = set(int(dd) for dd in pin.get("hold_trans", [1, 2, 3]))
+        cols = [np.concatenate([np.eye(3)[dd - 1], np.zeros(3)]) for dd in (1, 2, 3) if dd not in held_t]
+        V = np.array([np.asarray(v, float) for v in pin.get("hold_rot", [])]).reshape(-1, 3)
+        if len(V):
+            _, sv, vt = np.linalg.svd(V)
+            free_rot = vt[int(np.sum(sv > 1e-9)):]          # the turns its fixture leaves free
+        else:
+            free_rot = np.eye(3)
+        cols += [np.concatenate([np.zeros(3), w]) for w in free_rot]
+        hcols = []
+        if grounded is not None:                           # its held motions, for its reaction (see above)
+            hcols = [np.concatenate([np.eye(3)[dd - 1], np.zeros(3)]) for dd in (1, 2, 3) if dd in held_t]
+            if len(V):
+                hcols += [np.concatenate([np.zeros(3), w]) for w in vt[:int(np.sum(sv > 1e-9))]]
+        cols = cols + hcols
+        M = np.array(cols).T if cols else np.zeros((6, 0))
+        qidx = list(range(nq, nq + M.shape[1]))
+        if hcols:
+            grounded += [(qidx[len(cols) - len(hcols) + i], hcols[i]) for i in range(len(hcols))]
+        _ORIGINS.update({qq: f"pin {n_pins}" for qq in qidx})
+        nq += M.shape[1]
+        if pin.get("weights") is not None:
+            # the face's mean motion is the pin's (D84, as the deck's equations): its weighted mean translation and
+            # best-fit rotation, over the face nodes (each given unknowns of its own if it has none)
+            pn = [int(n) for n in pin["nodes"] if int(n) in deck.nodes]
+            keep = [i for i, n in enumerate(pin["nodes"]) if int(n) in deck.nodes]
+            wv = np.asarray(pin["weights"], float)[keep]
+            from ..deck import mean_motion
+            wn, Cm = mean_motion(np.array([deck.nodes[n] for n in pn]), wv, np.asarray(pin["at"], float))
+            coef: dict = {}                                # independent node -> (3 translation, 3x3 rotation) rows
+            for i, nd in enumerate(pn):
+                for mm, ww in dep.get(nd, [(nd, 1.0)]):
+                    t_, r_ = coef.setdefault(mm, (np.zeros(3), np.zeros((3, 3))))
+                    t_ += ww * wn[i]
+                    r_ += ww * Cm[i]
+            for nd in coef:
+                if nd not in terms and nd not in cterms and nd not in held:
+                    terms[nd] = [(nq, 1.0)]
+                    _ORIGINS.update({nq + c: f"pin {n_pins} face node {nd}" for c in range(3)})
+                    nq += 3
+            for c in range(3):                             # mean translation along c = the pin's
+                row = [(qq, float(t_[c]) * w) for nd, (t_, _) in coef.items() for qq, w in existing(nd, c)]
+                row += [(qidx[j], -float(M[c, j])) for j in range(M.shape[1]) if abs(M[c, j]) > 1e-14]
+                rows.append(row)
+            for k in range(3):                             # best-fit rotation about k = the pin's
+                row = [(qq, float(r_[k, c]) * w) for nd, (_, r_) in coef.items() for c in range(3)
+                       for qq, w in existing(nd, c) if abs(r_[k, c]) > 1e-14]
+                row += [(qidx[j], -float(M[3 + k, j])) for j in range(M.shape[1]) if abs(M[3 + k, j]) > 1e-14]
+                rows.append(row)
+        else:
+            ring(pin["nodes"], np.asarray(pin["at"], float), M, qidx)
+        pin_maps.append((M, qidx, np.asarray(pin["at"], float)))
+        n_pins += 1
+    for j in rigid.get("joints", []):
+        if not j["nodes_b"] or (j.get("pin") is None and not j["nodes_a"]):
+            log(f"joint ({j['kind']}) at {np.round(j['at'], 1).tolist()}: a side has no nodes; it joins nothing, left out")
+            continue
+        a = np.asarray(j["axis"], float) / np.linalg.norm(j["axis"])
+        pj = np.asarray(j["at"], float)
+        if j.get("pin") is not None:
+            # side A is a pin's own ring: side B follows the pin's motion (about its centre) plus the joint's
+            M0, base, at = pin_maps[int(j["pin"])]
+        else:
+            at = pj
+            M0, base = np.eye(6), list(range(nq, nq + 6))
+            _ORIGINS.update({qq: f"joint {n_joints} base ({j['kind']} at {np.round(pj, 1).tolist()})" for qq in base})
+            nq += 6
+            ring(j["nodes_a"], at, M0, base)
+        if j.get("locked"):
+            ring(j["nodes_b"], at, M0, base)
+        else:
+            if j["kind"] in ("revolute", "hinge"):         # a turn about the joint's own axis line, about ``at``
+                g = np.concatenate([np.cross(a, at - pj), a])
+            else:
+                g = np.concatenate([a, np.zeros(3)])
+            ring(j["nodes_b"], at, np.column_stack([M0, g]), list(base) + [nq])
+            _ORIGINS[nq] = f"joint {n_joints} free ({j['kind']} at {np.round(pj, 1).tolist()}, pin {j.get('pin')})"
+            nq += 1
+        n_joints += 1
+    n_slide = 0
+    for eq in rigid.get("slides", []):
+        # the equation over independent nodes: a node its part makes dependent passes its weight on
+        coef: dict = {}
+        for nd, wn in [(int(eq["slave"]), 1.0)] + [(int(m), -float(wm)) for m, wm in eq["masters"]]:
+            for mm, ww in dep.get(nd, [(nd, 1.0)]):
+                coef[mm] = coef.get(mm, 0.0) + wn * ww
+        for nd in coef:
+            if nd not in terms and nd not in cterms and nd not in held:
+                terms[nd] = [(nq, 1.0)]
+                _ORIGINS.update({nq + c: f"slide node {nd}" for c in range(3)})
+                nq += 3
+        nrm = np.asarray(eq["normal"], float)
+        row = []
+        for nd, wn in coef.items():
+            if abs(wn) > 1e-14:
+                row += [(qq, wn * nrm[c] * w) for c in range(3) for qq, w in existing(nd, c)]
+        if row:
+            rows.append(row)
+            n_slide += 1
+    rows = [r for r in rows if r]
+    log(f"rigid rings: {n_pins} pin(s), {n_joints} joint(s), {n_slide} sliding-face equations; "
+        f"{len(rows)} rows held by penalty; {nq} global unknowns")
+    return cterms, rows, nq
+
+
+def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Settings, log=print, rigid=None):
     """(displacements (top, 3, n_steps), internal nodal forces (top, 3, n_steps), timings), both indexed by
     node id (rows of ids not in the deck stay zero). The nodal forces are what CalculiX prints as RF:
     reactions at fixtures, tie forces at slave nodes."""
@@ -967,13 +1248,14 @@ def solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Sett
     # traceback, so its frames) outlives it in the out-of-memory retry, which needs their memory back
     kept_factors: list = []
     try:
-        return _solve(deck, parts, external_ties, settings, log, kept_factors)
+        return _solve(deck, parts, external_ties, settings, log, kept_factors, rigid)
     finally:
         for f in kept_factors:
             f.free()
 
 
-def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Settings, log, kept_factors: list):
+def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Settings, log, kept_factors: list,
+           rigid=None):
     t0 = time.perf_counter()
     nsteps = len(deck.steps)
     fixed_nodes = {}
@@ -997,8 +1279,11 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
     part_of = np.full(top, -1, dtype=np.int64)
     for k, p in enumerate(parts):
         part_of[p.nodes] = k
+    # nodes on parts' own cut planes (the exact model solves every tie in one part: none)
+    dep = {} if settings.exact else internal_dependents(deck, parts, fixed_nodes)
     terms, transfer, agree, nq = joint_terms(deck, external_ties, settings, held, log,
-                                             node_part=lambda nd: part_of[nd] if nd < top else -1, stats=timings)
+                                             node_part=lambda nd: part_of[nd] if nd < top else -1, stats=timings,
+                                             dep=dep)
     if settings.split_dof and not settings.exact:
         pieces = []
         for part in parts:
@@ -1013,6 +1298,10 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
                 if n not in terms and n not in held:
                     terms[n] = [(nq, 1.0)]
                     nq += 3
+    # pins, joints and sliding faces (deck_info "hybrid"): their own unknowns, and node maps mixing components
+    grounded: list = []                                    # pins' held motions: kept at zero, their force read
+    cterms, crows, nq = rigid_terms(deck, rigid, held, terms, nq, log, dep=dep, grounded=grounded)
+    gidx = np.array([g for g, _ in grounded], dtype=np.int64)
 
     # The joint terms and the nodal loads as flat arrays, built once here: the part threads look them up with
     # NumPy, which leaves the GIL free (Python loops over them held it, and four part threads shared one core:
@@ -1022,6 +1311,13 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
     term_ptr = np.concatenate([[0], np.cumsum(term_cnt)]).astype(np.int64)
     term_base = np.fromiter((b for nd in term_nodes for b, _ in terms[int(nd)]), dtype=np.int64, count=int(term_ptr[-1]))
     term_w = np.fromiter((w for nd in term_nodes for _, w in terms[int(nd)]), dtype=float, count=int(term_ptr[-1]))
+    # the component-wise maps likewise: a node's entries are ct_comp / ct_q / ct_w[ct_ptr[k]:ct_ptr[k+1]]
+    ct_nodes = np.array(sorted(cterms), dtype=np.int64)
+    ct_cnt = np.array([len(cterms[int(nd)]) for nd in ct_nodes], dtype=np.int64)
+    ct_ptr = np.concatenate([[0], np.cumsum(ct_cnt)]).astype(np.int64)
+    ct_comp = np.fromiter((c for nd in ct_nodes for c, _, _ in cterms[int(nd)]), dtype=np.int64, count=int(ct_ptr[-1]))
+    ct_q = np.fromiter((q for nd in ct_nodes for _, q, _ in cterms[int(nd)]), dtype=np.int64, count=int(ct_ptr[-1]))
+    ct_w = np.fromiter((w for nd in ct_nodes for _, _, w in cterms[int(nd)]), dtype=float, count=int(ct_ptr[-1]))
     load_nodes = np.array(sorted(cload), dtype=np.int64)
     load_vals = np.array([cload[int(nd)] for nd in load_nodes]).reshape(len(load_nodes), 3, nsteps) \
         if len(load_nodes) else np.zeros((0, 3, nsteps))
@@ -1034,6 +1330,13 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
         k = np.minimum(k, max(len(term_nodes) - 1, 0))
         hit = (term_nodes[k] == nodes) if len(term_nodes) else np.zeros(len(nodes), bool)
         return np.where(hit, k, -1)
+
+    def node_cterms(nodes):
+        """For each node: its row of the component-wise maps, -1 for a node with none."""
+        if not len(ct_nodes):
+            return np.full(len(nodes), -1, dtype=np.int64)
+        k = np.minimum(np.searchsorted(ct_nodes, nodes), len(ct_nodes) - 1)
+        return np.where(ct_nodes[k] == nodes, k, -1)
 
     def loads(part, index):
         K, F = assemble(deck, part.blocks, index, gravity)
@@ -1061,6 +1364,7 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
     budget = MemoryBudget(memory_budget(settings), cores, settings.reserve_bytes)
     _remove_stale_spills()
     spill = tempfile.TemporaryDirectory(prefix=f"asmfea_hybrid_{os.getpid()}_", ignore_cleanup_errors=True)
+    OOC_DIR[:] = [spill.name]                             # out-of-core factors go here (Factor)
     _pardiso()                                            # found once, before the threads start
 
     def prepare(part):
@@ -1077,19 +1381,38 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
             fixed[hit] = fixed_mask[k[hit]]
         fixed = fixed.ravel()
         tk = node_terms(free_nodes)
-        bdof = np.repeat(tk >= 0, 3) & ~fixed
+        ck = node_cterms(free_nodes)
+        bdof = np.repeat((tk >= 0) | (ck >= 0), 3) & ~fixed
         idof = ~bdof & ~fixed
         I, B = np.nonzero(idof)[0], np.nonzero(bdof)[0]
         # each boundary DOF's row: its node's terms, the base shifted by its direction (vectorised, see above)
         rk = tk[B // 3]
-        cnt = term_cnt[rk]
+        hasr = rk >= 0
+        cnt = np.zeros(len(B), dtype=np.int64)
+        if len(term_cnt):                                  # a model with pins but no joint fields has none
+            cnt[hasr] = term_cnt[rk[hasr]]
+        tr, tc, tv = [], [], []
         if len(B) and cnt.sum():
-            start = np.repeat(term_ptr[rk], cnt)
+            start = np.repeat(term_ptr[np.maximum(rk, 0)], cnt)
             offs = np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt)
             idx = start + offs
-            rows = np.repeat(np.arange(len(B)), cnt)
-            cols = term_base[idx] + np.repeat(B % 3, cnt)
-            T = sp.csr_matrix((term_w[idx], (rows, cols)), shape=(len(B), nq))
+            tr.append(np.repeat(np.arange(len(B)), cnt))
+            tc.append(term_base[idx] + np.repeat(B % 3, cnt))
+            tv.append(term_w[idx])
+        # and its component-wise entries (a rigid ring's turn): those for its own direction
+        rc = ck[B // 3]
+        ccnt = np.zeros(len(B), dtype=np.int64)
+        if len(ct_cnt):
+            ccnt[rc >= 0] = ct_cnt[rc[rc >= 0]]
+        if len(B) and ccnt.sum():
+            start = np.repeat(ct_ptr[np.maximum(rc, 0)], ccnt)
+            offs = np.arange(ccnt.sum()) - np.repeat(np.cumsum(ccnt) - ccnt, ccnt)
+            idx = start + offs
+            rws = np.repeat(np.arange(len(B)), ccnt)
+            mine = ct_comp[idx] == (B[rws] % 3)
+            tr.append(rws[mine]), tc.append(ct_q[idx][mine]), tv.append(ct_w[idx][mine])
+        if tr:
+            T = sp.csr_matrix((np.concatenate(tv), (np.concatenate(tr), np.concatenate(tc))), shape=(len(B), nq))
         else:
             T = sp.csr_matrix((len(B), nq))
         used = np.unique(T.indices) if len(B) else np.zeros(0, np.int64)
@@ -1210,11 +1533,17 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
         tk = node_terms(part.nodes)
         tk = tk[tk >= 0]
         cnt = term_cnt[tk]
+        m = 0
         if cnt.sum():
             idx = np.repeat(term_ptr[tk], cnt) + np.arange(cnt.sum()) - np.repeat(np.cumsum(cnt) - cnt, cnt)
-            modes_of.append(3 * len(np.unique(term_base[idx])))
-        else:
-            modes_of.append(0)
+            m = 3 * len(np.unique(term_base[idx]))
+        ck = node_cterms(part.nodes)
+        ck = ck[ck >= 0]
+        ccnt = ct_cnt[ck]
+        if ccnt.sum():
+            idx = np.repeat(ct_ptr[ck], ccnt) + np.arange(ccnt.sum()) - np.repeat(np.cumsum(ccnt) - ccnt, ccnt)
+            m += len(np.unique(ct_q[idx]))
+        modes_of.append(m)
     work = [3 * len(p.nodes) * (m + nsteps) for p, m in zip(parts, modes_of)]
     share = sum(work) / cores
     heavy = sorted((k for k in range(len(parts)) if work[k] > share), key=lambda k: -work[k])
@@ -1253,7 +1582,7 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
     log(f"joint system: {nq} unknowns, {Kq.nnz / 1e6:.0f} M entries ({Kq.nnz / max(nq, 1) ** 2:.0%} full)")
     if nq and Kq.nnz:
         G = None
-        if agree:
+        if agree or crows:
             gr, gc, gv = [], [], []
             for k, (mine, earlier, _) in enumerate(agree):
                 for c in range(3):
@@ -1262,7 +1591,10 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
                         gr.append(row), gc.append(base + c), gv.append(w)
                     for base, w in earlier:
                         gr.append(row), gc.append(base + c), gv.append(-w)
-            G = sp.csr_matrix((gv, (gr, gc)), shape=(3 * len(agree), nq))
+            for k, crow in enumerate(crows):               # rigid rings and sliding faces (rigid_terms)
+                for qq, w in crow:
+                    gr.append(3 * len(agree) + k), gc.append(qq), gv.append(w)
+            G = sp.csr_matrix((gv, (gr, gc)), shape=(3 * len(agree) + len(crows), nq))
         if os.environ.get("ASMFEA_HYBRID_DUMP"):          # investigation: the global system as solved
             d = Path(os.environ["ASMFEA_HYBRID_DUMP"])
             d.mkdir(parents=True, exist_ok=True)
@@ -1273,7 +1605,9 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
         live = np.abs(Kq).sum(axis=1).A1 > 0
         if G is not None:
             live |= np.abs(G).sum(axis=0).A1 > 0
+        live[gidx] = False                                 # pins' held motions stay at zero
         act = np.nonzero(live)[0]
+        Kh = Kq.tocsr()[gidx] if len(gidx) else None       # their rows, for the pins' reactions
         Ka = Kq if len(act) == nq else Kq[act][:, act]       # no copy when every unknown is live
         del Kq
         alpha = 0.0
@@ -1281,19 +1615,58 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
             # agreement by penalty: alpha G'G added to the joint stiffness. Lagrange multipliers were tried
             # first: redundant rows (several joints agreeing along one weld line) made the system
             # rank-deficient and PARDISO's perturbed pivots left srleg a residual of 1e-5 that refinement
-            # drove to 1e-2. With alpha = PENALTY_SCALE x the stiffest joint unknown, a row is broken by
-            # about 1/PENALTY_SCALE of the joint's own deflection.
-            alpha = PENALTY_SCALE * float(np.abs(Ka.diagonal()).max() if Ka.nnz else 1.0)
-            Ga = G[:, act]
-            Ka = (Ka + alpha * (Ga.T @ Ga)).tocsc()
+            # drove to 1e-2. Each row's penalty is PENALTY_SCALE x the stiffness its own motion meets (its
+            # unknowns in series, sum(w^2 / K_jj)^-1), so a row is broken by about 1/PENALTY_SCALE of the joint's
+            # own deflection. One penalty for all rows (PENALTY_SCALE x the stiffest unknown) was 1e7 too stiff
+            # for the ties once rigid rings brought rotation unknowns of 4.7e13 N mm/rad: the cradle's joint
+            # system had a condition of 1e23 and a residual of 10 (2026-10-10).
+            Ga = G[:, act].tocoo()
+            dg = np.abs(Ka.diagonal())
+            ok = (dg[Ga.col] > 0) & (np.abs(Ga.data) > 0)
+            comp = np.zeros(Ga.shape[0])
+            np.add.at(comp, Ga.row[ok], Ga.data[ok] ** 2 / dg[Ga.col[ok]])
+            fallback = np.median(1.0 / comp[comp > 0]) if (comp > 0).any() else float(dg.max() if len(dg) else 1.0)
+            alpha = PENALTY_SCALE * np.where(comp > 0, 1.0 / np.where(comp > 0, comp, 1.0), fallback)
+            Ga = Ga.tocsr()
+            Ka = (Ka + Ga.T @ sp.diags(alpha) @ Ga).tocsc()
         rhs = Fq[act]
-        gf = Factor(Ka, definite=False)
+        # the joint system out of core when its factor would not fit beside the results kept for recovery
+
+        def make_room(need: int) -> int:
+            """Factors kept for recovery are freed, largest first, until the joint system's factor fits (those
+            parts are factorised again at recovery: slower, but in core rather than out of core)."""
+            order = sorted((k for k, rec in enumerate(recovery) if rec is not None and rec[14] is not None
+                            and rec[15]), key=lambda k: -recovery[k][15])
+            dropped = 0
+            for k in order:
+                if budget.total - budget.kept >= need:
+                    break
+                rec = recovery[k]
+                rec[14].free()
+                budget.unkeep(rec[15])
+                dropped += 1
+                recovery[k] = rec[:14] + (None, 0)
+            if dropped:
+                log(f"joint system: {dropped} factor(s) kept for recovery freed to make room for it")
+            return max(budget.total - budget.kept, 2 ** 30)
+        gf = Factor(Ka, definite=False, ooc_limit=max(budget.total - budget.kept, 2 ** 30), make_room=make_room)
         sol = gf.solve(rhs).reshape(len(act), nsteps)
         gf.free()
         q[act] = sol
+        if os.environ.get("ASMFEA_HYBRID_DUMP"):
+            np.save(d / "sol.npy", q)
+            (d / "origins.json").write_text(json.dumps({str(k): v for k, v in _ORIGINS.items()}))
         if G is not None:
-            lam = (alpha * (G @ q)).reshape(-1, 3, nsteps)   # the force each agreement row carries
-        timings["agree_rows"] = 3 * len(agree)
+            lam = (alpha[:, None] * (G[:, act] @ q[act]))[:3 * len(agree)].reshape(-1, 3, nsteps)   # the force each agreement row carries
+        timings["agree_rows"] = 3 * len(agree) + len(crows)
+        if len(gidx):
+            # each pin's reaction: the internal force on its held motions, through the parts and the penalty rows
+            rh = Kh @ q
+            if G is not None:
+                rh = rh + (G[:, gidx].T @ (alpha[:, None] * (G[:, act] @ q[act])))
+            rh = np.asarray(rh).reshape(len(gidx), nsteps) - np.asarray(Fq[gidx]).reshape(len(gidx), nsteps)
+            dirs = np.array([v[:3] for _, v in grounded])  # translations (a held turn adds no force)
+            timings["pin_reaction"] = (dirs.T @ rh).T.tolist()   # per step, (fx, fy, fz)
         # PARDISO perturbs zero pivots instead of failing, so a model that falls apart (parts joined to
         # nothing) would come back as a solution: the residual tells
         res = np.linalg.norm(Ka @ sol - rhs) / max(np.linalg.norm(rhs), 1e-300)

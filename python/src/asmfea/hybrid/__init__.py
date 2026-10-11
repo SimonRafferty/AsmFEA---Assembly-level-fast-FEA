@@ -109,14 +109,39 @@ def write_frd(path: Path, deck: Deck, U: np.ndarray, S: np.ndarray, nsteps: int)
     Path(path).write_text("\n".join(out) + "\n")
 
 
-def write_dat(path: Path, deck: Deck, RF: np.ndarray, nsteps: int) -> None:
+def write_dat(path: Path, deck: Deck, RF: np.ndarray, nsteps: int, info: dict | None = None,
+              pin_reaction: list | None = None) -> None:
+    """The printed forces as CalculiX writes them. With pins (``info`` "hybrid"), the supports' total is the
+    force at the fixed nodes plus each pin's reaction as the solve found it (on its held motions): a pin's face
+    nodes move with it rather than being fixed, and force reaches it through rings joined to it by penalty too,
+    so their element forces do not show it. The sets of joints on pins then print nothing more."""
     out = []
+    pins = bool(info and (info.get("hybrid") or {}).get("pins"))
+    fixed = set()
+    if pins:
+        for setname, d0, d1 in deck.boundary:
+            if d0 <= 1 and d1 >= 3:
+                fixed.update(int(n) for n in deck.node_ids(setname))
+    pj = set(info.get("pin_joint_sets", [])) if pins else set()
     for k, step in enumerate(deck.steps):
         out += ["", f"                        S T E P{k + 1:8d}", "", "", "                                INCREMENT     1", ""]
         for nset, totals in step.prints:
             nodes = deck.node_ids(nset)
-            if totals:
+            if totals and nset.upper() in {x.upper() for x in pj}:
+                tot = np.zeros(3)                         # in the pins' reactions (FIXALL)
+            elif totals and pins and nset.upper() == "FIXALL":
+                sel = np.asarray([n for n in nodes if int(n) in fixed], dtype=np.int64)
+                tot = RF[sel, :, k].sum(axis=0) if len(sel) else np.zeros(3)
+                if pin_reaction:
+                    tot = tot + np.asarray(pin_reaction[k], float)
+                # printed as CalculiX prints it: with the external load on the pins' face nodes, which the
+                # balance check takes off again (deck "into_supports"). The reaction above is the pin's alone:
+                # without this the load on the pins' faces was taken off twice (D85)
+                case = next((s["case"] for s in info.get("steps", []) if s.get("step") == k + 1), None)
+                tot = tot + np.asarray(((info.get("load_cases") or {}).get(case) or {}).get("into_pins", [0.0] * 3), float)
+            elif totals:
                 tot = RF[np.asarray(nodes, dtype=np.int64), :, k].sum(axis=0)
+            if totals:
                 out += [f" total force (fx,fy,fz) for set {nset.upper()} and time  0.1000000E+01", "",
                         "      " + " ".join(f"{x:13.6E}" for x in tot), ""]
             else:
@@ -130,15 +155,18 @@ def run(workdir: Path, job: str = "study", settings: Settings | None = None, log
     """Solve ``workdir``/``job``.inp; returns timings. Raises Unsupported for a deck it cannot solve."""
     workdir = Path(workdir)
     t0 = time.perf_counter()
-    deck = read(workdir / f"{job}.inp")
     info = json.loads((workdir / "deck_info.json").read_text())
+    rigid = info.get("hybrid")
+    if rigid and rigid.get("unsupported"):
+        raise Unsupported(", ".join(sorted(set(rigid["unsupported"]))))
+    deck = read(workdir / f"{job}.inp", rigid_ok=rigid is not None)
     parts, external = build_parts(deck, info)
     nsteps = len(deck.steps)
-    U, RF, timings = solve(deck, parts, external, settings or Settings(), log=log)
+    U, RF, timings = solve(deck, parts, external, settings or Settings(), log=log, rigid=rigid)
     t1 = time.perf_counter()
     S = nodal_stresses(deck, parts, U, nsteps)
     write_frd(workdir / f"{job}.frd", deck, U, S, nsteps)
-    write_dat(workdir / f"{job}.dat", deck, RF, nsteps)
+    write_dat(workdir / f"{job}.dat", deck, RF, nsteps, info, timings.get("pin_reaction"))
     timings["output_s"] = time.perf_counter() - t1
     timings["read_s"] = timings.get("setup_s", 0.0)
     timings["wall_s"] = time.perf_counter() - t0
