@@ -294,6 +294,47 @@ def _spans_clear_of_joints(part, rx: dict, conns: list[dict]) -> list:
     return spans
 
 
+def _spans_untouched_by_joints(part, rx: dict, conns: list[dict]) -> list:
+    """The add-in's spans of a straight member that no bonded footprint reaches (none of its tie's sample points,
+    projected on the path, falls inside the span)."""
+    spans = [list(s) for s in rx.get("spans", [])]
+    if rx.get("path") != "line" or not spans:
+        return []
+    o, u = np.asarray(rx["origin"], float), np.asarray(rx["axis"], float)
+    T = np.asarray(part.transform, float).reshape(4, 4)
+    hits = [np.zeros(0)]
+    for c in conns:
+        if part.id in c.get("parts", []) and c.get("samples"):
+            Pp = (np.asarray(c["samples"], float) - T[:3, 3]) @ T[:3, :3]     # into the part frame
+            hits.append((Pp - o) @ u)
+    s = np.concatenate(hits)
+    return [sp for sp in spans if not np.any((s > sp[0] + 1e-3) & (s < sp[1] - 1e-3))]
+
+
+def _graded_spans(spans: list, clear: list, wall: float) -> tuple[list, list]:
+    """(pieces, long pieces) of graded spans (D92): each span split into its joint-clear pieces (swept long) and
+    the windows round the joints between them (swept at the standard sizes). A window or end gap no longer than
+    SPAN_WINDOW_MERGE_T x wall joins the long piece beside it."""
+    pieces, longs = [], []
+    merge = defaults.SPAN_WINDOW_MERGE_T * wall
+    for s0, s1 in spans:
+        inside = sorted([a, b] for a, b in clear if a >= s0 - 1e-6 and b <= s1 + 1e-6)
+        at = s0
+        for k, (a, b) in enumerate(inside):
+            if a - at <= merge:
+                a = at
+            else:
+                pieces.append([at, a])
+            if k == len(inside) - 1 and s1 - b <= merge:
+                b = s1
+            pieces.append([a, b])
+            longs.append([a, b])
+            at = b
+        if s1 - at > 1e-6:
+            pieces.append([at, s1])
+    return pieces, longs
+
+
 def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL, local: set | None = None) -> tuple[dict, dict]:
     """(unique tasks by cache key, manifest {part: {level: {...}}}). A fast run meshes at the fast sizes, with
     the coarse size as each part's fallback. local: the parts the local pass (D65) meshes finer again, at
@@ -331,6 +372,16 @@ def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL, local: set | No
                 rx = {**rx, "spans": clear, "layer_t": defaults.FAST_SWEEP_LAYER_T, "section_t": defaults.FAST_SWEEP_SECTION_T}
             else:                       # no span left between joints: the whole member skin-swept (as mesh_route)
                 route, rx = "skin", {"thickness": rx.get("wall")}
+        elif route == "member" and rx.get("path") == "line":
+            # graded spans (D92): long layers on the joint-clear pieces, the standard sizes round the joints; a
+            # member with no piece that far from its joints still gets long layers on the add-in's spans that no
+            # bonded footprint reaches
+            clear = _spans_clear_of_joints(part, rx, conns)
+            if clear:
+                pieces, longs = _graded_spans(rx["spans"], clear, float(rx.get("wall") or 0.0))
+                rx = {**rx, "spans": pieces, "long_spans": longs}
+            elif untouched := _spans_untouched_by_joints(part, rx, conns):
+                rx = {**rx, "long_spans": untouched}
         chain = CHAINS["tet" if route == "tet" else "swept"]
         manifest[part.id] = {}
         levels = list(levels_for(model, mode))
@@ -345,12 +396,17 @@ def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL, local: set | No
                 # thickness, not the minimum size (a 3 mm plate gave 218 000 tets at 1 mm, found live)
                 t = rx.get("thickness") or min(d for d in dims if d > 0)    # thickness found by the sweep: the thin dimension
                 size = max(size, defaults.SKIN_FALLBACK_SIZE_T * t * sweep_factor)
+            rx_l = rx
+            if "long_spans" in rx:
+                # the long pieces stay at their base size on every level: only the joint windows refine (D92)
+                rx_l = {**rx, "long_layer_t": defaults.SPAN_LONG_LAYER_T / factor,
+                        "long_section_t": defaults.SPAN_LONG_SECTION_T / factor}
             key = cache_key(part.geometry_hash, g["solid_index"], size, [(n, versions[n]) for n in chain],
-                            {"route": route, **rx, "factor": sweep_factor})
+                            {"route": route, **rx_l, "factor": sweep_factor})
             manifest[part.id][level] = {"key": key, "size": size, "route": route}
             tasks.setdefault(key, {
                 "key": key, "part": part.id, "level": level, "body_step": str(study / g["body_step"]),
-                "element": "tet" if route == "tet" else "swept", "route": route, "route_extra": rx,
+                "element": "tet" if route == "tet" else "swept", "route": route, "route_extra": rx_l,
                 "factor": sweep_factor, "size": size, "out": str(study / "mesh" / f"{key}.npz"),
                 "workdir": str(study / "mesh" / "work" / key), "face_areas": [f["area"] for f in g["faces"]],
                 "chain": chain, "timeout_s": defaults.MESH_TIMEOUT_S, "config": asdict(cfg)})
@@ -827,7 +883,7 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg, plan=N
         with js.timed(f"solve ({label}): assembling the deck", estimate_deck_s(dof)), \
                 perf.span("deck", level=level, dof=dof) as pinfo:
             deck = write_deck(rd / "study.inp", spec.get("model", model), instances, spec["conns"], face_map, spec["cases"],
-                              bolts=[dict(b) for b in spec["bolts"]], stabilise=stabilise if spec["kind"] == "contact" else [],
+                              threads_hint=cfg.threads, bolts=[dict(b) for b in spec["bolts"]], stabilise=stabilise if spec["kind"] == "contact" else [],
                               buckling=spec["buckling"], pin_axes=conn_doc.get("pin_axes"),
                               held_spins=conn_doc.get("held_spins"))
             pinfo["inp_bytes"] = sum(f.stat().st_size for f in rd.glob("*") if f.suffix in (".inp", ".nam", ".sur", ".equ"))
@@ -1097,6 +1153,14 @@ def stage_solve(study: Path, js: JobState) -> None:
     cache.put(stage, k, run_outputs(js.dir, solved) + extra, {**js.data(), "run": js.dir.name})
 
 
+def _refine_todo(tasks: dict, manifest: dict, chosen: list[str]) -> list[dict]:
+    """The refined meshing tasks the chosen parts need. Identical parts share one mesh, whose single task is named
+    after the first of them, so the tasks are picked by mesh key, not by part (D91: choosing only later copies of
+    a part left their shared mesh unmade)."""
+    keys = {manifest[p]["refined"]["key"] for p in chosen}
+    return [t for t in tasks.values() if t["level"] == "refined" and t["key"] in keys]
+
+
 def _select_refine(study: Path, js, model: Model, cfg, mode: str = FULL) -> None:
     """The refined level of a big model (D73; the user's item 2, 2026-10-10): only the parts whose assessed stress
     in the base solve is at least REFINE_SELECT_FRACTION of the model's highest are meshed finer (the fraction
@@ -1134,7 +1198,7 @@ def _select_refine(study: Path, js, model: Model, cfg, mode: str = FULL) -> None
         frac = min(0.95, frac + 0.05)
     js.result(f"refined pass: {len(chosen)} of {len(manifest)} parts refined (assessed stress at least {frac:.0%} of "
               f"the highest, {top:.4g} MPa); the rest keep their base mesh")
-    todo = [t for t in tasks.values() if t["level"] == "refined" and t["part"] in set(chosen)]
+    todo = _refine_todo(tasks, manifest, chosen)
     done = [0]
 
     def on_done(task, res):
@@ -1144,7 +1208,14 @@ def _select_refine(study: Path, js, model: Model, cfg, mode: str = FULL) -> None
         results = mesh_parts(todo, cfg.threads, on_done, lambda _l: js.cancel_requested(), force=False)
     except MeshCancelled:
         raise Cancelled()
-    failed = {t["part"] for t in todo if not results[t["key"]]["ok"]}
+    failed = {p for p in chosen if not results[manifest[p]["refined"]["key"]]["ok"]}
+    if failed:
+        # loudly: they keep their base mesh, so their convergence check would compare a mesh with itself (every
+        # chosen part of the cradle failed after its STEP files were deleted mid-run, and the run reported a
+        # converged refined result, 2026-10-15)
+        names = sorted(failed)
+        js.add_diags([make("REFINE_MESH_FAILED", where={"parts": names}, count=len(names), chosen=len(chosen),
+                           parts=", ".join(names[:10]) + (f" and {len(names) - 10} more" if len(names) > 10 else ""))])
     chosen = [p for p in chosen if p not in failed]
     (run / "refined").mkdir(parents=True, exist_ok=True)
     _write(run / "refined" / "manifest.json", {"schema_version": SCHEMA_VERSION, "parts": {

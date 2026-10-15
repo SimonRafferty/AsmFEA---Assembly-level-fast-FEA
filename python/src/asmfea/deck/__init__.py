@@ -121,11 +121,8 @@ def _face_geom(inst: Instance, etype: str, conn: np.ndarray, fnum: int):
     return a, n, nodes
 
 
-def measured_wall(inst: Instance) -> Optional[float]:
-    """post.sections.estimate_wall_thickness of an instance, kept beside its cached mesh
-    (<mesh key>.wall.json): it depends only on the mesh and the instance's rotation (its thin test
-    uses the assembly-frame box), and took 5.6 s of every deck of a 24-part welded chassis (INVESTIGATION-001)."""
-    from ..post.sections import PartTopology, estimate_wall_thickness
+def _wall_cache(inst: Instance) -> tuple[Optional[Path], str, str, dict]:
+    """(cache file, tag, rotation key, cached walls by rotation) of an instance's measured wall."""
     from ..stagecache import code_fingerprint, defaults_digest, digest
     src = inst.mesh.source
     path = src.with_name(src.stem + ".wall.json") if src else None
@@ -138,6 +135,15 @@ def measured_wall(inst: Instance) -> Optional[float]:
             cache = d.get("by_rotation", {}) if d.get("tag") == tag else {}
         except (OSError, ValueError):
             cache = {}
+    return path, tag, rot, cache
+
+
+def measured_wall(inst: Instance) -> Optional[float]:
+    """post.sections.estimate_wall_thickness of an instance, kept beside its cached mesh
+    (<mesh key>.wall.json): it depends only on the mesh and the instance's rotation (its thin test
+    uses the assembly-frame box), and took 5.6 s of every deck of a 24-part welded chassis (INVESTIGATION-001)."""
+    from ..post.sections import PartTopology, estimate_wall_thickness
+    path, tag, rot, cache = _wall_cache(inst)
     if rot in cache:
         return cache[rot]
     t = estimate_wall_thickness(inst, PartTopology(inst))
@@ -148,6 +154,33 @@ def measured_wall(inst: Instance) -> Optional[float]:
         except OSError:
             pass          # unwritable: measured again next time
     return t
+
+
+def _measure_walls(insts: list[Instance]) -> None:
+    """A pool worker: measure (and cache) the walls of instances that all share one mesh, so that no two
+    workers write the same cache file."""
+    for inst in insts:
+        measured_wall(inst)
+
+
+def prefetch_walls(instances: list[Instance], workers: int) -> None:
+    """Measure the walls the deck will need and are not yet cached, one mesh per task in a process pool (D93:
+    the walls of a 174-part frame were measured one after another, most of each deck's two minutes). The deck
+    then reads them from the cache; anything a worker could not cache is measured in the deck as before."""
+    todo: dict = {}
+    for inst in instances:
+        path, _, rot, cache = _wall_cache(inst)
+        if path is not None and rot not in cache:
+            todo.setdefault(str(path), {}).setdefault(rot, inst)       # one instance per mesh and rotation
+    groups = [list(by_rot.values()) for by_rot in todo.values()]
+    if workers < 2 or len(groups) < 2:
+        return
+    import multiprocessing as mp
+    from concurrent.futures import ProcessPoolExecutor
+    # spawn, as the classification pool: the deck can be written from a thread (the MCP server)
+    with ProcessPoolExecutor(max_workers=min(workers, len(groups)), mp_context=mp.get_context("spawn")) as pool:
+        for f in [pool.submit(_measure_walls, g) for g in sorted(groups, key=lambda g: -len(g[0].X))]:
+            f.result()
 
 
 @dataclass
@@ -476,12 +509,16 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         # each part's wall thickness, measured from its mesh where the model gives none (a weldment profile
         # the add-in could not read, found live): joint and membrane-plus-bending assessment need it (D34)
         info["wall_thickness"] = {}
+        measure = []
         for inst in instances:
             part = model.part(inst.part_id) if hasattr(model, "part") else next(p for p in model.parts if p.id == inst.part_id)
             if getattr(part, "sheet", None) is not None and part.sheet.thickness:
                 continue
             if getattr(part, "member", None) is not None and isinstance(part.member.profile, dict) and part.member.profile.get("t"):
                 continue
+            measure.append(inst)
+        prefetch_walls(measure, threads_hint)
+        for inst in measure:
             t_geo = measured_wall(inst)
             if t_geo:
                 info["wall_thickness"][inst.part_id] = t_geo

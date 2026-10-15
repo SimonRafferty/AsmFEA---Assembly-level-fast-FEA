@@ -210,8 +210,12 @@ def _member_regions(solid, nf, rx, factor, work, attempts):
                     idx = nf + 2 * ci + (0 if np.isclose(c, hi) else 1)
                     cut_faces.append((idx, face_info(f.shape, idx)))
         if in_span:
-            extra = {"mode": "section", **{k_: v for k_, v in rx.items() if k_ != "spans"},
+            extra = {"mode": "section", **{k_: v for k_, v in rx.items()
+                                           if k_ not in ("spans", "long_spans", "long_layer_t", "long_section_t")},
                      "s0": lo, "s1": hi, "factor": factor}
+            if any(a - 1e-6 <= 0.5 * (lo + hi) <= b + 1e-6 for a, b in rx.get("long_spans", [])):
+                # a joint-clear piece of a graded span (D92): long layers, coarser section
+                extra["layer_t"], extra["section_t"] = rx["long_layer_t"], rx["long_section_t"]
         else:
             extra = {"mode": "skin", "thickness": rx.get("wall"), "factor": factor}
         regions.append((f"{'span' if in_span else 'end'}{k}", step, CHAINS["swept"], extra, cut_faces, in_span))

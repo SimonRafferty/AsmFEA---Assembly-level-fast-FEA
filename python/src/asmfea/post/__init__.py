@@ -64,13 +64,19 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
         umag = np.linalg.norm(uv[:, :3], axis=1)
         imax = int(np.argmax(umag))
         vm = von_mises(sv[:, :6])
+        # each part's nodes by binary search in the ids sorted once (D93: a mask over every node for each part
+        # was most of the summary of a 174-part frame); the results' ids are sorted already, so nothing moves
+        s_ord = np.argsort(sn, kind="stable")
+        sn_s, vm_s = sn[s_ord], vm[s_ord]
+        u_ord = np.argsort(un, kind="stable")
+        un_s, umag_s = un[u_ord], umag[u_ord]
         parts = {}
         for inst in deck_info["instances"]:
             lo, hi = inst["node0"] + 1, inst["node0"] + inst["n_nodes"]
-            sel = (sn >= lo) & (sn <= hi)
-            if not sel.any():
+            a, b = np.searchsorted(sn_s, [lo, hi + 1])
+            if a == b:
                 continue
-            ids, v = sn[sel], vm[sel]
+            ids, v = sn_s[a:b], vm_s[a:b]
             i = int(np.argmax(v))
             none = np.empty(0, dtype=np.int64)
             in_band = np.isin(ids, tie_nodes.get(inst["part"], none))
@@ -83,8 +89,9 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
             joint_only = not (~in_band).any() or not (~excl).any()
             j = i if joint_only else int(np.argmax(np.where(excl, -np.inf, v)))
             mat = model.material(inst["material"])
-            usel = (un >= lo) & (un <= hi)
-            ju = int(np.argmax(np.where(usel, umag, -np.inf)))
+            ua, ub = np.searchsorted(un_s, [lo, hi + 1])
+            has_u = ub > ua
+            ju = int(u_ord[ua + int(np.argmax(umag_s[ua:ub]))]) if has_u else 0
             parts[inst["part"]] = {
                 "peak_vm": float(v[i]), "peak_vm_node": int(ids[i]), "peak_vm_at": at(ids[i]),
                 "peak_vm_excl_ties": None if joint_only else float(v[j]),
@@ -95,8 +102,8 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
                 # before yield; whether some yielding is acceptable is the engineer's judgement
                 "min_fos_ultimate": (mat.ultimate / float(v[j]) if mat.ultimate and v[j] > 0 and not joint_only
                                      else None),
-                "max_disp": float(umag[ju]) if usel.any() else 0.0,
-                "max_disp_at": at(un[ju]) if usel.any() else None,
+                "max_disp": float(umag[ju]) if has_u else 0.0,
+                "max_disp_at": at(un[ju]) if has_u else None,
             }
         applied = np.asarray(deck_info["load_cases"][case]["applied"])
         # CalculiX's RF omits load applied straight onto constrained DOFs; the deck

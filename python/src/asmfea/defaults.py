@@ -182,6 +182,14 @@ TET_FLAT_QUALITY = 1e-6
 # up to 10 t fine for global response).
 SWEEP_SECTION_T = 1.0
 SWEEP_LAYER_T = 5.0
+# Graded spans (D92): in a full run the joint-clear pieces of a straight span (clear of every bonded footprint by
+# 1.5 section depths) are swept in long layers with a coarser section, at their base size on every level; the
+# windows round the joints keep the sizes above and refine. Speed investigation 02-tuning (<= 0.3 % on clean
+# spans at 20-40 t / 2-3 t) and a 174-part welded RHS frame (69 -> 42 min, per-part results within the
+# base-to-refined change of the uniform mesh).
+SPAN_LONG_LAYER_T = 20.0
+SPAN_LONG_SECTION_T = 2.0
+SPAN_WINDOW_MERGE_T = 5.0      # a window or end gap no longer than this x wall joins its neighbouring long piece
 # Constant-thickness walls (sheet, member end regions): one skin is meshed in 2D at
 # SKIN_SIZE_T x thickness and swept through the thickness, one quadratic wedge through the
 # wall. Calibrated on the M0 local wall-bending case (spikes/m0/m0_local_skin.py): 2 t, 3 t

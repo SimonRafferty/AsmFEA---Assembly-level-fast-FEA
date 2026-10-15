@@ -434,6 +434,14 @@ explain = "Each run solves on a base mesh and a finer one and compares the defle
 likely_causes = ["The base mesh is too coarse for these parts (thin walls, small fillets, stress concentrations).", "The peak sits on a singular point (sharp re-entrant corner or fixture edge) that never converges."]
 actions = ["If the study is not on the finest mesh yet, optimise for Accuracy and run again; if it is, allow for the change shown before relying on a small margin in these parts.", "Check where the stress is: a sharp corner or fixture edge is a singularity (a fillet in the model settles it), not a real stress."]
 
+[REFINE_MESH_FAILED]
+severity = "warning"
+stage = "solve"
+what = "{count} of the {chosen} parts chosen for the refined mesh could not be meshed finer and kept their base mesh: {parts}."
+explain = "A large model is refined only on its most stressed parts, chosen after the base solve. These parts were chosen, but their finer mesh failed, so the refined solve used their base mesh again. Their convergence check then compares a mesh with itself and shows no change, which says nothing about their accuracy. Treat their results as base-mesh results."
+likely_causes = ["The part's geometry (its STEP file) was moved or deleted during the run.", "The finer mesh failed where the base one succeeded (a thin feature at the smaller size)."]
+actions = ["Check that the study's parts folder is complete and run again.", "If it fails again, see the part's mesh log in the job folder."]
+
 [BUCKLING_NO_SCALED_LOAD]
 severity = "blocking"
 stage = "deck"

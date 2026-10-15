@@ -292,7 +292,7 @@ def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exc
     hot = None
     if thin and zones.get("line"):
         hot = hot_spots(inst, nrm_node, local, stress, thin, zones["line"],
-                        (zones.get("inside") or set()) | (zones.get("load") or set()), h)
+                        (zones.get("inside") or set()) | (zones.get("load") or set()), _joint_element_size(inst, tri, zones["line"], thin, h))
     if not cands and hot is None:
         return None
     ids = np.array(sorted(local), dtype=np.int64)
@@ -342,6 +342,22 @@ def membrane_bending(inst, tp: "PartTopology", vm_nodes: np.ndarray, stress, exc
     if worst is not None:
         worst["joint"] = joint            # the worst at the joints (None: no joint, or none read there)
     return worst
+
+
+def _joint_element_size(inst, tri: np.ndarray, line: set, t: float, h_part: float) -> float:
+    """The median surface element edge near a part's joint edges (triangle centres within 3 x HOT_SPOT_FAR_T wall
+    thicknesses of the edge line), which sets how far the hot-spot read-out reaches; the part's own median when too
+    few lie there. The part's median followed its longest elements: a member's long span layers (D92) widened the
+    read-out at its joints, whose mesh had not changed (D95)."""
+    from scipy.spatial import cKDTree
+    ids = np.array(sorted(a - inst.node0 for a in line if 0 < a - inst.node0 <= len(inst.X)), dtype=np.int64)
+    if len(ids) == 0 or len(tri) == 0:
+        return h_part
+    r, _ = cKDTree(inst.X[ids - 1]).query(tri.mean(axis=1), k=1)
+    near = tri[r <= 3.0 * defaults.HOT_SPOT_FAR_T * t]
+    if len(near) < 10:
+        return h_part
+    return float(np.median(np.linalg.norm(near[:, 1] - near[:, 0], axis=1)))
 
 
 def hot_spots(inst, nrm_node: dict, local: dict, stress, t: float, line: set, inside: set,
@@ -458,24 +474,35 @@ def estimate_wall_thickness(inst, tp: "PartTopology") -> float | None:
     """A part's wall thickness from its mesh: the median distance through the part from its largest outer
     faces (the skins of a sheet or a tube). None when that is not thin compared with the part (a solid)."""
     ext = tp.exterior()
-    tri, cand = [], []
-    for k, fn in ext:
-        e, c = tp.elems[k]
-        corners = [int(c[i]) for i in FACES[e][fn]]
-        P = inst.X[np.asarray(corners) - 1]
-        n = np.cross(P[1] - P[0], P[2] - P[0])
-        if np.dot(n, P.mean(axis=0) - tp.centroid[k]) < 0:
-            n = -n
-        a = np.linalg.norm(n) * (0.5 if len(corners) == 3 else 1.0)
-        cand.append((a, P.mean(axis=0), n / max(np.linalg.norm(n), 1e-30)))
-        tri.append(P[[0, 1, 2]])
-        if len(corners) == 4:
-            tri.append(P[[0, 2, 3]])
-    if not cand:
+    if not ext:
         return None
-    tri = np.asarray(tri)
-    cand.sort(key=lambda x: -x[0])
-    L = [_ray_exit(c - 1e-6 * n, -n, tri) for _, c, n in cand[:defaults.WALL_SAMPLE_FACETS]]
+    # each exterior facet's area (a quad's from its first three corners, as a parallelogram), centre and
+    # outward unit normal, vectorised per element type and face number (a small cross product per facet was
+    # most of a deck's time on a 174-part frame); the triangles in facet order, a quad as two
+    F = len(ext)
+    A, C, N = np.zeros(F), np.zeros((F, 3)), np.zeros((F, 3))
+    tri_of: list = [None] * F
+    groups: dict = {}
+    for pos, (k, fn) in enumerate(ext):
+        groups.setdefault((tp.elems[k][0], fn), []).append(pos)
+    for (e, fn), pos in groups.items():
+        ks = np.array([ext[p][0] for p in pos])
+        conn = np.array([tp.elems[k][1] for k in ks])
+        P = inst.X[conn[:, FACES[e][fn]] - 1]                    # (m, corners, 3)
+        n = np.cross(P[:, 1] - P[:, 0], P[:, 2] - P[:, 0])
+        cen = P.mean(axis=1)
+        n[(n * (cen - tp.centroid[ks])).sum(axis=1) < 0] *= -1.0
+        nn = np.linalg.norm(n, axis=1)
+        quad = P.shape[1] == 4
+        A[pos] = nn * (1.0 if quad else 0.5)
+        C[pos], N[pos] = cen, n / np.maximum(nn, 1e-30)[:, None]
+        for i, p in enumerate(pos):
+            tri_of[p] = (P[i, [0, 1, 2]], P[i, [0, 2, 3]]) if quad else (P[i, [0, 1, 2]],)
+    tri = np.array([t for ts in tri_of for t in ts]).reshape(-1, 3, 3)
+    tris = _Triangles(tri)
+    reach = float(np.sqrt(A.max())) if A.max() > 0 else 1.0
+    order = np.argsort(-A, kind="stable")[:defaults.WALL_SAMPLE_FACETS]       # the largest facets first
+    L = [tris.exit(C[i] - 1e-6 * N[i], -N[i], reach) for i in order]
     L = np.array([x for x in L if x])
     if len(L) == 0:
         return None
