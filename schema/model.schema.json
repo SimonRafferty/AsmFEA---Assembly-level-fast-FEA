@@ -18,6 +18,7 @@
     "fixtures": {"type": "array", "items": {"$ref": "#/$defs/fixture"}},
     "overrides": {"type": "array", "items": {"$ref": "#/$defs/override"}},
     "hinges": {"type": "array", "items": {"$ref": "#/$defs/hinge"}, "description": "Hinges the user added by choosing concentric cylindrical faces (schema 1.x, D50)"},
+    "joins": {"type": "array", "items": {"$ref": "#/$defs/join"}, "description": "Connections the user added between two parts with the Join button (D97)"},
     "study": {"$ref": "#/$defs/study"},
     "issues": {"type": "array", "items": {"$ref": "#/$defs/issue"}, "description": "Problems the add-in found while extracting; the pipeline reports each as a diagnostic"}
   },
@@ -67,7 +68,20 @@
         "nu": {"type": "number", "minimum": 0, "exclusiveMaximum": 0.5},
         "density": {"type": "number", "exclusiveMinimum": 0, "description": "tonne/mm^3"},
         "yield": {"type": "number", "exclusiveMinimum": 0, "description": "MPa"},
-        "ultimate": {"type": "number", "exclusiveMinimum": 0, "description": "MPa"}
+        "ultimate": {"type": "number", "exclusiveMinimum": 0, "description": "MPa"},
+        "sn_curves": {
+          "type": "array",
+          "description": "S-N curves stored with the SolidWorks material (its Fatigue SN Curves tab: .sldmat materialcurve type 19), read by the add-in; fatigue uses the fully reversed one (r_ratio -1) when study.fatigue gives none for the material (D109)",
+          "items": {
+            "type": "object", "additionalProperties": false, "required": ["r_ratio", "points"],
+            "properties": {
+              "r_ratio": {"type": "number", "description": "Stress ratio of the test (min / max stress): -1 fully reversed"},
+              "points": {"type": "array", "minItems": 2, "items": {"type": "array", "items": {"type": "number", "exclusiveMinimum": 0}, "minItems": 2, "maxItems": 2},
+                         "description": "[cycles, stress amplitude MPa]"},
+              "source": {"type": "string", "description": "Where it came from, e.g. the SolidWorks material library's name"}
+            }
+          }
+        }
       }
     },
     "body": {
@@ -278,6 +292,18 @@
         "note": {"type": "string"}
       }
     },
+    "join": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "parts"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "parts": {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 2},
+        "faces": {"type": "array", "items": {"type": "string"}, "maxItems": 2,
+                  "description": "face_refs ids: none (the nearest faces of the two parts are bonded, within the join gap limit), one (that face to the nearest face of the other part, within the limit) or one on each part (joined whatever the distance: bonded when they meet, else a rigid link)"},
+        "note": {"type": "string"}
+      }
+    },
     "override": {
       "type": "object",
       "additionalProperties": false,
@@ -306,6 +332,81 @@
         "bond_tolerance": {"type": "number", "minimum": 0, "description": "Faces this close (a gap or an overlap, mm) count as touching and are bonded; default 0.5"},
         "connection_method": {"enum": ["auto", "classic", "bond_first"], "description": "How connections are found: bond_first bonds everything touching and keeps a mate's joint only where it frees something (D81); auto chooses bond_first on models with many parts"},
         "excluded_parts": {"type": "array", "items": {"type": "string"}, "description": "Parts left out of the analysis by the user (the floating-parts dialog); never suppressed in SolidWorks"},
+        "rigid_parts": {"type": "array", "items": {"type": "string"}, "description": "Parts treated as rigid (D96): not meshed, each group of them moves as one rigid body carrying its weight (density x CAD volume) at its centre of mass; the SolidWorks material is not changed"},
+        "fatigue": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["spectrum"],
+          "description": "Fatigue assessment on the static results (release 2, PLAN-FATIGUE.md, D102): the spectrum, the standard, the S-N data per material",
+          "properties": {
+            "standard": {"enum": ["bs7608", "pd5500", "en13001_3_1", "en1993_1_9"], "description": "The standard whose curves and categories are used and named in the report; default bs7608 (the UK standard)"},
+            "spectrum": {
+              "type": "array", "minItems": 1,
+              "items": {
+                "type": "object", "additionalProperties": false, "required": ["case", "max_pct", "min_pct", "cycles"],
+                "properties": {
+                  "case": {"type": "string", "description": "Load case at the cycle's maximum"},
+                  "max_pct": {"type": "number", "description": "The maximum, as a percentage of that load case"},
+                  "min_pct": {"type": "number", "description": "The minimum, as a percentage of min_case (negative for a load that reverses)"},
+                  "min_case": {"type": "string", "description": "Load case at the minimum, when the cycle runs between two cases; default case"},
+                  "cycles": {"type": "number", "exclusiveMinimum": 0, "description": "Cycles of this row in one block of the spectrum"}
+                }
+              }
+            },
+            "design_blocks": {"type": "number", "exclusiveMinimum": 0, "description": "Times the spectrum's block is repeated in the design life; default 1"},
+            "materials": {
+              "type": "array",
+              "items": {
+                "type": "object", "additionalProperties": false, "required": ["material"],
+                "properties": {
+                  "material": {"type": "string", "description": "Material name, as in model.json"},
+                  "basquin": {"type": "object", "additionalProperties": false, "required": ["Sf", "b"],
+                              "description": "The user's curve, fully reversed amplitude: sigma_a = Sf (2N)^b",
+                              "properties": {"Sf": {"type": "number", "exclusiveMinimum": 0}, "b": {"type": "number", "exclusiveMaximum": 0},
+                                             "endurance_limit": {"type": "number", "minimum": 0, "description": "Amplitude below which a constant-amplitude spectrum does no damage"}}},
+                  "points": {"type": "array", "minItems": 2, "items": {"type": "array", "items": {"type": "number", "exclusiveMinimum": 0}, "minItems": 2, "maxItems": 2},
+                             "description": "The user's curve as [cycles, fully reversed amplitude MPa] points, log-log interpolated; below the last point's amplitude, no damage"},
+                  "standard_class": {"type": "string", "description": "A parent-material class of the study's standard instead of a user curve (bs7608 B or C, en1993_1_9 160/140/125, en13001_3_1 D.1)"},
+                  "surface_factor": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Surface finish factor on a user curve's strength; default 1"},
+                  "size_factor": {"type": "number", "exclusiveMinimum": 0, "maximum": 1, "description": "Size factor on a user curve's strength; default 1"},
+                  "surface": {"enum": ["polished", "ground", "machined", "hot_rolled", "as_forged"], "description": "Surface finish for AsmFEA's built-in S-N data (D111): Marin's factor for steel; default hot_rolled for steel, polished otherwise"},
+                  "source": {"type": "string", "description": "Where the S-N data came from (printed in the report)"}
+                }
+              }
+            },
+            "parent": {
+              "type": "object", "additionalProperties": false,
+              "properties": {
+                "mean_stress": {"enum": ["goodman", "gerber", "none"], "description": "Mean-stress correction on a user curve; default goodman"},
+                "range": {"enum": ["principal", "signed_von_mises"], "description": "Range measure: the largest-magnitude principal of the range tensor (default) or the signed von Mises range"}
+              }
+            },
+            "welds": {
+              "type": "object", "additionalProperties": false,
+              "properties": {
+                "method": {"enum": ["dong", "nominal"], "description": "dong (default): structural stress per window along each bonded joint on the standard's structural stress curve (W1); nominal: the joint's nominal stress on a detail category given per joint (W2)"},
+                "structural_category": {"type": "string", "description": "W1's curve: a class or category of the standard (default: bs7608 / pd5500 class D, en1993_1_9 Annex B category 90; en13001_3_1 has none and uses EN 1993-1-9's)"},
+                "joints": {
+                  "type": "array",
+                  "items": {
+                    "type": "object", "additionalProperties": false, "required": ["connection"],
+                    "properties": {
+                      "connection": {"type": "string", "description": "Connection id from connections.json"},
+                      "method": {"enum": ["dong", "nominal"]},
+                      "category": {"type": "string", "description": "The detail category or class of the study's standard"}
+                    }
+                  }
+                }
+              }
+            },
+            "bolts": {
+              "type": "object", "additionalProperties": false,
+              "properties": {"thread": {"enum": ["rolled", "machined"], "description": "EN 13001-3-1 Table D.2 detail 2.6: rolled threads (default) or machined"}}
+            },
+            "gamma_Ff": {"type": "number", "minimum": 1, "description": "Partial factor on the stress ranges; default 1"},
+            "gamma_Mf": {"type": "number", "minimum": 1, "description": "Partial factor on the fatigue strength (EN 1993-1-9 Table 3.1, EN 13001-3-1 Table 9); default 1"}
+          }
+        },
         "mesh": {
           "type": "object",
           "additionalProperties": false,

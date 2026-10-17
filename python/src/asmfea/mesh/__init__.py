@@ -244,6 +244,8 @@ def _mesh_region(task, backends, name, geom, chain, extra, tag_list, work, attem
             continue
         if task.get("gmsh_optimize"):
             extra = {**extra, "gmsh_optimize": True}
+        if task.get("holes") and extra.get("mode") != "section":
+            extra = {**extra, "holes": task["holes"]}     # free holes (D101): not on clean spans, which have none
         req = MeshRequest(part=task["part"], geometry_file=Path(geom), element=task["element"],
                           size_max=task["size"], out_dir=work / f"{name}_{mesher}", timeout_s=task["timeout_s"],
                           threads=1, extra=extra)

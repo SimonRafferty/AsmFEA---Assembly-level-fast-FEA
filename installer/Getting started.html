@@ -66,7 +66,7 @@
     </div>
     <ul class="flow">
       <li>1&nbsp; Find the pane</li><li>2&nbsp; Prepare</li><li>3&nbsp; Loads &amp; fixtures</li>
-      <li>4&nbsp; Connections</li><li>5&nbsp; Run</li><li>6&nbsp; Results</li>
+      <li>4&nbsp; Connections</li><li>5&nbsp; Run</li><li>6&nbsp; Results</li><li>7&nbsp; Fatigue</li>
     </ul>
   </div>
 </header>
@@ -85,26 +85,20 @@
   </div>
 </section>
 
-<section class="card step">
+<section class="card step wide">
   <div>
     <h2><span class="num" style="background:#2b8fd8">2</span>Prepare the assembly and start a study</h2>
     <ul>
       <li>Open the assembly and give every part a material (right-click the part &gt; <b>Material</b>).
         A single part works too: its bodies are treated as the parts, and bodies that touch are joined.</li>
-      <li>Click <span class="btn">New</span> in the pane and name the study. It is saved inside the assembly (or part).</li>
-      <li>On the <b>Study</b> tab choose what to <b>Optimise for</b>: <i>Speed</i> (a coarse mesh, one solve: quick, for
-        comparing designs), <i>Balanced</i> (for most work) or <i>Accuracy</i> (a finer mesh for local stresses, and parts whose results have not settled are solved again on a finer mesh).
-        AsmFEA decides the rest from this and your computer's free memory and cores, always leaving room for
-        SolidWorks and other programs; the <b>Run</b> tab shows the plan before you run. <i>Advanced</i> lets you set
-        the mesh level, convergence check, <i>Refine where not converged</i> or solver yourself. Check the pass/fail criteria the reports use too.
-        Changes are kept as you make them.</li>
-      <li>If you expect to try several sizes of load, tick <i>Fast load-size changes</i>: each load is solved once,
-        and changing only load sizes afterwards needs no new solve.</li>
+      <li>Click <span class="btn">New</span> in the pane and name the study. It is saved inside the assembly (or part).
+        Every setting is kept as you make it.</li>
+      <li>The pane has five tabs, used in order: <b>Loads</b>, <b>Connections</b>, <b>Run</b>, <b>Results</b> and
+        <b>Fatigue</b>. The main button on each tab is the dark blue one; red buttons remove something.</li>
     </ul>
     <div class="tip">Parts that touch are joined automatically. Mates tell AsmFEA where parts can slide or turn;
       weld beads are used too, and a sub-assembly is treated as one rigid piece.</div>
   </div>
-  <figure><img src="guide_images/pane_study.png" alt="The Study tab"><figcaption>The Study tab</figcaption></figure>
 </section>
 
 <section class="card step">
@@ -112,7 +106,7 @@
     <h2><span class="num" style="background:var(--teal)">3</span>Add fixtures and loads</h2>
     <ol>
       <li>Select one or more faces on the model.</li>
-      <li>On the <b>Loads and fixtures</b> tab click <span class="btn">Fixed</span> (held still) or
+      <li>On the <b>Loads</b> tab, under <i>Add to the selected faces</i>, click <span class="btn">Fixed</span> (held still) or
         <span class="btn">Pinned</span> (can rotate).</li>
       <li>Loads belong to a <b>load case</b> (a set of loads solved together). Pick one at the top of the tab, or
         click <span class="btn">New load case</span>; every case is solved in the same run. Fixtures apply to all cases.
@@ -130,7 +124,7 @@
     <p>Click a row in the list to highlight its faces on the model; a load also shows an arrow pointing at
       where it acts. Double-click a row to change it.</p>
   </div>
-  <figure><img src="guide_images/pane_loads.png" alt="The Loads and fixtures tab"><figcaption>Loads and fixtures</figcaption></figure>
+  <figure><img src="guide_images/pane_loads.png" alt="The Loads tab"><figcaption>The Loads tab</figcaption></figure>
   <figure style="grid-column: 1 / -1"><img src="guide_images/model_fixtures.png" alt="A fixed face highlighted on the model">
     <figcaption>The fixed face highlighted in blue. This assembly is a plate on a base, held by a 6 mm weld bead along one edge.</figcaption></figure>
 </section>
@@ -140,20 +134,26 @@
     <h2><span class="num" style="background:var(--green)">4</span>Check how the parts connect</h2>
     <ul>
       <li>Click <span class="btn">Analyse connections</span>: the list shows every place where parts meet and how they will be joined.</li>
-      <li>To change one, select it and click <span class="btn">Edit...</span>, or use <i>Set to</i>: <span class="btn">Fixed</span> (bonded),
-        <span class="btn">Sliding with friction...</span>, <span class="btn">Sliding joint...</span> or
-        <span class="btn">Not connected</span>. <span class="btn">Automatic</span> undoes your choice.</li>
+      <li>Click a connection to see it on the model: red balls mark the faces that join, and the view zooms to it.
+        The <b>Auto zoom</b> slider sets how close: far left shows the whole model, far right the connection's faces.</li>
+      <li>To change one, select it and click <span class="btn">Edit...</span>, or use <i>Set the selected connections to</i>:
+        <span class="btn">Fixed</span> (bonded), <span class="btn">Sliding with friction...</span>,
+        <span class="btn">Sliding joint...</span> or <span class="btn">No separation</span> (sliding, never parting).
+        <span class="btn">Remove</span> disconnects the parts there; <span class="btn">Automatic</span> undoes your choice.</li>
+      <li><i>From the SolidWorks selection</i>: <span class="btn">Add hinge...</span> makes a pin joint on a hole or pin
+        face, <span class="btn">Join</span> connects two parts that do not touch, and <span class="btn">Rigid...</span>
+        treats parts whose shape is only approximate as rigid (they carry load and weight, but are not meshed).</li>
       <li>Weld beads appear as their own rows.</li>
       <li>On a large model (over 50 parts) every part is first bonded to the parts it touches, and mates are
         applied where they free a motion that matters; small parts hanging off the structure are left out and listed in
-        the report. Advanced &gt; Connections chooses the method yourself.</li>
+        the report. <i>Advanced &gt; Connections</i> on the Run tab chooses the method yourself.</li>
       <li>If parts are still floating, a window lists them with the gap to their nearest neighbour: raise the bond
         tolerance to join them, or leave them out of the analysis (they stay in SolidWorks).</li>
     </ul>
     <div class="tip">Hover over any button for a tip. Double-click a connection or a warning, or press
       <span class="btn">?</span>, for a full explanation.</div>
   </div>
-  <figure><img src="guide_images/pane_connections.png" alt="The Connections tab"><figcaption>Connections, including a weld bead</figcaption></figure>
+  <figure><img src="guide_images/pane_connections.png" alt="The Connections tab"><figcaption>The Connections tab</figcaption></figure>
 </section>
 
 <section class="card step">
@@ -161,7 +161,16 @@
     <h2><span class="num" style="background:var(--amber)">5</span>Run</h2>
     <ul>
       <li>On the <b>Run</b> tab click <span class="btn">Run</span>. The bar and the line below it show what is
-        happening; a first run takes from under a minute to a few minutes.</li>
+        happening; a first run takes from under a minute to a few minutes. The bar is green while the results match
+        the study as it is, and red when something has changed since.</li>
+      <li><b>Advanced</b> (click to open) sets what to <b>Optimise for</b>: <i>Speed</i> (a coarse mesh, one solve: quick,
+        for comparing designs), <i>Balanced</i> (for most work) or <i>Accuracy</i> (a finer mesh for local stresses, and
+        parts whose results have not settled solved again finer). AsmFEA decides the rest from this and your computer's
+        free memory and cores, always leaving room for SolidWorks and other programs; the plan shows under the buttons.
+        You can also set the mesh and solver by hand there, and <i>Fast load-size changes</i>: each load solved once,
+        so changing only load sizes afterwards needs no new solve.</li>
+      <li><b>Pass/fail criteria</b> (click to open) holds the limits the checks and reports use: maximum deflection
+        and minimum factors of safety. Changing a limit re-checks the last results without solving again.</li>
       <li><span class="btn">Check only</span> just checks the set-up, quickly, without solving.</li>
       <li><span class="btn">Fast run</span> is for trying design changes: a coarser model that shows where the
         problem is and whether a change helped, in a fraction of the time. Its results are marked
@@ -180,7 +189,7 @@
       <li>Anything that needs attention is listed: double-click it to see what it means and what to do.</li>
     </ul>
   </div>
-  <figure><img src="guide_images/pane_run.png" alt="The Run tab during a run"><figcaption>The Run tab</figcaption></figure>
+  <figure><img src="guide_images/pane_run.png" alt="The Run tab"><figcaption>The Run tab: the plan, then Advanced and Pass/fail criteria, closed</figcaption></figure>
 </section>
 
 <section class="card step">
@@ -202,8 +211,9 @@
           <li><b>right-click a part</b> to see it as an outline and look at the parts behind it; right-click it again, or the background, to bring it back;</li>
           <li>local peaks beyond the assessed stress show <b>magenta</b>; grey parts (such as bushes) are not assessed: check their bearing pressure by hand.</li>
         </ul></li>
-      <li><span class="btn">Open report</span> gives the full Word report; <span class="btn">Open summary</span>
-        a half-page summary. Both need a full run (they are greyed out after a fast run).</li>
+      <li><span class="btn">Open report</span> gives the Word report, <span class="btn">Open summary</span>
+        a half-page summary, and <span class="btn">Open data</span> the data behind them (the model, materials,
+        connections, forces and detailed results). They need a full run (they are greyed out after a fast run).</li>
       <li>The pictures follow the way you look at the model in SOLIDWORKS: turn it, then open the results again.</li>
     </ul>
   </div>
@@ -214,9 +224,33 @@
   </div>
 </section>
 
+<section class="card step">
+  <div>
+    <h2><span class="num" style="background:#7a4fd0">7</span>Fatigue</h2>
+    <p>Fatigue is cracking under repeated loading, at stresses well below yield. It matters for anything loaded many
+      times: lifting, travelling, vibrating or rotating parts, and even a rig that only has to last a few hours can see
+      thousands of cycles. The <b>Fatigue</b> tab works it out from the static results, with no new solve.</p>
+    <ol>
+      <li>Choose the <b>standard</b> (BS 7608 by default) and how many times the spectrum repeats in the design life.</li>
+      <li>Fill in the <b>loading spectrum</b>: each row is a load case cycling between two percentages of it
+        (100 % to 0 %: the load put on and taken off) a number of times. Use one load case at both ends, unless the
+        load moves between two positions.</li>
+      <li>The <b>S-N data</b> per material is built in: the SolidWorks material's own curve if it has one, otherwise
+        published data, or an estimate from the tensile strength (marked ESTIMATED). Give your own if you have it.</li>
+      <li>Click <span class="btn">Assess fatigue</span>. The result shows the damage over the design life (1 means a crack
+        is expected) and the fatigue factor: how much every stress could rise before that.</li>
+      <li>Bonded joints (welds) are listed weakest first, with the factors of the weld and of the wall under it: click
+        one to see it on the model.</li>
+      <li><span class="btn">Fatigue report</span>, <span class="btn">Summary</span> and <span class="btn">Data</span>
+        open its own documents. Hover over any setting for an explanation.</li>
+    </ol>
+  </div>
+  <figure><img src="guide_images/pane_fatigue.png" alt="The Fatigue tab"><figcaption>The Fatigue tab after an assessment</figcaption></figure>
+</section>
+
 <section class="card step wide">
   <div>
-    <h2><span class="num" style="background:var(--red)">7</span>Optional: PrePoMax, for a closer look</h2>
+    <h2><span class="num" style="background:var(--red)">8</span>Optional: PrePoMax, for a closer look</h2>
     <p>PrePoMax is a free program for exploring results in detail: section cuts, values at any point, animations.
       AsmFEA does not need it, but <span class="btn">Open in PrePoMax</span> on the Results tab opens the last run in it.</p>
     <ol>
@@ -243,10 +277,10 @@
 
 <section class="card step wide">
   <div>
-    <h2><span class="num" style="background:#5d6878">8</span>Keep your work</h2>
+    <h2><span class="num" style="background:#5d6878">9</span>Keep your work</h2>
     <ul>
       <li>The study is saved <b>inside the assembly</b>: save the assembly to keep it.</li>
-      <li>Results and reports are in a folder next to the assembly called <code>&lt;assembly name&gt;_FEA</code>.</li>
+      <li>Results and reports (static and fatigue) are in a folder next to the assembly called <code>&lt;assembly name&gt;_FEA</code>.</li>
       <li>Units are millimetres, newtons and MPa throughout.</li>
     </ul>
     <div class="tip warn">Always check its results with engineering judgement and a

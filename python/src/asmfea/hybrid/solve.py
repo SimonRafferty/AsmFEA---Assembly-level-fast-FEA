@@ -1081,7 +1081,7 @@ def _rigid_rows(x: np.ndarray, at: np.ndarray) -> np.ndarray:
 
 
 def rigid_terms(deck: Deck, rigid: dict | None, held: set, terms: dict, nq: int, log=print,
-                dep: dict | None = None, grounded: list | None = None):
+                dep: dict | None = None, grounded: list | None = None, group_out: list | None = None):
     """Pins, joints and sliding faces (deck_info "hybrid") as global unknowns: (cterms, rows, nq).
 
     cterms[node] = [(component, unknown, weight)]: a node's displacement component as a sum over unknowns, for
@@ -1188,8 +1188,85 @@ def rigid_terms(deck: Deck, rigid: dict | None, held: set, terms: dict, nq: int,
             ring(pin["nodes"], np.asarray(pin["at"], float), M, qidx)
         pin_maps.append((M, qidx, np.asarray(pin["at"], float)))
         n_pins += 1
+
+    def shift(at_from, at_to) -> np.ndarray:
+        """(6, 6): a rigid motion [t, theta] about at_from as the same motion about at_to."""
+        T = np.eye(6)
+        T[:3, 3:] = _rigid_rows(at_to, at_from)[:, 3:]
+        return T
+
+    def mean_rows(nodes, weights, at_f, frame):
+        """Rows holding a face's mean motion (D84: weighted translation, best-fit turn about its centroid at_f) to the
+        rigid motion ``frame`` = (M, unknowns, about) at at_f; face nodes with no unknowns get three of their own."""
+        nonlocal nq
+        from ..deck import mean_motion
+        M, qx, about = frame
+        pn = [int(n) for n in nodes if int(n) in deck.nodes]
+        keep = [i for i, n in enumerate(nodes) if int(n) in deck.nodes]
+        wn, Cm = mean_motion(np.array([deck.nodes[n] for n in pn]), np.asarray(weights, float)[keep], np.asarray(at_f))
+        coef: dict = {}
+        for i, nd in enumerate(pn):
+            for mm, ww in dep.get(nd, [(nd, 1.0)]):
+                t_, r_ = coef.setdefault(mm, (np.zeros(3), np.zeros((3, 3))))
+                t_ += ww * wn[i]
+                r_ += ww * Cm[i]
+        for nd in coef:
+            if nd not in terms and nd not in cterms and nd not in held:
+                terms[nd] = [(nq, 1.0)]
+                nq += 3
+        A = shift(about, at_f) @ M
+        for c in range(3):
+            row = [(qq, float(t_[c]) * w) for nd, (t_, _) in coef.items() for qq, w in existing(nd, c)]
+            rows.append(row + [(qx[j], -float(A[c, j])) for j in range(A.shape[1]) if abs(A[c, j]) > 1e-14])
+        for k in range(3):
+            row = [(qq, float(r_[k, c]) * w) for nd, (_, r_) in coef.items() for c in range(3)
+                   for qq, w in existing(nd, c) if abs(r_[k, c]) > 1e-14]
+            rows.append(row + [(qx[j], -float(A[3 + k, j])) for j in range(A.shape[1]) if abs(A[3 + k, j]) > 1e-14])
+
+    # Rigid groups (D96): each one's free motions (its holds leave them; held ones are nil) as unknowns about its
+    # reference point; its bonded nodes follow it as a ring, its sliding nodes along their normals only
+    group_maps = []
+    if group_out is not None:
+        group_out.clear()
+    for g in rigid.get("groups", []):
+        M = np.asarray(g["free"], float).reshape(6, -1)
+        at = np.asarray(g["at"], float)
+        qidx = list(range(nq, nq + M.shape[1]))
+        _ORIGINS.update({qq: f"rigid group {g['id']}" for qq in qidx})
+        nq += M.shape[1]
+        ring(g["nodes"], at, M, qidx)
+        for nd, nrm in g.get("normals", []):
+            nd = int(nd)
+            if nd not in deck.nodes or nd in dep:
+                continue
+            if nd not in terms and nd not in cterms and nd not in held:
+                terms[nd] = [(nq, 1.0)]
+                nq += 3
+            nrm = np.asarray(nrm, float)
+            A = _rigid_rows(deck.nodes[nd], at) @ M
+            row = [(qq, nrm[c] * w) for c in range(3) for qq, w in existing(nd, c)]
+            row += [(qidx[j], -float(nrm @ A[:, j])) for j in range(M.shape[1]) if abs(nrm @ A[:, j]) > 1e-14]
+            rows.append(row)
+        group_maps.append((M, qidx, at))
+        if group_out is not None:
+            group_out.append({"ref": int(g["ref"]), "rot": int(g["rot"]), "M": M, "q": qidx, "at": at})
+    for lk in rigid.get("links", []):
+        # a rigid link (D97): its own six unknowns, or the group it hangs from; each face's mean motion follows it
+        if lk.get("group") is not None:
+            frame = group_maps[int(lk["group"])]
+        else:
+            qx = list(range(nq, nq + 6))
+            _ORIGINS.update({qq: "rigid link" for qq in qx})
+            nq += 6
+            frame = (np.eye(6), qx, np.asarray(lk["at"], float))
+            if group_out is not None:
+                group_out.append({"ref": int(lk["ref"]), "rot": int(lk["rot"]), "M": frame[0], "q": qx, "at": frame[2]})
+        for face in lk.get("faces", []):
+            mean_rows(face["nodes"], face["weights"], face["at"], frame)
+
     for j in rigid.get("joints", []):
-        if not j["nodes_b"] or (j.get("pin") is None and not j["nodes_a"]):
+        ga, gb = j.get("group_a"), j.get("group_b")
+        if (not j["nodes_b"] and gb is None) or (j.get("pin") is None and ga is None and not j["nodes_a"]):
             log(f"joint ({j['kind']}) at {np.round(j['at'], 1).tolist()}: a side has no nodes; it joins nothing, left out")
             continue
         a = np.asarray(j["axis"], float) / np.linalg.norm(j["axis"])
@@ -1197,6 +1274,8 @@ def rigid_terms(deck: Deck, rigid: dict | None, held: set, terms: dict, nq: int,
         if j.get("pin") is not None:
             # side A is a pin's own ring: side B follows the pin's motion (about its centre) plus the joint's
             M0, base, at = pin_maps[int(j["pin"])]
+        elif ga is not None:
+            M0, base, at = group_maps[int(ga)]             # side A a rigid group: its own motion
         else:
             at = pj
             M0, base = np.eye(6), list(range(nq, nq + 6))
@@ -1204,15 +1283,25 @@ def rigid_terms(deck: Deck, rigid: dict | None, held: set, terms: dict, nq: int,
             nq += 6
             ring(j["nodes_a"], at, M0, base)
         if j.get("locked"):
-            ring(j["nodes_b"], at, M0, base)
+            MB, qB = M0, list(base)
         else:
             if j["kind"] in ("revolute", "hinge"):         # a turn about the joint's own axis line, about ``at``
                 g = np.concatenate([np.cross(a, at - pj), a])
             else:
                 g = np.concatenate([a, np.zeros(3)])
-            ring(j["nodes_b"], at, np.column_stack([M0, g]), list(base) + [nq])
+            MB, qB = np.column_stack([M0, g]), list(base) + [nq]
             _ORIGINS[nq] = f"joint {n_joints} free ({j['kind']} at {np.round(pj, 1).tolist()}, pin {j.get('pin')})"
             nq += 1
+        if gb is not None:
+            # side B a rigid group: its motion (about its own point) agrees with side A's plus the joint's, by rows
+            Mg, qg, atg = group_maps[int(gb)]
+            A = shift(at, atg) @ MB
+            for k in range(6):
+                row = [(qg[jj], float(Mg[k, jj])) for jj in range(Mg.shape[1]) if abs(Mg[k, jj]) > 1e-14]
+                row += [(qB[jj], -float(A[k, jj])) for jj in range(A.shape[1]) if abs(A[k, jj]) > 1e-14]
+                rows.append(row)
+        else:
+            ring(j["nodes_b"], at, MB, qB)
         n_joints += 1
     n_slide = 0
     for eq in rigid.get("slides", []):
@@ -1300,7 +1389,9 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
                     nq += 3
     # pins, joints and sliding faces (deck_info "hybrid"): their own unknowns, and node maps mixing components
     grounded: list = []                                    # pins' held motions: kept at zero, their force read
-    cterms, crows, nq = rigid_terms(deck, rigid, held, terms, nq, log, dep=dep, grounded=grounded)
+    group_out: list = []                                   # rigid groups' and links' motions (D96, D97)
+    cterms, crows, nq = rigid_terms(deck, rigid, held, terms, nq, log, dep=dep, grounded=grounded,
+                                    group_out=group_out)
     gidx = np.array([g for g, _ in grounded], dtype=np.int64)
 
     # The joint terms and the nodal loads as flat arrays, built once here: the part threads look them up with
@@ -1360,6 +1451,12 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
             kr.clear(), kc.clear(), kv.clear()
         return Kq
     Fq = np.zeros((nq, nsteps))
+    for gm in group_out:
+        # loads on a rigid group (D96): the force on its reference node, the moment on its rotation node, onto its
+        # free motions (a held motion takes its share straight to the ground)
+        f6 = np.vstack([cload.get(gm["ref"], np.zeros((3, nsteps))), cload.get(gm["rot"], np.zeros((3, nsteps)))])
+        if len(gm["q"]) and np.any(f6):
+            Fq[gm["q"]] += gm["M"].T @ f6
     cores = psutil.cpu_count(logical=False) or 1
     budget = MemoryBudget(memory_budget(settings), cores, settings.reserve_bytes)
     _remove_stale_spills()
@@ -1760,5 +1857,10 @@ def _solve(deck: Deck, parts: list[PartData], external_ties: list, settings: Set
         for m, w in ms:
             if s in resid:
                 RF[m] += w * resid[s]
+    for gm in group_out:                                   # the groups' and links' motions, for their nodes' print
+        mot = gm["M"] @ q[gm["q"]] if len(gm["q"]) else np.zeros((6, nsteps))
+        for nd, sl in ((gm["ref"], slice(0, 3)), (gm["rot"], slice(3, 6))):
+            if nd < len(U):
+                U[nd] = mot[sl]
     timings["total_s"] = time.perf_counter() - t0
     return U, RF, timings

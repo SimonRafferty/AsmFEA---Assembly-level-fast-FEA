@@ -15,6 +15,7 @@ from . import bondfirst
 from .classify import classify
 from .interfaces import find_interferences, find_interfaces, interface_id  # noqa: F401
 from .mechanism import detect_mechanisms, lock_spin, snap_coaxial
+from .rigid import rigid_groups
 from .welds import apply_welds
 
 
@@ -125,6 +126,10 @@ def resolve(model: Model, geoms: dict, face_map: dict,
         if not any(d.code in _MECHANISMS for d in b[2]):
             conns, removed, diags, info = b
             info["why"] = "the classic rules left a mechanism"
+    # rigid parts (D96): grouped by their bonds; what they cannot have is refused
+    groups, gdiags = rigid_groups(model, conns, removed)
+    diags += gdiags
+    info["rigid_groups"] = groups
     if out is not None:
         out.update(info)
     return conns, removed, diags

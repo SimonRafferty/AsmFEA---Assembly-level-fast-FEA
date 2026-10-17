@@ -6,6 +6,7 @@ diagnostics.Blocked when they cannot continue.
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections import defaultdict
 import time
@@ -21,6 +22,7 @@ from .diagnostics import Blocked, Diagnostic, make, raise_if_blocking
 from .geometry import resolve_geometry
 from .jobs import JobState, read_json, write_json_atomic
 from .mesh import MeshCancelled, PartMesh, cache_key, element_size, mesh_parts
+from .mesh import holes as holes_mod
 from .model import Model, load_model
 from .post import buckling, checks, convergence, summarise
 from .resolve import resolve
@@ -115,9 +117,22 @@ def stage_resolve(study: Path, js: JobState) -> None:
     _write(study / "geometry.json", {"schema_version": SCHEMA_VERSION,
                                      "parts": {k: g.to_json() for k, g in geoms.items()},
                                      "face_map": {k: list(v) for k, v in face_map.items()}})
+    groups = pin_info.get("rigid_groups", [])
+    from .resolve.rigid import rigid_doc
+    _write(study / "rigid.json", rigid_doc(model, geoms, face_map, groups, conns))
+    _side_fingerprints(conns, geoms)
     _write(study / "connections.json", {"schema_version": SCHEMA_VERSION, "connections": conns,
                                         "removed_parts": removed,
+                                        # rigid parts (D96): not meshed; each group one rigid body (rigid.json)
+                                        "rigid_parts": sorted(p for g in groups for p in g["parts"]),
+                                        "rigid_groups": groups,
                                         "left_out_hinges": [dict(d.evidence) for d in dupes],
+                                        # joins too far apart to bond (D97): the pane deletes them and says why
+                                        "refused_joins": [dict(d.evidence, parts=list(d.where.parts)) for d in rdiags
+                                                          if d.code == "JOIN_TOO_FAR"],
+                                        # every join this analysis took in (made, merged into another or refused): the
+                                        # pane lists the others as not yet analysed
+                                        "joins_seen": [j.id for j in model.joins],
                                         # pins: their axes (aligned where near-coaxial) and those whose own turn is
                                         # held as well (resolve; the deck holds them so)
                                         "pin_axes": pin_info.get("pin_axes", {}),
@@ -145,10 +160,29 @@ def stage_resolve(study: Path, js: JobState) -> None:
     js.verify(check)
     js.add_diags([d for d in diags if d.severity != "blocking"])
     raise_if_blocking(diags)
-    outputs = [study / "geometry.json", study / "connections.json"]
+    outputs = [study / "geometry.json", study / "connections.json", study / "rigid.json"]
     outputs += sorted({study / g.body_step for g in geoms.values() if g.body_step})
     cache.put("resolve", k, outputs, {"gr_diags": [d.model_dump() for d in gdiags + rdiags],
                                       "results": [line], "verify": [check]})
+
+
+def _side_fingerprints(conns: list[dict], geoms: dict) -> None:
+    """Each connection side's face fingerprint (type, area, centroid, normal or axis, radius), so the add-in can find
+    the face in SolidWorks (the colour view) and match a selected face to its connections (D98)."""
+    for c in conns:
+        for s in c.get("sides", []):
+            g = geoms.get(s.get("part"))
+            if g is None or not 0 <= int(s["face"]) < len(g.faces):
+                continue
+            f = g.faces[int(s["face"])]
+            fp = {"surface": f.surface, "area": round(float(f.area), 4), "centroid": [round(float(v), 4) for v in f.centroid]}
+            if f.normal is not None:
+                fp["normal"] = [round(float(v), 6) for v in f.normal]
+            if f.axis is not None:
+                fp["axis"] = [round(float(v), 6) for v in f.axis]
+            if f.radius is not None:
+                fp["radius"] = round(float(f.radius), 5)
+            s["fingerprint"] = fp
 
 
 def _model_doc(model: Model) -> dict:
@@ -167,7 +201,10 @@ def resolve_key(study: Path, model: Model) -> str:
     so a byte hash made resolve run again after every export (found live on M8)."""
     d = _model_doc(model)
     d["loads"] = [{k: ld.get(k) for k in ("id", "load_case", "type", "faces")} for ld in d.get("loads", [])]
-    d["study"] = {"bond_tolerance": (d.get("study") or {}).get("bond_tolerance")}
+    # the study settings the connections depend on (excluded_parts and connection_method were left out until D99, so
+    # changing them reused the old connections)
+    st = d.get("study") or {}
+    d["study"] = {k: st.get(k) for k in ("bond_tolerance", "excluded_parts", "connection_method", "rigid_parts")}
     # a missing file is part of the key, not an error here: resolve then reports STEP_MISSING as usual
     present = {s: (study / s).is_file() for s in sorted({p.step for p in model.parts})}
     return stage_key("resolve", {"model": d, "steps_present": present})
@@ -335,6 +372,34 @@ def _graded_spans(spans: list, clear: list, wall: float) -> tuple[list, list]:
     return pieces, longs
 
 
+def _free_holes(model: Model, geo: dict, conns: list[dict], removed: set) -> dict:
+    """{(geometry hash, solid index): ([free holes in the part frame], wall thickness or None)} (D101). Copies of a
+    part share one mesh, so a hole free on any copy is refined on all of them (a bolted copy's hole gets a finer mesh
+    for nothing, which costs less than meshing the copies apart). A part with more than HOLE_MAX_PER_PART free holes
+    gets none refined."""
+    fixture_faces = [tuple(geo.get("face_map", {})[fid]) for fx in model.fixtures for fid in fx.faces
+                     if fid in geo.get("face_map", {})]
+    used = holes_mod.used_faces(conns, fixture_faces)
+    out: dict = {}
+    for part in (p for p in model.parts if p.id not in removed):
+        g = geo["parts"][part.id]
+        route, rx = mesh_route(part)
+        wall = None
+        if route != "tet":
+            wall = rx.get("thickness") or rx.get("wall")
+            if not wall and part.body is not None:        # a plate-like solid: its thinnest box dimension
+                wall = min(abs(b - a) for a, b in zip(part.body.bbox_min, part.body.bbox_max))
+        found = holes_mod.free_holes(part.id, g["faces"], np.asarray(part.transform, float), used, wall)
+        key = (part.geometry_hash, g["solid_index"])
+        have, _ = out.setdefault(key, ([], wall))
+        seen = {(tuple(h["c"]), h["r"]) for h in have}
+        have += [h for h in found if (tuple(h["c"]), h["r"]) not in seen]
+    for key, (have, wall) in out.items():
+        if len(have) > defaults.HOLE_MAX_PER_PART:
+            out[key] = ([], wall)
+    return out
+
+
 def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL, local: set | None = None) -> tuple[dict, dict]:
     """(unique tasks by cache key, manifest {part: {level: {...}}}). A fast run meshes at the fast sizes, with
     the coarse size as each part's fallback. local: the parts the local pass (D65) meshes finer again, at
@@ -347,10 +412,11 @@ def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL, local: set | No
     fidelity = plan_study(model.study, fast=(mode == FAST)).fidelity     # D60: from favour, or the override
     user_size = model.study.mesh.size if model.study else None
     conn_doc = read_json(study / "connections.json")
-    removed = set(conn_doc.get("removed_parts", []))
+    removed = not_meshed(conn_doc)
     conns = conn_doc.get("connections", [])
     backends = registry(cfg)
     versions = {n: backends[n].version() for c in CHAINS.values() for n in c}
+    holes_of = _free_holes(model, geo, conns, removed)
     tasks, manifest = {}, {}
     for part in (p for p in model.parts if p.id not in removed):
         g = geo["parts"][part.id]
@@ -358,6 +424,7 @@ def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL, local: set | No
                 else [g["bbox"][k + 3] - g["bbox"][k] for k in range(3)])       # no body description (D53)
         base = element_size(dims, user_size, fidelity)
         route, rx = mesh_route(part)
+        holes, wall = holes_of.get((part.geometry_hash, g["solid_index"]), ([], None))
         if route == "skin" and part.kind == "solid" and any(
                 c["type"] == "tie" and c.get("geometry") == "line" and part.id in c["parts"] for c in conns):
             # a solid bonded along an edge (a weldment's edge contact): one wedge through its thickness gave the
@@ -401,12 +468,17 @@ def mesh_tasks(study: Path, model: Model, cfg, mode: str = FULL, local: set | No
                 # the long pieces stay at their base size on every level: only the joint windows refine (D92)
                 rx_l = {**rx, "long_layer_t": defaults.SPAN_LONG_LAYER_T / factor,
                         "long_section_t": defaults.SPAN_LONG_SECTION_T / factor}
+            # free holes (D101), sized against the part's size here: a swept wall's in-plane size, else the tet size
+            near = defaults.SKIN_SIZE_T * wall * sweep_factor if (wall and route != "tet") else size
+            holes_l = holes_mod.sized(holes, sweep_factor, near)
             key = cache_key(part.geometry_hash, g["solid_index"], size, [(n, versions[n]) for n in chain],
-                            {"route": route, **rx_l, "factor": sweep_factor})
-            manifest[part.id][level] = {"key": key, "size": size, "route": route}
+                            {"route": route, **rx_l, "factor": sweep_factor, **({"holes": holes_l} if holes_l else {})})
+            manifest[part.id][level] = {"key": key, "size": size, "route": route,
+                                        **({"holes": len(holes_l)} if holes_l else {})}
             tasks.setdefault(key, {
                 "key": key, "part": part.id, "level": level, "body_step": str(study / g["body_step"]),
                 "element": "tet" if route == "tet" else "swept", "route": route, "route_extra": rx_l,
+                "holes": holes_l,
                 "factor": sweep_factor, "size": size, "out": str(study / "mesh" / f"{key}.npz"),
                 "workdir": str(study / "mesh" / "work" / key), "face_areas": [f["area"] for f in g["faces"]],
                 "chain": chain, "timeout_s": defaults.MESH_TIMEOUT_S, "config": asdict(cfg)})
@@ -508,6 +580,10 @@ def stage_mesh(study: Path, js: JobState) -> None:
     if coarse:
         js.result(f"mesh (fast): {len(coarse)} part(s) meshed at the coarse size (they would not mesh at the fast size): "
                   + ", ".join(coarse[:8]) + ("..." if len(coarse) > 8 else ""))
+    holed = {p: m["base"]["holes"] for p, m in manifest.items() if m.get("base", {}).get("holes")}
+    if holed:
+        js.result(f"mesh: {sum(holed.values())} free hole(s) on {len(holed)} part(s) meshed finer round their edges "
+                  f"(D101)")
     js.add_diags(diags)
     raise_if_blocking(diags)
     for level, _ in levels_for(model, mode):
@@ -519,6 +595,12 @@ def stage_mesh(study: Path, js: JobState) -> None:
 
 
 # --------------------------------------------------------------------------- #
+
+def not_meshed(conn_doc: dict) -> set[str]:
+    """Parts with no mesh: those left out of the analysis, and the rigid parts (D96), which are analysed as rigid
+    bodies (their loads stay; a left-out part's go with it)."""
+    return set(conn_doc.get("removed_parts", [])) | set(conn_doc.get("rigid_parts", []))
+
 
 def build_instances(study: Path, model: Model, level: str = "base", mode: str = FULL,
                     run: Path | None = None) -> list[Instance]:
@@ -535,7 +617,7 @@ def build_instances(study: Path, model: Model, level: str = "base", mode: str = 
             manifest = read_json(run / level / "manifest.json")["parts"]
     if manifest is None:
         manifest = read_json(study / "mesh" / ("manifest_fast.json" if mode == FAST else "manifest.json"))["parts"]
-    removed = set(read_json(study / "connections.json").get("removed_parts", []))
+    removed = not_meshed(read_json(study / "connections.json"))
     out, node0, elem0 = [], 0, 0
     cache: dict[str, PartMesh] = {}
     for i, part in enumerate(model.parts, start=1):
@@ -620,7 +702,9 @@ def joint_zones(instances: list[Instance], conns: list[dict], model: Model | Non
         if c["type"] != "tie":
             continue
         for s in c["sides"]:
-            inst = by[s["part"]]
+            inst = by.get(s["part"])
+            if inst is None:
+                continue                    # a rigid part (D96): no mesh, nothing to assess
             ids = seeds.setdefault(inst.part_id, set())
             nodes = np.asarray(inst.face_nodes(int(s["face"])))
             if len(nodes) == 0:
@@ -645,7 +729,9 @@ def joint_zones(instances: list[Instance], conns: list[dict], model: Model | Non
             # radius counts as real stress (found live: 1149 MPa on a tube's radius). Only under the end:
             # a radius runs the whole length of its tube.
             for m in b["masters"]:
-                inst = by[m["part"]]
+                inst = by.get(m["part"])
+                if inst is None or b["slave"]["part"] not in by:
+                    continue
                 seeds.setdefault(inst.part_id, set())
                 ids = whole.setdefault(inst.part_id, set())
                 # every face element at once, grouped by node count (one at a time in Python was most of
@@ -770,6 +856,22 @@ def _history_path(name: str = "solve_history.json") -> Path:
 DECK_HISTORY = "deck_history.json"
 
 
+def _pessimistic(hist: list, dof: int, power: float, floor: float) -> float | None:
+    """A time to expect, on the long side (the user, 2026-10-16: better surprised than disappointed): the slowest of
+    the recent earlier runs within ESTIMATE_DOF_RANGE of this size, each scaled by (dof ratio)^power, times
+    ESTIMATE_MARGIN; the nearest run (scaled) when none is that close. The same model solved in 78 s and 132 s on two
+    runs an hour apart (the 90 chassis, 1.0 M DOF), and the nearest-run estimate had said 78."""
+    hist = [h for h in hist if h.get("dof") and h.get("seconds") is not None]
+    if not hist:
+        return None
+    near = [h for h in hist[-defaults.ESTIMATE_RECENT:]
+            if abs(np.log(h["dof"] / dof)) <= np.log(defaults.ESTIMATE_DOF_RANGE)]
+    if not near:
+        near = [min(hist, key=lambda h: abs(np.log(h["dof"] / dof)))]
+    worst = max(h["seconds"] * (dof / h["dof"]) ** power for h in near)
+    return max(worst * defaults.ESTIMATE_MARGIN, floor)
+
+
 def estimate_deck_s(dof: int) -> float | None:
     """How long writing a deck of this size takes on this machine: the nearest earlier deck (by DOF), scaled by
     (dof ratio)^1.1 (the deck's tie, joint and load work grows a little faster than its size). None before the
@@ -778,10 +880,7 @@ def estimate_deck_s(dof: int) -> float | None:
         hist = json.loads(_history_path(DECK_HISTORY).read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    if not hist:
-        return None
-    best = min(hist, key=lambda h: abs(np.log(h["dof"] / dof)))
-    return max(best["seconds"] * (dof / best["dof"]) ** 1.1, 1.0)
+    return _pessimistic(hist, dof, 1.1, 1.0)
 
 
 def _record_deck_history(dof: int, seconds: float) -> None:
@@ -800,10 +899,7 @@ def estimate_solve_s(dof: int) -> float | None:
         hist = json.loads(_history_path().read_text())
     except (OSError, json.JSONDecodeError):
         return None
-    if not hist:
-        return None
-    best = min(hist, key=lambda h: abs(np.log(h["dof"] / dof)))
-    return best["seconds"] * (dof / best["dof"]) ** 1.3
+    return _pessimistic(hist, dof, 1.3, 0.0)
 
 
 def _record_history(dof: int, seconds: float, steps: int) -> None:
@@ -846,6 +942,7 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg, plan=N
     conns = [c for c in conn_doc["connections"] if not removed & set(c["parts"][:2])]
     face_map = {k: tuple(v) for k, v in geo["face_map"].items()}
     model = _without_removed(model, removed, face_map)
+    rigid = read_json(study / "rigid.json") if (study / "rigid.json").exists() else None
     d = js.dir / level
     d.mkdir(parents=True, exist_ok=True)
     instances = build_instances(study, model, level, mode_of(js), run=js.dir)
@@ -885,7 +982,7 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg, plan=N
             deck = write_deck(rd / "study.inp", spec.get("model", model), instances, spec["conns"], face_map, spec["cases"],
                               threads_hint=cfg.threads, bolts=[dict(b) for b in spec["bolts"]], stabilise=stabilise if spec["kind"] == "contact" else [],
                               buckling=spec["buckling"], pin_axes=conn_doc.get("pin_axes"),
-                              held_spins=conn_doc.get("held_spins"))
+                              held_spins=conn_doc.get("held_spins"), rigid=rigid)
             pinfo["inp_bytes"] = sum(f.stat().st_size for f in rd.glob("*") if f.suffix in (".inp", ".nam", ".sur", ".equ"))
         _record_deck_history(dof, time.time() - t_deck)
         if deck.diagnostics:
@@ -939,6 +1036,9 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg, plan=N
                 # a deck the hybrid cannot take (bolts, equations, buckling): CalculiX after all, unless it
                 # cannot fit in the computer at all (it would page to a standstill)
                 js.log(f"hybrid solver cannot take this deck ({e}); solving with CalculiX")
+                if "rigid" in str(e):
+                    js.add_diags([make("HYBRID_RIGID_UNSUPPORTED", where={"parts": conn_doc.get("rigid_parts", [])},
+                                       what=str(e), evidence={"level": level, "dof": dof})])
                 js.add_diags(mem)
                 raise_if_blocking(too_big)
                 use_hybrid = False
@@ -1082,13 +1182,14 @@ def solve_key(study: Path, model: Model, cfg, levels: list[str], superposed: boo
     d = _model_doc(model)
     st = dict(d.get("study") or {})
     st.pop("limits", None)
+    st.pop("fatigue", None)          # read after post (D105): a spectrum change re-runs the fatigue stage only
     d["study"] = st
     if superposed:
         # each load is solved at its own size once and scaled afterwards: its size is not an input of the decks
         d["loads"] = [{k: v for k, v in ld.items() if k != "magnitude"} for ld in d.get("loads", [])]
     manifest = read_json(study / "mesh" / ("manifest_fast.json" if mode == FAST else "manifest.json"))["parts"]
     meshes = {p: {lv: m[lv]["key"] for lv in levels} for p, m in manifest.items()}
-    files = {n: file_digest(study / n) for n in ("geometry.json", "connections.json", "exceptions.json")
+    files = {n: file_digest(study / n) for n in ("geometry.json", "connections.json", "exceptions.json", "rigid.json")
              if (study / n).exists()}
     ccx = Path(cfg.ccx) if cfg.ccx else None
     tool = [str(ccx), ccx.stat().st_size, ccx.stat().st_mtime_ns] if ccx and ccx.is_file() else None
@@ -1469,6 +1570,8 @@ def post_key(study: Path, model: Model, run: Path, levels: list[str]) -> str:
     including limits and the export's view, and a view chosen after the solve (view.json)."""
     d = model.model_dump(by_alias=True, mode="json")
     d["source"] = {k: v for k, v in (d.get("source") or {}).items() if k != "timestamp"}
+    if d.get("study"):
+        d["study"] = {k: v for k, v in d["study"].items() if k != "fatigue"}     # the fatigue stage's own (D105)
     view = file_digest(study / "view.json") if (study / "view.json").exists() else None
     results = {p.relative_to(run).as_posix(): file_digest(p) for p in run_outputs(run, levels)}
     return stage_key("post", {"model": d, "run": run.name, "results": results, "view": view, "levels": levels})
@@ -1778,6 +1881,135 @@ class Cancelled(Exception):
     pass
 
 
+LEVEL_ORDER = ("base", "refined", "local")
+
+
+def fatigue_key(study: Path, model: Model, run: Path, levels: list[str]) -> str:
+    """What fatigue.json depends on: study.fatigue, the materials, the static results (results.json and the solved
+    levels' result files by content) and geometry.json (the sharp edges). Nothing else: a spectrum change re-runs
+    this stage only (D105)."""
+    fat = model.study.fatigue.model_dump(mode="json") if model.study and model.study.fatigue else None
+    mats = [m.model_dump(by_alias=True, mode="json") for m in model.materials]
+    results = {p.relative_to(run).as_posix(): file_digest(p) for p in run_outputs(run, levels)}
+    return stage_key("fatigue", {"fatigue": fat, "materials": mats, "results": results, "levels": levels,
+                                 "static": file_digest(study / "results" / "results.json"),
+                                 "geometry": file_digest(study / "geometry.json")})
+
+
+def stage_fatigue(study: Path, js: JobState) -> None:
+    """Fatigue on the static results (release 2, D105): results/fatigue.json, parent material (F2)."""
+    model = load_model(study)
+    fat = model.study.fatigue if model.study else None
+    if fat is None:
+        js.log("fatigue: none asked for (study.fatigue)")
+        return
+    if not fat.spectrum:
+        # settings made on the Fatigue tab but no load cycles yet: nothing to assess (D120: the tab has no on/off box)
+        js.log("fatigue: the spectrum has no rows; not assessed")
+        return
+    if mode_of(js) == FAST:
+        js.result("fatigue: not assessed on a fast run (approximate results); do a full run")
+        return
+    if not (study / "results" / "results.json").exists():
+        raise Blocked([make("RESULTS_MISSING")])
+    res = read_json(study / "results" / "results.json")
+    run = study / "run" / res["job"]
+    levels = [lv for lv in LEVEL_ORDER if lv in (res.get("mesh") or {})]
+    reported = res["reported_mesh"]
+    previous = levels[levels.index(reported) - 1] if levels.index(reported) > 0 else None
+    cache = StageCache(study)
+    k = fatigue_key(study, model, run, levels)
+    rec = None if force_requested(js) else cache.get("fatigue", k)
+    if rec:
+        replay(js, rec["data"])
+        note_reuse(js, "fatigue", f"fatigue reused (from job {rec['data'].get('job', '?')})")
+        return
+    outer = js
+    js = Recorder(js)
+    from . import fatigue as F
+    from .fatigue import tables
+    js.activity("fatigue: reading the static results")
+    stresses = {lv: F.LevelStresses(run / lv, model) for lv in ([previous] if previous else []) + [reported]}
+    nonlinear = set().union(*(s.nonlinear for s in stresses.values()))
+    diags = F.check_spectrum(model, fat, nonlinear)
+    parts = [i["part"] for i in stresses[reported].info["instances"]]
+    curves, cdiags = F.curves_for(model, fat, parts)
+    diags += cdiags
+    raise_if_blocking(diags)
+    geometry = read_json(study / "geometry.json")["parts"]
+    js.activity("fatigue: parent material")
+    with perf.span("fatigue_parent"):
+        def progress(text, done, total):          # the pane's bar; a cancel request stops between items
+            js.activity(text, done, total)
+            if hasattr(outer, "cancel_requested") and outer.cancel_requested():
+                raise Cancelled()
+        parent, skipped, pdiags, fields = F.assess_parent(model, fat, stresses, reported, previous, geometry, curves,
+                                                          parts, progress)
+    diags += pdiags
+    from .fatigue import welds as W
+    js.activity("fatigue: bonded joints and bolts")
+    with perf.span("fatigue_joints"):
+        joints, wdiags = W.assess_welds(model, fat, stresses, reported, previous, progress)
+        conns = read_json(study / "connections.json")["connections"] if (study / "connections.json").exists() else []
+        bolts, bdiags = W.assess_bolts(model, fat, stresses[reported], conns)
+        from .fatigue.walls import assess_walls
+        walls, rdiags = assess_walls(model, fat, stresses, reported, joints, progress)
+    diags += wdiags + bdiags + rdiags
+    items = [(f"part {p}", v) for p, v in parent.items()] + [(f"joint {c}", v) for c, v in joints.items()] +         [(f"wall {c}", v) for c, v in walls.items()] + [(f"bolt {b}", v) for b, v in bolts.items()]
+    for _, v in items:
+        # strict JSON writes inf as null: damage stays finite (a failure is a huge damage, pass false), while an infinite
+        # life or factor (no damage) is written null and read so
+        if not math.isfinite(v["damage"]):
+            v["damage"], v["pass"] = 1e300, False
+    worst = min(items, key=lambda kv: kv[1]["factor_k"], default=None)
+    doc = {"schema_version": SCHEMA_VERSION, "job": outer.dir.name, "static_job": res["job"],
+           "static_results": file_digest(study / "results" / "results.json"),
+           "standard": fat.standard, "standard_name": tables.STANDARD_NAMES[fat.standard],
+           "spectrum": [r.model_dump(mode="json") for r in fat.spectrum], "design_blocks": fat.design_blocks,
+           "gamma_Ff": fat.gamma_Ff, "gamma_Mf": fat.gamma_Mf, "mean_stress": fat.parent.mean_stress,
+           "range_measure": fat.parent.range, "level": reported, "previous_level": previous,
+           "parts": parent, "joints": joints, "walls": walls, "bolts": bolts,
+           "governing": {"item": worst[0], **{k2: worst[1][k2] for k2 in ("damage", "life_blocks", "factor_k", "pass")}}
+           if worst else None,
+           "parts_not_assessed": skipped,
+           "not_assessed": {},
+           "warnings": [d.model_dump() for d in diags]}
+    _write(study / "results" / "fatigue.json", doc)
+    js.add_diags(diags)
+    outputs = [study / "results" / "fatigue.json"]
+    try:                                        # the damage plot and the two documents (F4, D107)
+        from .post.plots import render_fatigue
+        js.activity("fatigue: rendering the damage plot")
+        marks = [(np.asarray(v["governing"]["at"]), f"{n.split(' (')[0]}: factor {v['factor_k']:.3g}")
+                 for n, v in sorted(items, key=lambda kv: kv[1]["factor_k"])[:3] if v["governing"].get("at")]
+        images = render_fatigue(study, model, reported, fields, marks, study / "results")
+        doc["images"] = images
+        _write(study / "results" / "fatigue.json", doc)
+        outputs += [study / "results" / n for n in images]
+    except ImportError:
+        js.log("fatigue: PyVista not installed (asmfea[report]); no damage plot")
+    try:
+        from .report.fatigue import build_fatigue_data, build_fatigue_report, build_fatigue_summary
+    except ImportError:
+        js.log("fatigue: python-docx not installed (asmfea[report]); no fatigue report written")
+    else:
+        js.activity("fatigue: writing the fatigue report, summary and data report")
+        for build in (build_fatigue_report, build_fatigue_summary, build_fatigue_data):
+            path = build(study)
+            outputs.append(path)
+            js.result(f"fatigue: {path.relative_to(study)}")
+    for name, p in sorted(items, key=lambda kv: kv[1]["factor_k"]):
+        g = p["governing"]
+        where = f" at ({', '.join(f'{v:.1f}' for v in g['at'])})" if "at" in g else ""
+        rng = g.get("range", g.get("stress_range"))
+        js.result(f"fatigue: {name} damage {p['damage']:.3g} over the design life, factor {p['factor_k']:.3g} on "
+                  f"stress ({p['curve']}); governing row {g['row']}, range {rng:.4g} MPa{where}")
+    if worst:
+        js.verify(f"{'PASS' if worst[1]['pass'] else 'FAIL'} fatigue damage over the design life: "
+                  f"{worst[1]['damage']:.3g} ({worst[0]}; limit 1)")
+    cache.put("fatigue", k, outputs, {**js.data(), "job": outer.dir.name})
+
+
 def stage_report(study: Path, js: JobState) -> None:
     if mode_of(js) == FAST:
         # a fast run is approximate: reports are written from full runs only (ADDENDUM-FAST-RUN-MODE)
@@ -1802,4 +2034,4 @@ def stage_report(study: Path, js: JobState) -> None:
 
 
 STAGES = {"resolve": stage_resolve, "mesh": stage_mesh, "solve": stage_solve, "post": stage_post,
-          "report": stage_report}
+          "fatigue": stage_fatigue, "report": stage_report}

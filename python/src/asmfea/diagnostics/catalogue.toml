@@ -46,7 +46,7 @@ actions = ["Assign a material to the part in SolidWorks and re-export.", "Add th
 severity = "blocking"
 stage = "load"
 what = "Load case '{case}' {problem}."
-explain = "Loads are grouped into named load cases, each solved separately. A load names a case the study does not list, or a listed case has no loads. Check the load cases on the Study tab match the ones used on the Loads and fixtures tab."
+explain = "Loads are grouped into named load cases, each solved separately. A load names a case the study does not list, or a listed case has no loads. Check the load cases and their loads on the Loads tab."
 likely_causes = ["The load case was renamed in the study but not on its loads.", "A load case was added to the study with no loads yet."]
 actions = ["Assign loads to the load case or remove it from the study."]
 
@@ -54,7 +54,7 @@ actions = ["Assign loads to the load case or remove it from the study."]
 severity = "blocking"
 stage = "load"
 what = "The study has no fixtures, so nothing holds the assembly in space."
-explain = "A static analysis needs something holding the assembly in space; without it the whole model would simply fly away under load and the solver cannot find an answer. Add at least one fixture (select faces, then Fixed or Pinned on the Loads and fixtures tab)."
+explain = "A static analysis needs something holding the assembly in space; without it the whole model would simply fly away under load and the solver cannot find an answer. Add at least one fixture (select faces, then Fixed or Pinned on the Loads tab)."
 likely_causes = ["Fixtures have not been defined yet."]
 actions = ["Add at least one fixture to a face of the assembly."]
 
@@ -120,7 +120,7 @@ stage = "resolve"
 what = "{count} part(s) are not connected to anything with a fixture and are left out of the analysis: {parts}."
 explain = "These parts have no path, through touching faces, mates or bolts, to a fixture, and no load is applied to them, so they cannot carry anything. They are left out so the rest of the model can be solved; their weight is not included. Click this message to select them in SolidWorks. If they should be part of the structure, look for small gaps, or set the connection on the Connections tab."
 likely_causes = ["A gap between the parts and their neighbours larger than the bond tolerance.", "Duplicate or stray bodies left in a part.", "A connection set to 'none' by an override."]
-actions = ["Select the parts from this message and check how they meet their neighbours.", "Raise the bond tolerance on the Study tab if the gaps are intended to be bonded."]
+actions = ["Select the parts from this message and check how they meet their neighbours.", "Raise the bond tolerance on the Connections tab if the gaps are intended to be bonded."]
 
 [MECHANISM_LOADED]
 severity = "blocking"
@@ -198,9 +198,9 @@ actions = ["Read the log excerpt in `raw`.", "Open the run in PrePoMax to inspec
 severity = "blocking"
 stage = "solve"
 what = "The solver ran out of memory on a model with {dof} degrees of freedom."
-explain = "The model has more unknowns than the computer's memory can hold while solving, even after AsmFEA's own retry with the simplest joints. On the Study tab choose Optimise for: Speed (a coarser mesh, one solve), close other programs, or remove detail that does not matter for strength."
+explain = "The model has more unknowns than the computer's memory can hold while solving, even after AsmFEA's own retry with the simplest joints. On the Run tab (How to solve) choose Optimise for: Speed (a coarser mesh, one solve), close other programs, or remove detail that does not matter for strength."
 likely_causes = ["The mesh is too fine for the installed RAM.", "Other programs took memory during the run."]
-actions = ["Choose Optimise for: Speed on the Study tab (or a coarser mesh level under Advanced).", "Close other programs before running.", "Reduce the number of parts meshed with tets (members and flat sheet use swept elements)."]
+actions = ["Choose Optimise for: Speed on the Run tab (How to solve) (or a coarser mesh level under Advanced).", "Close other programs before running.", "Reduce the number of parts meshed with tets (members and flat sheet use swept elements)."]
 
 [HYBRID_RETRIED]
 severity = "warning"
@@ -552,7 +552,7 @@ actions = ["Rebuild the assembly (Ctrl+Q) and fix any rebuild errors, then expor
 severity = "warning"
 stage = "extract"
 what = "Face {face} on {part} lost its SolidWorks reference after a change to the model and was found again by its shape (match score {score}). Check that the loads and fixtures on it are still where they should be."
-explain = "Each load and fixture remembers its faces. After a change to the model SolidWorks could no longer identify this face, so it was found again by shape and position. The match is usually right, but check the load or fixture is still on the intended face (select it on the Loads and fixtures tab to highlight it)."
+explain = "Each load and fixture remembers its faces. After a change to the model SolidWorks could no longer identify this face, so it was found again by shape and position. The match is usually right, but check the load or fixture is still on the intended face (select it on the Loads tab to highlight it)."
 likely_causes = ["A feature was deleted and recreated, or the face was split or merged, so SolidWorks gave it a new identity."]
 actions = ["Select the study's loads and fixtures in the task pane to highlight their faces and confirm them.", "Re-select the face if it is wrong."]
 
@@ -579,3 +579,171 @@ what = "Fast load-size changes is on, but each load case was solved as a whole: 
 explain = "With Fast load-size changes each load is solved on its own once and a load case is the sum of its loads, so a later change to the size of loads needs no new solve. That is exact only when the results are linear in the loads. This study has something that is not, so its load cases were solved as a whole, as usual. The results are complete and correct; only the shortcut is not available."
 likely_causes = ["The study includes buckling.", "The model has separating contact or preloaded bolts."]
 actions = ["Nothing is needed. To use the shortcut, turn buckling off for this study, or use bonded connections."]
+
+[RIGID_PART_UNKNOWN]
+severity = "info"
+stage = "load"
+what = "Part {part} is set to rigid but is not in the model; the setting is ignored."
+explain = "The study lists a part as rigid that this export does not contain (it may be suppressed in this configuration, renamed or deleted). The setting is kept and applies again if the part comes back; nothing else is affected."
+likely_causes = ["The part is suppressed in the active configuration.", "The part was renamed or deleted after it was set to rigid."]
+actions = ["Make the part flexible on the Connections tab (Rigid: row, Edit) if it is gone for good.", "Otherwise nothing is needed."]
+
+[RIGID_NO_FLEXIBLE_PART]
+severity = "blocking"
+stage = "resolve"
+what = "Every part is set to rigid ({parts}): there is nothing to analyse."
+explain = "Rigid parts are not meshed and carry no stress; only the flexible parts are analysed. With every part rigid there is no structure left to solve."
+likely_causes = ["The parts were made rigid by mistake.", "The one part meant to be analysed was made rigid as well."]
+actions = ["Make the parts you want stresses for flexible on the Connections tab (Rigid: rows, Edit)."]
+
+[RIGID_CONNECTION_UNSUPPORTED]
+severity = "blocking"
+stage = "resolve"
+what = "Connection {connection} between {parts} is {kind}, which a rigid part cannot have."
+explain = "A rigid part is not meshed: its connections join the other parts' faces to its rigid motion. Bonded, bolted (without preload) and hinged or sliding joints work that way. Separating contact needs a mesh on both sides, and a preloaded bolt needs one under its head and nut, so these are not available on a rigid part; two rigid parts meeting face to face are one rigid body and cannot slide on each other."
+likely_causes = ["A part with separating contact or a preloaded bolt was made rigid.", "Two rigid parts were set to slide on each other."]
+actions = ["Set the connection to Fixed or to Sliding, no separation (Connections tab, Set to).", "Or make the part flexible again."]
+
+[RIGID_JOINT_IN_GROUP]
+severity = "warning"
+stage = "resolve"
+what = "Joint {connection} between rigid parts {parts} is ignored: they are also bonded, so they move as one rigid body."
+explain = "Rigid parts bonded to each other form one rigid body. A hinge or sliding joint between two parts of one such body can never move, so it is left out; the bond holds them."
+likely_causes = ["Two rigid parts touch face to face (bonded) and are also hinged.", "A hinge was added between parts that are welded or bolted together."]
+actions = ["Nothing is needed if the parts are meant to be fixed together.", "If the joint should move, set the bond between them to Not connected, or make one of the parts flexible."]
+
+[JOIN_INVALID]
+severity = "blocking"
+stage = "resolve"
+what = "Join {join} cannot be made: {problem}."
+explain = "A join you add connects two different parts, and any faces chosen for it must be faces of those parts, at most one on each. The faces or parts of this join do not allow that, so it is left out until it is fixed."
+likely_causes = ["A face of a third part was selected.", "Both faces are on one part.", "A part was removed or a face changed in SolidWorks since the join was added."]
+actions = ["Delete the join on the Connections tab (Set to: Not connected) and add it again, selecting the two parts or a face on each."]
+
+[JOIN_TOO_FAR]
+severity = "warning"
+stage = "resolve"
+what = "Join {join} between {parts} was not made: the nearest faces are {gap} mm apart, more than the join limit of {limit} mm."
+explain = "A join with no faces chosen, or with a face chosen on one part only, bonds the nearest faces only when they are close (about one element apart): further apart, a bond would join faces that may not be the ones meant. Choose a face on each part to join them however far apart they are (they are then joined by a rigid link)."
+likely_causes = ["The parts do not come close to each other where they should meet.", "The selected face is not the one nearest the other part."]
+actions = ["Select a face on each part and press Join again: the two faces are linked whatever the distance.", "Or move the part in SolidWorks so that it meets its neighbour."]
+
+[JOIN_TYPE_UNSUPPORTED]
+severity = "blocking"
+stage = "resolve"
+what = "Join {connection} between {parts} is a rigid link and cannot be set to {kind}."
+explain = "A join between faces that do not meet is made as a rigid link: each face's mean motion follows one rigid connector between them. A link carries everything (Fixed); contact or sliding needs faces that touch."
+likely_causes = ["A join between faces that are apart was set to a sliding or contact type."]
+actions = ["Set the join back to Fixed, or delete it and join faces that touch."]
+
+[HYBRID_RIGID_UNSUPPORTED]
+severity = "warning"
+stage = "solve"
+what = "The memory-saving solver cannot take {what} yet: the model was solved with CalculiX instead."
+explain = "The run planner chose the memory-saving (hybrid) solver for this model's size, but it does not yet support this combination of rigid parts or rigid links. CalculiX solved it instead; the results are complete, but the solve needed more memory."
+likely_causes = ["A rigid part with a joint or a fixture combination the hybrid solver does not handle."]
+actions = ["Nothing is needed if the solve finished.", "If memory runs short, make the rigid parts flexible or simplify the joints on them."]
+
+[FATIGUE_NO_SN_CURVE]
+severity = "blocking"
+stage = "fatigue"
+what = "Material {material} has no S-N data for the fatigue assessment."
+explain = "Fatigue life is read from an S-N curve, and asmfea never assumes one: each material of the parts assessed needs a curve of its own (a Basquin fit or S-N points from your data), or a parent-material class of the study's standard."
+likely_causes = ["The material was added to the model after the fatigue settings were made.", "The material's name in the fatigue settings is spelled differently from the model's."]
+actions = ["Add the material to the fatigue settings with its S-N data (study.fatigue.materials: basquin, points or standard_class) and its source."]
+
+[FATIGUE_CLASS_UNKNOWN]
+severity = "blocking"
+stage = "fatigue"
+what = "Material {material}: class {cls} is not a parent-material class of {standard}."
+explain = "A standard_class picks the standard's own S-N curve for unwelded material. Each standard offers only a few; a class from another standard, or a misspelt one, cannot be used."
+likely_causes = ["The class belongs to another standard than the one chosen for the study.", "The class name is misspelt."]
+actions = ["Choose one of the classes listed in the evidence, or change the study's standard, or give a curve of your own (basquin or points)."]
+
+[FATIGUE_NO_ULTIMATE]
+severity = "blocking"
+stage = "fatigue"
+what = "Material {material} has no ultimate strength, which the {rule} mean-stress correction needs."
+explain = "A user S-N curve is for fully reversed loading; a cycle with a mean stress is corrected to an equivalent fully reversed amplitude using the material's ultimate tensile strength. Without it the correction cannot be made."
+likely_causes = ["The material in SolidWorks has no tensile strength set."]
+actions = ["Set the material's tensile strength in SolidWorks and export again.", "Or set study.fatigue.parent.mean_stress to none if your S-N data already allows for the mean stress (state why in the report)."]
+
+[FATIGUE_UNKNOWN_CASE]
+severity = "blocking"
+stage = "fatigue"
+what = "Fatigue spectrum row {row} names load case {case}, which is not one of the study's load cases."
+explain = "Each row of the spectrum cycles a solved load case between two percentages. A row naming a load case the study does not solve has no stresses to read."
+likely_causes = ["The load case was renamed or removed after the spectrum was set up.", "The case is not in study.load_cases (it is not solved)."]
+actions = ["Correct the row's case, or add the load case to the study and run it."]
+
+[FATIGUE_NONLINEAR_LEVEL]
+severity = "blocking"
+stage = "fatigue"
+what = "Fatigue spectrum row {row} uses load case {case} at {pct:g} %, but that case has contact or preloaded bolts, so it cannot be scaled."
+explain = "With contact or preloaded bolts the response is not proportional to the load (a joint opens, a bolt's force jumps), so a result at 100 % cannot be scaled to another level. Only 0 % (unloaded, or the bolts' preload alone) and 100 % of such a case can be read."
+likely_causes = ["The row's percentage is neither 0 nor 100 on a case solved with contact or preload."]
+actions = ["Add a load case at that load level, solve it, and use it at 100 % in the row."]
+
+[FATIGUE_NONLINEAR_PAIR]
+severity = "info"
+stage = "fatigue"
+what = "Fatigue spectrum rows use load cases with contact or preloaded bolts ({cases}): their ranges are taken between separately solved cases."
+explain = "Each such case was solved on its own. The range between two of them is valid as it stands; the cases are not scaled. A case's 0 % state is its own unloaded state (with the bolts' preload alone where there are preloaded bolts)."
+likely_causes = ["The study has contact or preloaded bolts."]
+actions = ["No action needed. To read a level other than 0 % or 100 % of such a case, solve that level as a load case of its own."]
+
+[FATIGUE_HOTSPOT_UNCONVERGED]
+severity = "warning"
+stage = "fatigue"
+what = "Part {part}: its largest stress range changed {change:+.1f} % between the last two meshes (limit {tol:g} %); its fatigue life is not settled."
+explain = "Fatigue life goes roughly as the stress range to the power 3 to 10, so a few per cent in stress is tens of per cent in life. The governing range must hold between the last two meshes; this one did not."
+likely_causes = ["A notch (fillet, hole or corner) is not meshed finely enough yet.", "The governing point is near a joint or support edge whose stress has no finite value."]
+actions = ["Run with Optimise for Accuracy (or fidelity fine), which refines the parts that did not converge.", "Look at where the governing point is: at an unfilleted corner, model the real fillet radius."]
+
+[FATIGUE_SHARP_NOTCH]
+severity = "warning"
+stage = "fatigue"
+what = "Part {part}: the highest fatigue damage is at a sharp inside corner (at {at}), which has no finite stress; the corner is left out and the next point is reported."
+explain = "At an inside corner with no fillet the elastic stress grows without limit as the mesh is refined, so no fatigue life can be read there. The real part has some radius at the corner; its life depends on that radius."
+likely_causes = ["The corner is modelled sharp, with no fillet.", "A weld or a machined pocket corner is modelled without its radius."]
+actions = ["Model the corner's real radius (a fillet), or assess the corner by hand with a detail category or a notch factor for its real radius."]
+
+[FATIGUE_NO_CATEGORY]
+severity = "blocking"
+stage = "fatigue"
+what = "Joint {connection} is to be assessed by its nominal stress, but has no detail category."
+explain = "The nominal stress method reads a joint's life from the detail category of the joint's type in the standard (a curve per type of weld detail). asmfea cannot tell a joint's detail from the model, so the category must be given for each joint assessed this way."
+likely_causes = ["The joint is set to the nominal method, or the study's weld method is nominal, but no category was given for it."]
+actions = ["Give the joint's detail category in study.fatigue.welds.joints, or assess it by the structural stress method (dong), which needs no category."]
+
+[FATIGUE_CATEGORY_WRONG_STANDARD]
+severity = "blocking"
+stage = "fatigue"
+what = "Joint {connection}: category {category} is not one of {standard}'s."
+explain = "One standard is used for the whole study, and each joint's category must be one of that standard's (for the structural stress method, one of its structural stress curves)."
+likely_causes = ["The category belongs to another standard than the one chosen for the study.", "The category is misspelt."]
+actions = ["Choose one of the categories listed in the evidence, or change the study's standard."]
+
+[FATIGUE_RECEIVING_SIDE_NOT_ASSESSED]
+severity = "warning"
+stage = "fatigue"
+what = "Joint {connection}: the wall it sits on ({part}) is not assessed for fatigue; only the member side of the joint is."
+explain = "A bonded joint can crack on either side of the weld: in the member whose end or edge is welded, or in the wall it is welded onto. The wall is assessed by the published hand formulae where the joint is a hollow-section T-joint inside their range, else read from the model as an indication; for this joint neither was possible (the wall's thickness or the stresses round the joint could not be read)."
+likely_causes = ["The receiving part is a solid with no wall thickness.", "The joint's footprint could not be traced on the receiving part's mesh."]
+actions = ["Check the receiving wall by hand (for tube joints, CIDECT design guide 8 or EN 1993-1-9 Table 8.7), or by a local model with the weld."]
+
+[FATIGUE_RECEIVING_SIDE_INDICATIVE]
+severity = "warning"
+stage = "fatigue"
+what = "Joint {connection}: the wall it sits on ({part}) is assessed from the model's hot-spot stress, an indication only ({why})."
+explain = "The published hand formulae for the wall a tube is welded onto cover square and rectangular hollow-section T-joints inside a range, under axial load and in-plane bending. This joint is not one of those, so the wall's hot-spot stress is read from the bonded model at 0.4 and 1.0 wall thicknesses from the joint's edge. On a reference joint that read-out came out anywhere from 40 % low (coarse meshes) to 30 % high against a solid model and the formulae, so it is an indication, not an assessment."
+likely_causes = ["The joint is not a square-on hollow-section T-joint, or is outside the formulae's range.", "The brace carries out-of-plane bending, for which no formula is published."]
+actions = ["Treat the wall's figure as indicative: use the refined (or Optimise for Accuracy) results, and check by hand or a local model with the weld where it matters."]
+
+[FATIGUE_BOLT_NOT_ASSESSED]
+severity = "info"
+stage = "fatigue"
+what = "{count} bolted joint(s) in the default mode (clamped faces bonded, no bolt in the model) have no bolt force, so their bolts are not assessed for fatigue."
+explain = "In the default bolted mode the clamped faces are bonded and the fastener is left out, so the model carries no bolt force. A bolt is assessed for fatigue only in the preloaded mode, where it is an element of its own and its force is solved in every load case with the preload in place."
+likely_causes = ["The joints are in the default bolted mode."]
+actions = ["Switch the joints whose bolts matter to the preloaded mode (contact and preload), or check the bolts by hand."]

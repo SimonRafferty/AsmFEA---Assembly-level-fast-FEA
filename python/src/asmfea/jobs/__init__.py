@@ -26,7 +26,7 @@ from .. import defaults
 from ..diagnostics import Diagnostic, make
 
 TERMINAL = ("done", "failed", "blocked", "cancelled")
-ALL_STAGES = ["resolve", "mesh", "solve", "post", "report"]
+ALL_STAGES = ["resolve", "mesh", "solve", "post", "fatigue", "report"]
 
 
 def _now() -> str:

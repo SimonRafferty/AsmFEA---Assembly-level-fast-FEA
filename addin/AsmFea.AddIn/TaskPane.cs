@@ -31,6 +31,8 @@ namespace AsmFea.AddIn
         /// <summary>The active view of the document: {toward_viewer, up}, assembly frame; null without a view.</summary>
         JObj CurrentView(IModelDoc2 doc);
         string Export(IModelDoc2 doc, string study, out IList<string> log);
+        /// <summary>A digest of the model's state, worked out without exporting (ResultsState: are the results current).</summary>
+        string ModelSignature(IModelDoc2 doc);
         JObj FaceRefFromSelection(IModelDoc2 doc, IFace2 face, string id);
         int HighlightFaces(IModelDoc2 doc, JObj study, IEnumerable<string> faceIds);
         void SelectComponents(IModelDoc2 doc, IEnumerable<string> partIds);
@@ -46,9 +48,17 @@ namespace AsmFea.AddIn
         /// </summary>
         /// <returns>null when drawn (or removed), else why it could not be drawn.</returns>
         string ShowArrow(IModelDoc2 doc, double[] tipMm, double[] direction, bool markTip);
+        /// <summary>The SolidWorks selection as the analysis names it: part ids, and face refs for faces (D98).</summary>
+        IList<SelItem> SelectionItems(IModelDoc2 doc);
+        /// <summary>The colour view (D98): the faces of ``sides`` (connections.json sides) red, the rigid parts blue, the
+        /// rest see-through, as temporary appearances put back afterwards. null when shown, else why not.</summary>
+        string ShowColours(IModelDoc2 doc, IList<JObj> sides, ICollection<string> rigidParts, bool zoom);
+        void ClearColours();
+        /// <summary>The user selected something in a document (not the add-in's own selections).</summary>
+        event Action<IModelDoc2> UserSelected;
     }
 
-    public class StudyPane : UserControl
+    public partial class StudyPane : UserControl
     {
         private readonly IPaneHost host;
         private readonly Label asmLabel = new Label { AutoSize = true, Padding = new Padding(2, 6, 2, 2) };
@@ -59,20 +69,21 @@ namespace AsmFea.AddIn
         private readonly NumericUpDown bucklingModes = new NumericUpDown { Minimum = 1, Maximum = 20, Value = 5, Width = 60 };
         // the run planner (D60): what to favour, and the Advanced overrides of what it decides
         private readonly ComboBox favour = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
-        private readonly CheckBox advanced = new CheckBox { Text = "Advanced: set the mesh and solver by hand", AutoSize = true };
+        private readonly CheckBox advanced = new CheckBox { Text = "Set the mesh and solver by hand", AutoSize = true };
         private readonly ComboBox fidelity = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };   // mesh level
         private readonly ComboBox convergence = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
         private readonly ComboBox refine = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };   // D65
         private readonly ComboBox solverBox = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };
         private readonly ComboBox connMethod = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 100 };   // D81
         private string floatShownFor;        // the job whose floating-parts dialog was shown (once per run)
+        private string floatShownParts;      // and the parts it named: shown again only when they change (the user, 2026-10-16)
         private readonly List<Control> advancedRows = new List<Control>();
         private static readonly string[] FavourNames = { "Speed", "Balanced", "Accuracy" };
         private static readonly Dictionary<string, string> LegacyFavour = new Dictionary<string, string>
             { { "coarse", "Speed" }, { "standard", "Balanced" }, { "fine", "Accuracy" } };   // studies saved before D60
         private static readonly Dictionary<string, bool> FavourConvergence = new Dictionary<string, bool>
             { { "Speed", false }, { "Balanced", true }, { "Accuracy", true } };             // asmfea.defaults.PLAN_FAVOUR
-        private readonly Label planText = new Label { Dock = DockStyle.Top, AutoSize = false, Height = 64,
+        private readonly Label planText = new Label { Dock = DockStyle.Top, AutoSize = false, Height = 0,
             ForeColor = Color.FromArgb(40, 60, 90), Padding = new Padding(2, 2, 2, 2) };
         private readonly Label accBanner = new Label { Dock = DockStyle.Top, AutoSize = false, Height = 40, Visible = false,
             ForeColor = Color.White, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold), Padding = new Padding(4, 3, 4, 3),
@@ -101,24 +112,32 @@ namespace AsmFea.AddIn
         // Pass/fail criteria given to a study that has none (mirrors asmfea.defaults: PANE_MIN_FOS etc.)
         private const double DefaultMinFos = 1.5, DefaultMinBucklingFactor = 3.0, DefaultDeflectionRatio = 250;
         private readonly ListView connList = MakeList("Connection", "Found by");
-        private TabPage connTab, resTab;
-        private readonly CheckBox exceptionsOnly = new CheckBox { Text = "Show exceptions only", AutoSize = true, Padding = new Padding(0, 3, 0, 0) };
+        // the colour view and two-way selection (D98): the connections selected in the list coloured in SolidWorks;
+        // parts selected in SolidWorks select their connections here, or say they are not connected (Join)
+        private readonly Label notConnected = new Label { Dock = DockStyle.Top, Height = 20, AutoEllipsis = true, Visible = false,
+            ForeColor = Color.Firebrick, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold) };
+        private readonly Timer selTimer = new Timer { Interval = 150 }, colourTimer = new Timer { Interval = 150 };
+        private bool syncingFromSw;          // rows being selected to follow SolidWorks: not sent back to it
+        private bool fromSw;                 // ... and their markers drawn with no zoom, the user's selection kept
+        private TabPage connTab, resTab, runTab;
+        private readonly CheckBox exceptionsOnly = new CheckBox { Text = "Exceptions only", AutoSize = true, Padding = new Padding(0, 3, 0, 0) };
         private readonly TextBox bondTol = new TextBox { Width = 45 };
         private readonly ComboBox solveCase = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 150 };
         private readonly CheckBox fullRun = new CheckBox { Text = "Full re-run", AutoSize = true, Padding = new Padding(8, 3, 0, 0) };
-        private readonly ProgressBar progress = new ProgressBar { Dock = DockStyle.Top, Height = 14 };
+        private readonly ColourBar progress = new ColourBar { Dock = DockStyle.Top, Height = 14 };
         // the same progress, small, beside the Connections tab's More Info: Analyse connections shows it there
-        private readonly ProgressBar connProgress = new ProgressBar { Width = 110, Height = 14, Margin = new Padding(8, 7, 0, 0) };
+        private readonly ColourBar connProgress = new ColourBar { Dock = DockStyle.Top, Height = 14 };   // full width under the buttons, as the Run tab's
         private bool starting;          // an export and job start are under way: further Run clicks wait for it
         // when a hinge was added or deleted: the Connections list is out of date until connections.json is written
         // after it (by Analyse connections or a run). Adding a hinge used to analyse at once, which takes minutes
         // on a large model (the user's choice, 2026-10-09: mark it stale and let them analyse when ready)
         private DateTime? connChangedAt;
-        private readonly Label activity = new Label { Dock = DockStyle.Top, Height = 34, AutoEllipsis = true };
-        private readonly Label connActivity = new Label { Dock = DockStyle.Top, Height = 34, AutoEllipsis = true };   // the same text, on the Connections tab
-        private readonly Label resActivity = new Label { Dock = DockStyle.Top, Height = 34, AutoEllipsis = true };    // and on the Results tab
+        private readonly Label activity = new Label { Dock = DockStyle.Top, Height = 0, AutoEllipsis = true };
+        private readonly Label connActivity = new Label { Dock = DockStyle.Top, Height = 0, AutoEllipsis = true };   // the same text, on the Connections tab
+        private readonly Label resActivity = new Label { Dock = DockStyle.Top, Height = 0, AutoEllipsis = true };    // and on the Results tab
         // shown over fast-run results, so a screenshot of the pane can't be taken for a full result
-        private Button reportBtn, summaryBtn;   // disabled over fast-run results: reports need a full run
+        private Button reportBtn, summaryBtn, dataBtn;
+        private TabPage fatigueTab;                // FatigueTab.cs: its joints shown in the model while it is open   // disabled over fast-run results: reports need a full run
         private readonly Label fastBanner = new Label { Dock = DockStyle.Top, AutoSize = false, Height = 54, Visible = false,
             Text = "APPROXIMATE: fast run. For iterative design only; do a full run before relying on these results or producing a report.",
             BackColor = Color.FromArgb(255, 140, 0), ForeColor = Color.White, Font = new Font("Segoe UI", 8.5f, FontStyle.Bold),
@@ -169,10 +188,14 @@ namespace AsmFea.AddIn
             { "Sliding with friction...", "Separating contact with a friction coefficient: the faces can slide when friction is overcome, and can lift apart. Slower to solve." },
             { "Sliding joint...", "The parts stay together but slide freely (no friction) along one direction you choose." },
             { "Not connected (delete)", "Delete this connection: the parts do not transfer load here. 'Automatic' brings it back." },
+            { "Remove", "Remove this connection (not connected): the parts do not transfer load here. 'Automatic' brings it back." },
             { "Automatic", "Remove your choice and let AsmFEA decide the connection from the geometry and mates." },
             { "More Info", "Explain the selected item in the list below in full: what it means and what to do (or double-click it)." },
             { "Edit...", "Change the selected connection: fixed, sliding with friction, sliding joint, sliding without separation, not connected (delete), or back to automatic." },
+            { "Join", "Join two parts that are not connected: select the two parts (their nearest faces are bonded, if within about an element), a face on one and the other part (that face to the nearest), or a face on each (joined whatever the distance, by a rigid link where they do not meet). Set to changes the join's type." },
+            { "Rigid...", "Treat the parts selected in SolidWorks (or the selected connection's parts) as rigid: not meshed, moving as one rigid body with their weight. Click again on rigid parts to make them flexible. The SolidWorks material is not changed." },
             { "Add hinge...", "A hinge on the faces selected in SolidWorks: one hole or pin surface is enough (AsmFEA finds the concentric faces of the other parts). Tick Lock rotation to bond it." },
+            { "No separation", "Sliding, no separation: the faces stay in contact and slide freely over each other, without friction; they can neither part nor press into each other." },
             { "Sliding, no separation", "The faces stay in contact and slide freely over each other, without friction; they can neither part nor press into each other." },
             { "Export", "Write the model (model.json and one STEP file per part) into the study folder, without running anything." },
             { "Run", "Export, then check, mesh, solve (the load cases chosen in Solve) and report. Progress shows below; the job runs in the background." },
@@ -182,6 +205,7 @@ namespace AsmFea.AddIn
             { "Open folder", "Open the study folder (exported model, run files, results and report) in Explorer." },
             { "Open report", "Open multi-page, detailed report" },
             { "Open summary", "Open half-page summary report" },
+            { "Open data", "Open the data report: model, materials, loads, connections, resultant forces and detailed results" },
             { "Stress", "Open the von Mises stress of the last run in a 3-D window." + ViewerUse },
             { "Displacement", "Open the displacement (deformed shape) of the last run in a 3-D window." + ViewerUse },
             { "FoS", "Open the factor of safety (yield / von Mises) of the last run in a 3-D window." + ViewerUse },
@@ -207,15 +231,17 @@ namespace AsmFea.AddIn
             row.Controls.Add(new Label { Text = "Study", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
             row.Controls.Add(studyBox);
             row.Controls.Add(Btn("New", NewStudy));
-            row.Controls.Add(Btn("Delete", DeleteStudy));
+            row.Controls.Add(Danger(Btn("Delete", DeleteStudy)));
             top.Controls.Add(row);
-            tabs.TabPages.Add(StudyTab());
             tabs.TabPages.Add(LoadsTab());
             tabs.TabPages.Add(ConnectionsTab());
             tabs.TabPages.Add(RunTab());
             tabs.TabPages.Add(ResultsTab());
+            tabs.TabPages.Add(FatigueTab());                    // release 2 (D108, FatigueTab.cs)
+            foreach (var l in new[] { activity, connActivity, resActivity, planText, fatActivity }) Collapsing(l);
             Controls.Add(tabs);
             Controls.Add(top);
+            StyleButtons(this);                                 // once every tab is in place
             Tip(studyBox, "The study shown in the tabs below. An assembly can hold several studies.");
             Tip(bucklingModes, "How many buckling modes to find for each load case that includes buckling.");
             Tip(caseBox, "The load case shown below; new loads are added to it. '(+ buckling)' marks the cases checked for buckling.");
@@ -250,14 +276,16 @@ namespace AsmFea.AddIn
                        + "(default 0.5). Raise it for parts placed with small gaps rather than mated. Click Analyse connections to apply.");
             Tip(problems, "Problems found by the last run. Select one to highlight where it is; double-click it (or press ?) for a full explanation.");
             Tip(logBox, "Progress and results of the running job, and the end of the solver log.");
-            Tip(checksList, "Pass/fail checks against the limits on the Study tab.");
+            Tip(checksList, "Pass/fail checks against the limits on the Run tab (How to solve and pass/fail criteria).");
             Tip(keyFigures, "Key results for each load case.");
             Tip(plotCase, "The load case the plot buttons show.");
             // the Connections and Results tabs read the last run whenever they are shown
             Action showTab = () =>
             {
-                if (tabs.SelectedTab == connTab) LoadConnections();
+                if (tabs.SelectedTab != connTab) { try { host.ClearColours(); } catch { } notConnected.Visible = false; }
+                if (tabs.SelectedTab == connTab) { LoadConnections(); colourTimer.Stop(); colourTimer.Start(); }   // rigid parts blue
                 else if (tabs.SelectedTab == resTab) WithCurrentView(null);
+                else if (tabs.SelectedTab == runTab || tabs.SelectedTab == fatigueTab) ShowResultsState();
                 // a load's arrow belongs to the Loads tab
                 if (tabs.SelectedTab != null && !tabs.SelectedTab.Controls.Contains(loadsList))
                     try { host.ShowArrow(Doc, null, null, false); } catch { }
@@ -265,6 +293,13 @@ namespace AsmFea.AddIn
             studyBox.SelectedIndexChanged += (s, e) => { ShowStudy(); showTab(); };
             tabs.SelectedIndexChanged += (s, e) => showTab();
             poll.Tick += (s, e) => PollJob();
+            // the user's picks in SolidWorks (D98), after a moment: a box selection fires once per item
+            host.UserSelected += d =>
+            {
+                try { if (IsHandleCreated) BeginInvoke(new Action(() => { selTimer.Stop(); selTimer.Start(); })); } catch { }
+            };
+            selTimer.Tick += (s, e) => { selTimer.Stop(); OnSwSelection(); };
+            colourTimer.Tick += (s, e) => { colourTimer.Stop(); UpdateColours(); fromSw = false; };
             watch.Tick += (s, e) => Watch();
             watch.Start();
         }
@@ -302,6 +337,23 @@ namespace AsmFea.AddIn
         }
 
         /// <summary>One line of controls (it wraps when the pane is narrow).</summary>
+        /// <summary>Buttons in ``columns`` columns of equal width across the tab.</summary>
+        private static TableLayoutPanel ButtonGrid(int columns, params Button[] buttons)
+        {
+            var t = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = columns, Padding = new Padding(0, 0, 0, 2) };
+            for (int i = 0; i < columns; i++) t.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f / columns));
+            foreach (var b in buttons)
+            {
+                b.AutoSize = false;
+                b.Dock = DockStyle.Fill;
+                b.Height = 28;
+                b.AutoEllipsis = true;
+                b.Margin = new Padding(2);
+                t.Controls.Add(b);
+            }
+            return t;
+        }
+
         private static FlowLayoutPanel Row(params Control[] items)
         {
             var row = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 1, 0, 1) };
@@ -309,11 +361,107 @@ namespace AsmFea.AddIn
             return row;
         }
 
+        /// <summary>The colour of section headings (the reports' blue).</summary>
+        internal static readonly Color HeadingInk = Color.FromArgb(0x1f, 0x4e, 0x79);
+
         private static Label Caption(string text, bool bold = false)
         {
             var l = new Label { Text = text, AutoSize = true, Padding = new Padding(0, 6, 0, 0) };
-            if (bold) l.Font = new Font(l.Font, FontStyle.Bold);
+            if (bold) { l.Font = new Font(l.Font, FontStyle.Bold); l.ForeColor = HeadingInk; }
             return l;
+        }
+
+        /// <summary>A line as tall as its text, and no height at all while it is empty.</summary>
+        private static void Collapsing(Label l)
+        {
+            Action fit = () => { if (string.IsNullOrEmpty(l.Text)) l.Height = 0; else FitHeight(l); };
+            l.TextChanged += (s, e) => fit();
+            l.Resize += (s, e) => { if (!string.IsNullOrEmpty(l.Text)) FitHeight(l); };
+            fit();
+        }
+
+        internal static readonly Color ButtonEdge = Color.FromArgb(0x1f, 0x6f, 0xd1), ButtonHover = Color.FromArgb(0xdc, 0xe8, 0xf8),
+                                        ButtonDown = Color.FromArgb(0xc4, 0xd8, 0xf2), ButtonOff = Color.FromArgb(0xc8, 0xcc, 0xd2);
+
+        /// <summary>Every button in ``root``: flat, filled blue with white text (the user, 2026-10-17: more prominent;
+        /// blue rather than white with a blue edge); a button tagged "primary" (Run, Analyse connections, Assess
+        /// fatigue) a darker blue in bold; a disabled one grey.</summary>
+        internal static void StyleButtons(Control root)
+        {
+            foreach (Control c in root.Controls)
+            {
+                var b = c as Button;
+                if (b != null) Style(b);
+                StyleButtons(c);
+            }
+        }
+
+        private static void Style(Button b)
+        {
+            bool primary = (b.Tag as string) == "primary", danger = (b.Tag as string) == "danger";
+            b.FlatStyle = FlatStyle.Flat;
+            b.FlatAppearance.BorderSize = 2;
+            b.UseVisualStyleBackColor = false;
+            b.MinimumSize = new Size(0, 28);
+            Color fill = danger ? Color.FromArgb(0x9b, 0x1c, 0x1c) : primary ? Color.FromArgb(0x15, 0x4f, 0x9e) : ButtonEdge;
+            Color hover = danger ? Color.FromArgb(0x7f, 0x14, 0x14) : primary ? Color.FromArgb(0x10, 0x3f, 0x80) : Color.FromArgb(0x18, 0x5a, 0xab);
+            Color down = danger ? Color.FromArgb(0x60, 0x0e, 0x0e) : Color.FromArgb(0x0c, 0x32, 0x66);
+            Action look = () =>
+            {
+                b.BackColor = b.Enabled ? fill : ButtonOff;
+                b.FlatAppearance.BorderColor = b.BackColor;
+                b.ForeColor = Color.White;
+                b.FlatAppearance.MouseOverBackColor = hover;
+                b.FlatAppearance.MouseDownBackColor = down;
+            };
+            b.EnabledChanged += (s, e) => look();
+            look();
+        }
+
+        private static Button Primary(Button b) { b.Tag = "primary"; b.Font = new Font(b.Font, FontStyle.Bold); return b; }
+
+        /// <summary>A button that removes something: dark red.</summary>
+        private static Button Danger(Button b) { b.Tag = "danger"; return b; }
+
+        /// <summary>A section that opens and closes on a click on its title line; closed, the title line carries a short
+        /// summary. Returns its title line; ``refresh`` redraws it (call when what the summary shows changes).</summary>
+        private Control Section(string title, Control body, Func<string> summary, Func<bool> isOpen, Action<bool> setOpen,
+                                string tip, out Action refresh)
+        {
+            var head = new Panel { Dock = DockStyle.Top, Height = 24, Cursor = Cursors.Hand };
+            var name = new Label { Dock = DockStyle.Left, AutoSize = true, Font = new Font(Font, FontStyle.Bold), ForeColor = HeadingInk,
+                                   Padding = new Padding(2, 5, 4, 0), Cursor = Cursors.Hand };
+            var line = new Label { Dock = DockStyle.Fill, AutoEllipsis = true, ForeColor = Color.DimGray, Padding = new Padding(0, 5, 2, 0),
+                                   Cursor = Cursors.Hand };
+            head.Controls.Add(line);
+            head.Controls.Add(name);
+            Action draw = () =>
+            {
+                body.Visible = isOpen();
+                name.Text = (isOpen() ? "\u25BE " : "\u25B8 ") + title;
+                line.Text = isOpen() ? "" : summary();
+            };
+            EventHandler toggle = (s, e) => { setOpen(!isOpen()); draw(); };
+            foreach (Control c in new Control[] { head, name, line }) { c.Click += toggle; tips.SetToolTip(c, tip); }
+            draw();
+            refresh = draw;
+            return head;
+        }
+
+        /// <summary>A section heading on a line of its own, for a tab laid out with Stack.</summary>
+        private static Label Heading(string text)
+        {
+            var l = Caption(text, true);
+            l.AutoSize = false;
+            l.Dock = DockStyle.Top;
+            l.Height = 24;
+            return l;
+        }
+
+        /// <summary>A short grey explanation under a heading.</summary>
+        private static Label Note(string text)
+        {
+            return new Label { Text = text, AutoSize = true, ForeColor = Color.DimGray, Padding = new Padding(0, 0, 0, 2) };
         }
 
         private static ListView MakeList(params string[] cols)
@@ -362,8 +510,34 @@ namespace AsmFea.AddIn
         }
 
         /// <summary>The watchdog: refresh when the document shown has closed, or another one is active.</summary>
+        private bool runStale;               // the study changed since its last finished run: the Run bar is red
+
+        /// <summary>The Run bar on opening the tab: green when the stored results are those of the study and model as
+        /// they are now, red when either changed since, or there are none (the user, 2026-10-16). Not while a job runs.</summary>
+        private void ShowResultsState()
+        {
+            if (Doc == null || StudyName == null || Study == null || starting || (jobId != null && poll.Enabled)) return;
+            try
+            {
+                string why;
+                bool current = ResultsState.Current(host.StudyFolder(Doc, StudyName), Study, host.ModelSignature(Doc), out why);
+                runStale = !current;
+                progress.Style = ProgressBarStyle.Continuous;    // the Run bar only: the others have their own state
+                progress.Value = current ? 100 : 0;
+                progress.NeedsRun = runStale;
+                Tip(progress, current ? "The results stored are those of the study and model as they are now."
+                                      : "Run needed: " + why + ".");
+            }
+            catch (Exception e) { Trace("results state: " + e.Message); }
+        }
+
         private void Watch()
         {
+            // the bars red when out of date (the user, 2026-10-16): not while a job runs
+            bool running = jobId != null && poll.Enabled;
+            connProgress.NeedsRun = !running && connChangedAt != null;
+            progress.NeedsRun = !running && runStale;
+            try { ShowFatigueState(running || starting); } catch (Exception e) { Trace("fatigue state: " + e.Message); }
             try
             {
                 // a closed mark expires when the document is open and visible well after its close (opened again
@@ -476,6 +650,9 @@ namespace AsmFea.AddIn
         /// </summary>
         public string Screenshot(string tab, string path, int width = 400, int height = 640)
         {
+            // the tabs' names before D119: the Study tab's settings are on the Run tab, "Loads and fixtures" is "Loads"
+            if (string.Equals(tab, "Study", StringComparison.OrdinalIgnoreCase)) tab = "Run";
+            if (string.Equals(tab, "Loads and fixtures", StringComparison.OrdinalIgnoreCase)) tab = "Loads";
             var page = tabs.TabPages.Cast<TabPage>().FirstOrDefault(t => string.Equals(t.Text, tab, StringComparison.OrdinalIgnoreCase));
             if (page == null) throw new ArgumentException("no tab " + tab);
             if (tabs.SelectedTab != page) tabs.SelectedTab = page;
@@ -557,6 +734,9 @@ namespace AsmFea.AddIn
                 asmLabel.Text = "";
                 progress.Style = ProgressBarStyle.Continuous;
                 progress.Value = 0;
+                runStale = false;                                 // the next document's own state is worked out on the Run tab
+                fatChangedAt = null;
+                ClearFatigue();
                 Say("");
             }
             finally { showing = false; }
@@ -594,6 +774,7 @@ namespace AsmFea.AddIn
                 foreach (var c in Cases(st)) solveCase.Items.Add(c);
                 int at = chosen == null ? -1 : solveCase.Items.IndexOf(chosen);
                 solveCase.SelectedIndex = at >= 0 ? at : 0;
+                ShowFatigue(st);
             }
             finally { showing = false; }
         }
@@ -677,6 +858,7 @@ namespace AsmFea.AddIn
         /// <summary>Stored in the study (no Apply); the list and drop-downs are not rebuilt, so typing is not disturbed.</summary>
         private void Stored()
         {
+            runStale = true;
             host.MarkChanged(Doc);
             Say("Stored in the study. Save the assembly to keep it.");
         }
@@ -833,6 +1015,7 @@ namespace AsmFea.AddIn
 
         private void Changed()
         {
+            runStale = true;
             host.MarkChanged(Doc);
             ShowStudy();
             Say("Changed. Save the assembly to keep the study in it.");
@@ -913,9 +1096,28 @@ namespace AsmFea.AddIn
             Cli.RunAsync(this, "plan " + Cli.Quote(host.StudyFolder(Doc, StudyName)) + args, (r, err) =>
             {
                 if (err != null) { planText.Text = ""; return; }
-                planText.Text = FormatPlan((JObj)r);
-                FitHeight(planText);
+                planText.Text = ShortPlan((JObj)r);
+                tips.SetToolTip(planText, FormatPlan((JObj)r));
             });
+        }
+
+        /// <summary>The plan in a line (D120: the Run tab had more explanation than anyone reads); FormatPlan in full
+        /// is its tool tip.</summary>
+        private static string ShortPlan(JObj p)
+        {
+            string what = "Plan: " + (string)p["fidelity"] + " mesh" + (Convert.ToBoolean(p["convergence_check"]) ? ", checked on a finer one" : "");
+            if (p["dof"] != null)
+            {
+                what += ", " + ((string)p["solver"] == "hybrid" ? "hybrid solver" : "CalculiX");
+                if (p["estimate_s"] != null) what += ", about " + Math.Max(1, (int)Math.Round(Convert.ToDouble(p["estimate_s"]) / 60)) + " min";
+            }
+            string acc = (string)p["expected_accuracy"];
+            if (!string.IsNullOrEmpty(acc))
+            {
+                int cut = acc.IndexOf(" (", StringComparison.Ordinal);
+                what += ". " + (cut > 0 ? acc.Substring(0, cut) : acc).TrimEnd('.');
+            }
+            return what + ".";
         }
 
         private static string FormatPlan(JObj p)
@@ -967,27 +1169,21 @@ namespace AsmFea.AddIn
 
         // ------------------------------------------------------------------ Study tab
 
-        private TabPage StudyTab()
+        /// <summary>How to solve and the pass/fail criteria (the Study tab's until D119): a section of the Run tab.</summary>
+        private void StudySettings(out TableLayoutPanel advancedTable, out TableLayoutPanel criteriaTable)
         {
-            var p = new TabPage("Study") { AutoScroll = true };
-            var t = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top, Padding = new Padding(4) };
+            var tAdv = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top, Padding = new Padding(12, 0, 4, 4) };
+            var tCrit = new TableLayoutPanel { ColumnCount = 2, AutoSize = true, Dock = DockStyle.Top, Padding = new Padding(12, 0, 4, 4) };
+            var t = tAdv;
             Action<string, Control> add = (label, c) =>
             {
                 t.Controls.Add(new Label { Text = label, AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
                 t.Controls.Add(c);
             };
-            bool first = true;
             Action<string> heading = text =>
             {
-                if (!first)
-                {
-                    // a dividing line between the groups, across both columns
-                    var line = new Label { BorderStyle = BorderStyle.Fixed3D, Height = 2, Dock = DockStyle.Fill, Margin = new Padding(0, 10, 0, 0) };
-                    t.Controls.Add(line);
-                    t.SetColumnSpan(line, 2);
-                }
-                first = false;
-                var h = new Label { Text = text, AutoSize = true, Font = new Font(Font, FontStyle.Bold), Padding = new Padding(0, 6, 0, 2) };
+                var h = new Label { Text = text, AutoSize = true, Font = new Font(Font, FontStyle.Bold), ForeColor = HeadingInk,
+                                    Padding = new Padding(0, 8, 0, 2) };
                 t.Controls.Add(h);
                 t.SetColumnSpan(h, 2);
             };
@@ -1006,7 +1202,6 @@ namespace AsmFea.AddIn
                 advancedRows.Add(c);
             };
             // by function: how the run is solved (the planner, D60), how the results are judged
-            heading("How to solve");
             add("Optimise for", favour);
             add("", advanced);
             addAdvanced("Mesh level", fidelity);
@@ -1015,11 +1210,10 @@ namespace AsmFea.AddIn
             addAdvanced("Solver", solverBox);
             addAdvanced("Connections", connMethod);
             add("", fastLoads);
-            heading("Pass / fail criteria (used in the reports)");
+            t = tCrit;
             add("Max deflection, mm", maxDefl);
             add("Min factor of safety (yield)", minFos);
             add("Min buckling factor", minBuck);
-            p.Controls.Add(t);
 
             // every change is stored at once (no Apply)
             bucklingModes.ValueChanged += (s, e) => { if (!showing && Study != null) { Settings(Study)["buckling_modes"] = (int)bucklingModes.Value; Stored(); } };
@@ -1038,6 +1232,9 @@ namespace AsmFea.AddIn
                     if ((string)refine.SelectedItem != "Auto") m["refine_unconverged"] = (string)refine.SelectedItem == "On";
                     if ((string)solverBox.SelectedItem != "Auto") m["solver"] = ((string)solverBox.SelectedItem).ToLowerInvariant();
                 }
+                // stored only when it changed: a control's events fire as it is first drawn (the Run tab opened marked
+                // the results out of date and the document changed, found 2026-10-17, D124)
+                if (Json.Write(m) == Json.Write(old)) return;
                 Settings(Study)["mesh"] = m;
                 Stored();
                 RefreshPlan();
@@ -1053,14 +1250,17 @@ namespace AsmFea.AddIn
             {
                 if (showing || Study == null) return;
                 string m = (string)connMethod.SelectedItem;
-                if (m == null || m == "Auto") Settings(Study).Remove("connection_method");
-                else Settings(Study)["connection_method"] = m == "Classic" ? "classic" : "bond_first";
+                string want = m == null || m == "Auto" ? null : m == "Classic" ? "classic" : "bond_first";
+                if (want == (string)Settings(Study)["connection_method"]) return;      // unchanged (D124)
+                if (want == null) Settings(Study).Remove("connection_method");
+                else Settings(Study)["connection_method"] = want;
                 Stored();
                 Say("Connection method stored: click Analyse connections to apply it.");
             };
             fastLoads.CheckedChanged += (s, e) =>
             {
                 if (showing || Study == null) return;
+                if (fastLoads.Checked == (Settings(Study)["load_superposition"] is bool b && b)) return;   // unchanged (D124)
                 if (fastLoads.Checked) Settings(Study)["load_superposition"] = true; else Settings(Study).Remove("load_superposition");
                 Stored();
             };
@@ -1076,6 +1276,7 @@ namespace AsmFea.AddIn
                     var v = Num(tb.Text);
                     bool blank = tb.Text.Trim().Length == 0;
                     tb.BackColor = blank || v > 0 ? SystemColors.Window : Color.MistyRose;   // not a positive number: not stored
+                    if (blank ? !lim.Has(key) : v > 0 && lim[key] != null && Convert.ToDouble(lim[key]) == v.Value) return;   // unchanged (D124)
                     if (blank) lim.Remove(key);
                     else if (v > 0) lim[key] = v.Value;
                     else return;
@@ -1087,7 +1288,25 @@ namespace AsmFea.AddIn
                 };
             }
             recheckTimer.Tick += (s, e) => { recheckTimer.Stop(); Recheck(); };
-            return p;
+            advancedTable = tAdv;
+            criteriaTable = tCrit;
+        }
+
+        private static bool advOpen, critOpen;   // the Run tab's sections shown open (kept while SolidWorks runs)
+
+        private string AdvancedSummary()
+        {
+            return "Optimise for " + ((string)favour.SelectedItem ?? "Balanced") + (advanced.Checked ? ", set by hand" : "")
+                   + (fastLoads.Checked ? ", fast load changes" : "");
+        }
+
+        private string CriteriaSummary()
+        {
+            var lim = new List<string>();
+            if (maxDefl.Text.Trim().Length > 0) lim.Add("deflection " + maxDefl.Text.Trim() + " mm");
+            if (minFos.Text.Trim().Length > 0) lim.Add("FoS " + minFos.Text.Trim());
+            if (minBuck.Enabled && minBuck.Text.Trim().Length > 0) lim.Add("buckling " + minBuck.Text.Trim());
+            return lim.Count > 0 ? string.Join(", ", lim) : "none";
         }
 
         private readonly Timer recheckTimer = new Timer { Interval = 1200 };
@@ -1114,10 +1333,10 @@ namespace AsmFea.AddIn
 
         private TabPage LoadsTab()
         {
-            var p = new TabPage("Loads and fixtures");
+            var p = new TabPage("Loads");
             // the load case, the buttons that manage cases, then the case's buckling, then what is added to it
             var caseRow = Row(Caption("Load case"), caseBox);
-            var caseButtons = Row(Btn("New load case", NewCase), Btn("Rename", RenameCase), Btn("Delete load case", DeleteCase));
+            var caseButtons = Row(Btn("New load case", NewCase), Btn("Rename", RenameCase), Danger(Btn("Delete load case", DeleteCase)));
             bucklingModes.Width = 45;
             var buck = Row(caseBuckling, bucklingModes, Caption("modes"));
             buck.WrapContents = false;                                  // "[x] Include buckling in load case [5] modes" kept together
@@ -1130,23 +1349,16 @@ namespace AsmFea.AddIn
                 ShowLoads(Study);
             };
             caseBuckling.CheckedChanged += (s, e) => CaseBucklingChanged();
-            var bar = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true };
-            var add = new Label { Text = "From the selected faces, add:", AutoSize = true, Padding = new Padding(0, 4, 0, 0) };
-            bar.Controls.Add(add);
-            bar.SetFlowBreak(add, true);                                // the buttons on the line below
-            bar.Controls.Add(Btn("Fixed", () => AddFixture("fixed")));
-            bar.Controls.Add(Btn("Pinned", () => AddFixture("pinned")));
-            bar.Controls.Add(Btn("Force", () => AddLoad("force")));
-            bar.Controls.Add(Btn("Pressure", () => AddLoad("pressure")));
-            bar.Controls.Add(Btn("Gravity", () => AddLoad("gravity")));
-            bar.Controls.Add(Btn("Hydrostatic", () => AddLoad("hydrostatic")));
-            var delete = Btn("Delete", DeleteLoad);
-            delete.Margin = new Padding(18, delete.Margin.Top, delete.Margin.Right, delete.Margin.Bottom);   // a gap: harder to hit by accident
-            bar.Controls.Add(delete);
+            // added to the faces selected in SolidWorks: equal buttons in three columns (D120); Delete on a row of its own,
+            // apart from them, so it is harder to hit by accident
+            var bar = ButtonGrid(3, Btn("Fixed", () => AddFixture("fixed")), Btn("Pinned", () => AddFixture("pinned")),
+                                 Btn("Force", () => AddLoad("force")), Btn("Pressure", () => AddLoad("pressure")),
+                                 Btn("Gravity", () => AddLoad("gravity")), Btn("Hydrostatic", () => AddLoad("hydrostatic")));
+            var deleteRow = Row(Danger(Btn("Delete", DeleteLoad)));
             loadsList.SelectedIndexChanged += (s, e) => HighlightSelected();
             loadsList.DoubleClick += (s, e) => EditSelected();
             p.Controls.Add(loadsActivity);                              // docked at the bottom
-            Stack(p, caseRow, caseButtons, Rule(), buck, Rule(), bar, loadsList);
+            Stack(p, caseRow, caseButtons, Rule(), buck, Rule(), Heading("Add to the selected faces"), bar, deleteRow, loadsList);
             return p;
         }
 
@@ -1470,33 +1682,70 @@ namespace AsmFea.AddIn
             // 1: analyse, with the bond tolerance it uses (the same as Check only on the Run tab: export, then resolve)
             // the tolerance and its units kept together: beside the button, or on the next line as a whole
             var bond = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
-            bond.Controls.AddRange(new Control[] { Caption("Bond gaps & overlaps up to"), bondTol, Caption("mm") });
-            var analyse = Row(Btn("Analyse connections", AnalyseConnections), bond);
-            // 2: the selected connection set to (stored in the study, used from the next run); Add hinge, a special
-            // kind of setting made from selected faces, in its own frame at the end
-            var edit = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 1, 0, 1) };
-            edit.Controls.Add(Caption("Set to:"));
-            edit.Controls.Add(Btn("Fixed", () => SetConnection("tie", null, null)));
-            edit.Controls.Add(Btn("Sliding with friction...", SetContact));
-            var lineEnd = Btn("Sliding joint...", SetSliding);
-            edit.Controls.Add(lineEnd);
-            edit.SetFlowBreak(lineEnd, true);                           // the Set-to buttons on two lines
-            edit.Controls.Add(Btn("Sliding, no separation", () => SetConnection("slide", null, null)));
-            edit.Controls.Add(Btn("Not connected (delete)", () => SetConnection("none", null, null)));
-            edit.Controls.Add(Btn("Automatic", ClearConnection));
-            var hingeFrame = new Panel { BorderStyle = BorderStyle.FixedSingle, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Padding = new Padding(2), Margin = new Padding(8, 1, 3, 1) };
-            var hinge = Btn("Add hinge...", AddHinge);
-            hinge.Margin = new Padding(0);
-            hingeFrame.Controls.Add(hinge);
-            edit.Controls.Add(hingeFrame);
-            // 3: the list, its filter and its More Info
-            var listBar = Row(exceptionsOnly, Btn("Edit...", EditConnection), Btn("More Info", ExplainConnection), connProgress);
+            bond.Controls.AddRange(new Control[] { Caption("Bond gaps and overlaps up to"), bondTol, Caption("mm") });
+            var analyse = Row(Primary(Btn("Analyse connections", AnalyseConnections)), bond);
+            // the selected connection set to: two columns of equal buttons (D120)
+            var setTo = ButtonGrid(3, Btn("Fixed", () => SetConnection("tie", null, null)), Btn("Sliding with friction...", SetContact),
+                                   Btn("Sliding joint...", SetSliding), Btn("No separation", () => SetConnection("slide", null, null)),
+                                   Btn("Automatic", ClearConnection), Danger(Btn("Remove", () => SetConnection("none", null, null))));
+            // made from the SolidWorks selection: a hinge on faces, a join of two parts, rigid parts (D96, D97)
+            var fromSel = ButtonGrid(3, Btn("Add hinge...", AddHinge), Btn("Join", AddJoin), Btn("Rigid...", ToggleRigid));
+            // how far the view zooms to a selected connection (the user, 2026-10-17): 0 off, else to the faces and out
+            // (level - 1) steps; remembered for the user
+            var zoom = new TrackBar { Minimum = 0, Maximum = ColourView.ZoomMax, TickStyle = TickStyle.None, AutoSize = false, Width = 128, Height = 26,
+                                      Margin = new Padding(0, 4, 0, 0), Value = ColourView.ZoomLevel };
+            Action zoomTip = () => tips.SetToolTip(zoom, "How close the view zooms when a connection is selected: "
+                + (zoom.Value == 0 ? "the whole model, fitted to the window." : zoom.Value == ColourView.ZoomMax ? "right on the connection's faces."
+                   : "between the whole model and the connection.") + "\nLeft: the whole model; right: closer to the connection.");
+            zoom.ValueChanged += (s, e) => { ColourView.ZoomLevel = zoom.Value; zoomTip(); };
+            zoomTip();
+            var zoomLabel = Caption("Auto zoom");
+            zoomLabel.Margin = new Padding(2, 0, 0, 0);
+            tips.SetToolTip(zoomLabel, "Auto zoom when a connection is selected: the slider sets how far out the view goes.");
+            // the list's buttons on the left; Auto zoom and its slider held at the right of the same line (a flowing row
+            // put the slider on a line of its own)
+            var listButtons = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Padding = new Padding(0, 1, 0, 1) };
+            listButtons.Controls.AddRange(new Control[] { exceptionsOnly, Btn("Edit...", EditConnection), Btn("More Info", ExplainConnection) });
+            var zoomBox = new FlowLayoutPanel { Dock = DockStyle.Right, Width = 200, WrapContents = false, Padding = new Padding(0, 1, 0, 1) };
+            zoom.Width = 120;
+            zoomBox.Controls.AddRange(new Control[] { zoomLabel, zoom });
+            var listBar = new Panel { Dock = DockStyle.Top, Height = 36 };
+            listBar.Controls.Add(listButtons);
+            listBar.Controls.Add(zoomBox);
+            // beside the buttons when the pane is wide enough, on a line of its own below them when not
+            listBar.Resize += (s, e) =>
+            {
+                int need = listButtons.Controls.Cast<Control>().Sum(c => c.Width + c.Margin.Horizontal) + zoomBox.Width + 8;
+                bool fits = listBar.Width >= need;
+                zoomBox.Dock = fits ? DockStyle.Right : DockStyle.Bottom;
+                zoomBox.Height = 34;
+                listButtons.Dock = fits ? DockStyle.Fill : DockStyle.Top;
+                listButtons.Height = 34;
+                listBar.Height = fits ? 36 : 70;
+            };
             exceptionsOnly.CheckedChanged += (s, e) => LoadConnections();
             connList.DoubleClick += (s, e) => ExplainConnection();
+            connList.MultiSelect = true;                     // several connections coloured at once (D98)
+            // selected rows stay white on blue when SolidWorks has the focus (the system drew them pale grey, hard to see)
+            connList.OwnerDraw = true;
+            connList.DrawColumnHeader += (s, e) => e.DrawDefault = true;
+            connList.DrawItem += (s, e) => { };
+            connList.DrawSubItem += (s, e) =>
+            {
+                bool sel = e.Item.Selected;
+                using (var back = new SolidBrush(sel ? SystemColors.Highlight : connList.BackColor))
+                    e.Graphics.FillRectangle(back, e.Bounds);
+                var r = new Rectangle(e.Bounds.X + 3, e.Bounds.Y, Math.Max(0, e.Bounds.Width - 4), e.Bounds.Height);
+                TextRenderer.DrawText(e.Graphics, e.SubItem.Text, connList.Font, r, sel ? SystemColors.HighlightText : e.Item.ForeColor,
+                                      TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+            };
             connList.SelectedIndexChanged += (s, e) =>
             {
-                var row = SelectedConnection();
-                if (row != null) host.SelectComponents(Doc, row.Parts);
+                colourTimer.Stop();
+                colourTimer.Start();                         // once the selection settles
+                if (syncingFromSw) return;                   // following SolidWorks: not sent back to it
+                notConnected.Visible = false;
+                var parts = SelectedConnections().SelectMany(r => r.Parts).Distinct().ToList();
             };
             // the bond tolerance: faces within it (a gap or an overlap) count as touching
             bondTol.TextChanged += (s, e) =>
@@ -1511,7 +1760,8 @@ namespace AsmFea.AddIn
                 Stored();
                 Say("Bond tolerance stored: click Analyse connections to apply it.");
             };
-            Stack(p, analyse, Rule(), edit, Rule(), listBar, connActivity, connList);
+            Stack(p, analyse, connProgress, connActivity, Rule(), Heading("Set the selected connections to"), setTo,
+                  Heading("From the SolidWorks selection"), fromSel, Rule(), listBar, notConnected, connList);
             return p;
         }
 
@@ -1523,6 +1773,7 @@ namespace AsmFea.AddIn
             public JObj Connection;        // the connections.json record, for a found interface
             public JObj Diagnostic;        // the exception, in Exceptions only
             public bool Excluded;          // a part the user left out of the analysis (the floating-parts dialog)
+            public bool Rigid;             // a part the user set rigid (D96)
         }
 
         private void ExplainConnection()
@@ -1562,6 +1813,11 @@ namespace AsmFea.AddIn
         private ConnRow SelectedConnection()
         {
             return connList.SelectedItems.Count == 0 ? null : connList.SelectedItems[0].Tag as ConnRow;
+        }
+
+        private List<ConnRow> SelectedConnections()
+        {
+            return connList.SelectedItems.Cast<ListViewItem>().Select(i => i.Tag as ConnRow).Where(r => r != null).ToList();
         }
 
         /// <summary>A part's name as the feature tree shows it: the body of a weldment, the part of a sub-assembly.</summary>
@@ -1611,7 +1867,7 @@ namespace AsmFea.AddIn
                 case "geometry": return (string)c["geometry"] == "line" ? "edge contact" : "touching faces";
                 case "sub-assembly": return "rigid sub-assembly";
                 case "override": return "your choice";
-                case "user": return "your hinge";
+                case "user": return c["join"] != null ? "your join" : "your hinge";
                 case "mates": return "mates";
                 case "weld": return "weld bead";
                 case "mate": return "mate";
@@ -1699,22 +1955,51 @@ namespace AsmFea.AddIn
             bool stale = connChangedAt != null && File.GetLastWriteTime(path) < connChangedAt.Value;
             if (!stale) connChangedAt = null;
             if (!stale && st != null) RemoveLeftOutHinges(st, doc);
+            if (!stale && st != null) RemoveRefusedJoins(st, doc);
             var hingeIds = new HashSet<string>(st == null ? new string[0]
                 : StudyStore.List(st, "hinges").OfType<JObj>().Select(o => (string)o["id"]));
             if (stale)
             {
-                connList.Items.Add(new ListViewItem(new[] { "Out of date: hinges changed since the last analysis. Click Analyse connections to update.", "" })
+                connList.Items.Add(new ListViewItem(new[] { "Out of date: hinges, joins or rigid parts changed since the last analysis. Click Analyse connections to update.", "" })
                 { ForeColor = Color.Firebrick });
                 var analysed = new HashSet<string>(((doc["connections"] as List<object>) ?? new List<object>()).OfType<JObj>()
                                                    .Where(c => c["hinge"] != null).Select(c => (string)c["hinge"]));
                 foreach (var hid in hingeIds.Where(h => !analysed.Contains(h)))
                     connList.Items.Add(new ListViewItem(new[] { "Hinge " + hid + ": not yet analysed", "your hinge (next analysis)" }));
             }
+            // joins not yet analysed (whatever else is out of date): listed, and with their faces known (picked in SolidWorks)
+            // selectable, so the colour view marks them before the analysis (the user, 2026-10-16)
+            if (st != null)
+            {
+                var seen = new HashSet<string>(((doc["joins_seen"] as List<object>) ?? new List<object>()).OfType<string>());
+                foreach (var c0 in ((doc["connections"] as List<object>) ?? new List<object>()).OfType<JObj>())
+                    if (c0["join"] != null) seen.Add((string)c0["join"]);
+                var refs = StudyStore.List(st, "face_refs").OfType<JObj>().ToDictionary(o => (string)o["id"], o => o);
+                foreach (JObj jn in StudyStore.List(st, "joins").OfType<JObj>())
+                {
+                    if (seen.Contains((string)jn["id"])) continue;
+                    var jparts = ((jn["parts"] as List<object>) ?? new List<object>()).OfType<string>().ToList();
+                    var sides = new List<object>();
+                    foreach (var fid in ((jn["faces"] as List<object>) ?? new List<object>()).OfType<string>())
+                    {
+                        JObj fr;
+                        if (refs.TryGetValue(fid, out fr) && fr["fingerprint"] is JObj)
+                            sides.Add(new JObj { { "part", (string)fr["part"] }, { "fingerprint", fr["fingerprint"] } });
+                    }
+                    if (sides.Count == 1) sides.Add(sides[0]);       // a patch is drawn per pair of sides (one face: itself)
+                    var conn = sides.Count == 0 ? null : new JObj { { "id", "J-" + (string)jn["id"] }, { "parts", jparts.Cast<object>().ToList() },
+                                                                    { "type", "tie" }, { "sides", sides }, { "join", jn["id"] } };
+                    connList.Items.Add(new ListViewItem(new[] { "Join " + (string)jn["id"] + ": " + PartsLabel(jparts) + ", not yet analysed",
+                                                                "your join (next analysis)" })
+                    { Tag = new ConnRow { Parts = jparts, Interface = "J-" + (string)jn["id"], Connection = conn } });
+                }
+            }
             foreach (JObj c in ((doc["connections"] as List<object>) ?? new List<object>()).OfType<JObj>())
             {
                 var row = new ConnRow { Parts = ((c["parts"] as List<object>) ?? new List<object>()).Cast<string>().ToList(), Interface = (string)c["id"], Connection = c };
                 string type = ShortType((string)c["type"], c["friction"], c["params"] as JObj);
                 if (c["locked"] is bool && (bool)c["locked"]) type += " (rotation locked)";
+                if (c["link"] is bool && (bool)c["link"] && (string)c["type"] == "tie") type = "Fixed (rigid link)";
                 if (c["hinge"] != null && !hingeIds.Contains((string)c["hinge"]))
                 {
                     // a hinge of the user's since deleted (or replaced): gone at the next analysis
@@ -1746,6 +2031,11 @@ namespace AsmFea.AddIn
                 foreach (var pid in ((Settings(st)["excluded_parts"] as List<object>) ?? new List<object>()).Cast<string>())
                     connList.Items.Add(new ListViewItem(new[] { "Left out of the analysis: " + pid, "your choice (Edit... to put back)" })
                     { Tag = new ConnRow { Parts = new List<string> { pid }, Excluded = true }, ForeColor = Color.DimGray });
+            // parts the user set rigid (D96): Edit... makes one flexible again
+            if (st != null)
+                foreach (var pid in RigidParts(st))
+                    connList.Items.Add(new ListViewItem(new[] { "Rigid (not meshed): " + pid, "your choice (Edit... to make flexible)" })
+                    { Tag = new ConnRow { Parts = new List<string> { pid }, Rigid = true }, ForeColor = Color.RoyalBlue });
             Fit(connList);
         }
 
@@ -1774,7 +2064,22 @@ namespace AsmFea.AddIn
             var st = Study;
             var row = SelectedConnection();
             if (st == null || row == null) { Say("Select a connection first.", true); return; }
+            if (connList.SelectedItems.Count > 1) { Say("Select one connection to set (several are selected).", true); return; }
             if (row.Parts.Count != 2) { Say("That problem does not concern one pair of parts; select a connection between two parts.", true); return; }
+            string jid = type == "none" && row.Connection != null ? row.Connection["join"] as string : null;
+            if (jid != null && StudyStore.List(st, "joins").OfType<JObj>().Any(o => (string)o["id"] == jid))
+            {
+                // a join the user added: Not connected deletes it, with any override stored for it
+                StudyStore.List(st, "joins").RemoveAll(o => o is JObj && (string)((JObj)o)["id"] == jid);
+                StudyStore.List(st, "overrides").RemoveAll(o => o is JObj && (string)((JObj)o)["interface"] == "J-" + jid);
+                StudyStore.Prune(st);
+                Changed();
+                connChangedAt = DateTime.Now;
+                Say("Join " + jid + " deleted: analysing the connections.");
+                if (!starting && !(jobId != null && poll.Enabled)) AnalyseConnections();
+                else LoadConnections();
+                return;
+            }
             if (row.Connection != null && (string)row.Connection["source"] == "weld")
             { Say("That connection is a weld bead: edit or suppress the weld bead in SolidWorks.", true); return; }
             string kind = row.Connection == null ? null : (string)row.Connection["type"];
@@ -1862,6 +2167,11 @@ namespace AsmFea.AddIn
         {
             var row = SelectedConnection();
             if (row == null) { Say("Select a connection first.", true); return; }
+            if (row.Rigid)
+            {
+                SetRigid(new List<string> { row.Parts[0] }, false);
+                return;
+            }
             if (row.Excluded)
             {
                 if (MessageBox.Show(this, "Put " + row.Parts[0] + " back into the analysis?", "AsmFEA", MessageBoxButtons.YesNo,
@@ -1884,6 +2194,212 @@ namespace AsmFea.AddIn
             else if (pick == options[3]) SetConnection("slide", null, null);
             else if (pick == options[4]) SetConnection("none", null, null);
             else ClearConnection();
+        }
+
+        // ------------------------------------------------------------------ rigid parts, joins, the colour view (D96-D98)
+
+        private static List<string> RigidParts(JObj st)
+        {
+            return ((Settings(st)["rigid_parts"] as List<object>) ?? new List<object>()).OfType<string>().ToList();
+        }
+
+        /// <summary>The model's part ids (the last export's model.json), to name what a selected component holds.</summary>
+        private List<string> ModelPartIds()
+        {
+            try
+            {
+                string path = Path.Combine(host.StudyFolder(Doc, StudyName), "model.json");
+                if (!File.Exists(path)) return new List<string>();
+                var m = (JObj)Json.Parse(File.ReadAllText(path, Encoding.UTF8));
+                return ((m["parts"] as List<object>) ?? new List<object>()).OfType<JObj>().Select(x => (string)x["id"]).ToList();
+            }
+            catch { return new List<string>(); }
+        }
+
+        /// <summary>The model parts a selection names: a face's part, a body, every part in a selected component.</summary>
+        private List<string> PartsOfSelection(IList<SelItem> sel)
+        {
+            var model = ModelPartIds();
+            var out_ = new List<string>();
+            foreach (var it in sel)
+            {
+                if (it.FaceRef != null) { out_.Add(it.PartId); continue; }      // a face names its own part
+                var inside = model.Where(p => ConnMatch.Covers(it.PartId, p)).ToList();
+                if (inside.Count > 0) out_.AddRange(inside); else out_.Add(it.PartId);
+            }
+            return out_.Distinct().ToList();
+        }
+
+        /// <summary>Rigid... : the parts selected in SolidWorks (or the selected connections' parts) made rigid, or
+        /// flexible again when they all are rigid already.</summary>
+        private void ToggleRigid()
+        {
+            var st = Study;
+            if (st == null) { Say("Create a study first (New).", true); return; }
+            var parts = Doc == null ? new List<string>() : PartsOfSelection(host.SelectionItems(Doc));
+            if (parts.Count == 0) parts = SelectedConnections().SelectMany(r => r.Parts).Distinct().ToList();
+            if (parts.Count == 0)
+            {
+                MessageBox.Show(this, "Select the parts to make rigid in SolidWorks (or a connection of theirs here), then click Rigid... again.",
+                                "AsmFEA", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            var rigid = new HashSet<string>(RigidParts(st));
+            // no confirmation (the user, 2026-10-16): the list shows the rigid rows, and the status line says what changed
+            SetRigid(parts, !parts.All(rigid.Contains));
+        }
+
+        private void SetRigid(List<string> parts, bool rigid)
+        {
+            var st = Study;
+            var now = RigidParts(st);
+            var next = rigid ? now.Union(parts).ToList() : now.Where(p => !parts.Contains(p)).ToList();
+            if (next.Count == 0) Settings(st).Remove("rigid_parts");
+            else Settings(st)["rigid_parts"] = next.Cast<object>().ToList();
+            Trace("rigid: " + (rigid ? "made rigid " : "made flexible ") + string.Join(", ", parts));
+            Changed();
+            connChangedAt = DateTime.Now;
+            LoadConnections();
+            colourTimer.Stop();
+            colourTimer.Start();                             // blue on, or off again
+            Say((rigid ? "Set rigid: " : "Flexible again: ") + string.Join(", ", parts.Select(ShortName))
+                + ". Click Analyse connections (or Run) to use it; save the assembly to keep it.");
+        }
+
+        /// <summary>
+        /// Join: two parts the analysis left unconnected, from the SolidWorks selection: the two parts (their nearest faces,
+        /// within about an element), a face on one and the other part (that face to the nearest), or a face on each (joined
+        /// whatever the distance). Stored in the study; analysed at once, as a hinge is.
+        /// </summary>
+        private void AddJoin()
+        {
+            var st = Study;
+            if (st == null) { Say("Create a study first (New).", true); return; }
+            if (Busy()) return;
+            var sel = Doc == null ? new List<SelItem>() : host.SelectionItems(Doc);
+            // a component holding several parts (a multi-body part) names none: its body or a face must be chosen
+            var model = ModelPartIds();
+            var named = new List<SelItem>();
+            foreach (var it in sel)
+            {
+                if (it.FaceRef != null || model.Count == 0 || model.Contains(it.PartId)) { named.Add(it); continue; }
+                var inside = model.Where(p => ConnMatch.Covers(it.PartId, p)).ToList();
+                if (inside.Count == 1) { named.Add(new SelItem(inside[0])); continue; }
+                Say(ShortName(it.PartId) + " holds " + inside.Count + " bodies: select the body, or a face on it, to join.", true);
+                return;
+            }
+            var faceIds = new Dictionary<string, string>();
+            foreach (var it in named.Where(x => x.FaceRef != null))
+            {
+                if (faceIds.ContainsKey(it.PartId)) continue;
+                var fr = (JObj)Json.Parse(Json.Write(it.FaceRef));
+                var same = StudyStore.List(st, "face_refs").OfType<JObj>()
+                           .FirstOrDefault(o => (string)o["persistent_ref"] == (string)fr["persistent_ref"]);
+                if (same != null) { faceIds[it.PartId] = (string)same["id"]; continue; }
+                fr["id"] = StudyStore.NextId(st, "face_refs", "L");
+                StudyStore.List(st, "face_refs").Add(fr);
+                faceIds[it.PartId] = (string)fr["id"];
+            }
+            string problem;
+            var j = ConnMatch.JoinFrom(named, StudyStore.NextId(st, "joins", "JN"), faceIds, out problem);
+            if (j == null)
+            {
+                StudyStore.Prune(st);
+                MessageBox.Show(this, "Join: " + problem + ".\n\nTwo parts: their nearest faces are bonded (within about an element). "
+                                + "A face on one part and the other part: that face to the nearest face of the other. A face on each: "
+                                + "joined whatever the distance (a rigid link where they do not meet).", "AsmFEA",
+                                MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            StudyStore.List(st, "joins").Add(j);
+            Trace("join: " + Json.Write(j).Trim());
+            Changed();
+            connChangedAt = DateTime.Now;
+            notConnected.Visible = false;
+            // not analysed at once (the user, 2026-10-16: several joins in a row waited for each analysis): the list is
+            // marked out of date until Analyse connections or a run
+            LoadConnections();
+            Say("Join " + (string)j["id"] + " added between " + PartsLabel(((List<object>)j["parts"]).Cast<string>())
+                + ". Add any others, then click Analyse connections.");
+        }
+
+        /// <summary>Joins too far apart to bond (connections.json "refused_joins") are deleted from the study, saying why.</summary>
+        private void RemoveRefusedJoins(JObj st, JObj doc)
+        {
+            var said = new List<string>();
+            foreach (JObj r in ((doc["refused_joins"] as List<object>) ?? new List<object>()).OfType<JObj>())
+            {
+                string jid = r["join"] as string;
+                if (jid == null) continue;
+                if (StudyStore.List(st, "joins").RemoveAll(o => o is JObj && (string)((JObj)o)["id"] == jid) == 0) continue;
+                said.Add(jid + " (" + PartsLabel(((r["parts"] as List<object>) ?? new List<object>()).Cast<string>()) + ": "
+                         + Fmt(r["gap"]) + " mm apart, more than " + Fmt(r["limit"]) + " mm)");
+            }
+            if (said.Count == 0) return;
+            StudyStore.Prune(st);
+            host.MarkChanged(Doc);
+            MessageBox.Show(this, "Not joined: " + string.Join("; ", said) + ".\n\nTheir nearest faces are too far apart to bond. "
+                            + "Select a face on each part and press Join to link them however far apart they are.", "AsmFEA",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        /// <summary>Two-way selection (D98): what the user picked in SolidWorks selects its connections in the list, or
+        /// says the parts are not connected (with the Join button to join them).</summary>
+        private void OnSwSelection()
+        {
+            if (tabs.SelectedTab != connTab || Doc == null || exceptionsOnly.Checked) return;
+            IList<SelItem> sel;
+            try { sel = host.SelectionItems(Doc); }
+            catch (Exception e) { Trace("selection: " + e.Message); return; }
+            var parts = ConnMatch.Parts(sel);
+            if (sel.Count == 0) { notConnected.Visible = false; return; }
+            var rows = connList.Items.Cast<ListViewItem>().Where(i => (i.Tag as ConnRow)?.Connection != null).ToList();
+            var hits = ConnMatch.Match(rows.Select(i => ((ConnRow)i.Tag).Connection).ToList(), sel);
+            syncingFromSw = true;
+            fromSw = true;
+            try
+            {
+                connList.SelectedItems.Clear();
+                foreach (int k in hits) rows[k].Selected = true;
+                if (hits.Count > 0)
+                {
+                    try { connList.TopItem = rows[hits[0]]; } catch { }    // the first one at the top of the list
+                    rows[hits[0]].EnsureVisible();
+                }
+            }
+            finally { syncingFromSw = false; }
+            bool pair = parts.Count == 2 || sel.Any(x => x.FaceRef != null) && parts.Count >= 1;
+            if (hits.Count == 0 && pair && parts.Count == 2)
+            {
+                // a join of these parts waiting for the next analysis: say so, not "not connected" (found live, 2026-10-16)
+                var st = Study;
+                var waiting = st == null ? null : StudyStore.List(st, "joins").OfType<JObj>().LastOrDefault(j =>
+                    new HashSet<string>(((j["parts"] as List<object>) ?? new List<object>()).OfType<string>()).SetEquals(parts));
+                notConnected.Text = waiting != null
+                    ? "Join " + (string)waiting["id"] + " added for " + PartsLabel(parts) + ": click Analyse connections to make it."
+                    : "Not connected: " + PartsLabel(parts) + ". Press Join to join them.";
+                notConnected.Visible = true;
+            }
+            else notConnected.Visible = false;
+        }
+
+        /// <summary>The colour view of the connections selected in the list (D98); cleared with none selected.</summary>
+        private void UpdateColours()
+        {
+            if (Doc == null) return;
+            var rows = SelectedConnections().Where(r => r.Connection != null).ToList();
+            var st = Study;
+            var rigid = st == null ? new List<string>() : RigidParts(st);
+            // on the Connections tab the rigid parts are always blue (the user, 2026-10-16); the selected connections marked
+            if (tabs.SelectedTab != connTab || (rows.Count == 0 && rigid.Count == 0))
+            {
+                host.ClearColours();
+                return;
+            }
+            var sides = rows.SelectMany(r => ((r.Connection["sides"] as List<object>) ?? new List<object>()).OfType<JObj>())
+                            .Where(sd => sd["fingerprint"] is JObj).ToList();
+            string why = host.ShowColours(Doc, sides, rigid, !fromSw);
+            if (why != null) Say("Colour view: " + why + ".", true);
         }
 
         /// <summary>
@@ -2034,13 +2550,11 @@ namespace AsmFea.AddIn
 
         private TabPage RunTab()
         {
-            var p = new TabPage("Run");
+            var p = runTab = new TabPage("Run");
             // what to solve and the run buttons; the model files; progress; the problems, their More Info and the log
             var which = Row(Caption("Solve"), solveCase, fullRun);
-            var runs = Row(Btn("Run", () => Run(null)), Btn("Fast run", () => Run(null, true)), Btn("Check only", () => Run("resolve")),
+            var runs = Row(Primary(Btn("Run", () => Run(null))), Btn("Fast run", () => Run(null, true)), Btn("Check only", () => Run("resolve")),
                            Btn("Cancel", CancelJob));
-            var files = Row(Caption("Model files:"), Btn("Export", () => Export()),
-                            Btn("Open folder", () => { if (Doc != null && StudyName != null) OpenPath(host.StudyFolder(Doc, StudyName)); }));
             var probBar = Row(Caption("Problems", true), showWarnings,
                               Btn("More Info", () => { if (problems.SelectedItems.Count > 0) ShowHelp((JObj)problems.SelectedItems[0].Tag); else Say("Select a problem first.", true); }));
             problems.DoubleClick += (s, e) => { if (problems.SelectedItems.Count > 0) ShowHelp((JObj)problems.SelectedItems[0].Tag); };
@@ -2051,9 +2565,18 @@ namespace AsmFea.AddIn
             var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 120 };
             split.Panel1.Controls.Add(problems);
             split.Panel2.Controls.Add(logBox);
-            Stack(p, which, runs, planText, Rule(), files, Rule(), progress, activity, probBar, split);
-            p.Enter += (s, e) => RefreshPlan();
-            planText.Resize += (s, e) => FitHeight(planText);           // free memory changes: the plan is refreshed when the tab is shown
+            TableLayoutPanel advTable, critTable;
+            StudySettings(out advTable, out critTable);
+            Action advRefresh, critRefresh;
+            var advHead = Section("Advanced", advTable, AdvancedSummary, () => advOpen, v => advOpen = v,
+                                  "Click to open or close: what to optimise the run for, and the mesh and solver set by hand.", out advRefresh);
+            var critHead = Section("Pass/fail criteria", critTable, CriteriaSummary, () => critOpen, v => critOpen = v,
+                                   "Click to open or close: the limits the checks and reports compare the results with.", out critRefresh);
+            favour.SelectedIndexChanged += (s, e) => advRefresh();
+            foreach (var ch in new[] { advanced, fastLoads }) ch.CheckedChanged += (s, e) => advRefresh();
+            foreach (var tb in new[] { maxDefl, minFos, minBuck }) tb.TextChanged += (s, e) => critRefresh();
+            Stack(p, which, runs, progress, activity, planText, Rule(), advHead, advTable, critHead, critTable, Rule(), probBar, split);
+            p.Enter += (s, e) => RefreshPlan();                          // free memory changes: the plan is refreshed when the tab is shown
             return p;
         }
 
@@ -2116,15 +2639,33 @@ namespace AsmFea.AddIn
         }
 
         /// <summary>Export the model and start a job; false when it did not start.</summary>
-        private bool Run(string stages, bool fast = false)
+        /// <summary>Start a job. ``fatigueOnly``: the fatigue stage on the last results, with only study.json's
+        /// fatigue settings written and no export (D115): saving the assembly changes the faces' persistent references,
+        /// and a fresh export then made the static results look out of date.</summary>
+        private bool Run(string stages, bool fast = false, bool fatigueOnly = false)
         {
             if (Busy()) return false;
             starting = true;
             try
             {
-                Trace("run: exporting for " + (stages ?? "a full run"));
-                if (!Export()) { starting = false; return false; }
                 string folder = host.StudyFolder(Doc, StudyName);
+                jobKind = fatigueOnly ? "fatigue" : stages == "resolve" ? "connections" : "run";
+                string studyFile = Path.Combine(folder, "study.json");
+                if (fatigueOnly && File.Exists(studyFile) && File.Exists(Path.Combine(folder, "model.json")))
+                {
+                    Trace("run: fatigue settings written, no export");
+                    File.WriteAllText(studyFile, FatigueSettings.WithFatigue(File.ReadAllText(studyFile),
+                                                                              FatigueSettings.Get(Settings(Study), false)),
+                                      new UTF8Encoding(false));
+                }
+                else
+                {
+                    Trace("run: exporting for " + (stages ?? "a full run"));
+                    if (!Export()) { starting = false; return false; }
+                }
+                JObj inputs = null;                              // what this job solves, for the Run bar later (ResultsState)
+                try { inputs = ResultsState.Inputs(Study, host.ModelSignature(Doc)); }
+                catch (Exception e) { Trace("run: model signature failed: " + e.Message); }
                 problems.Items.Clear();
                 // Run solves the load case chosen in "Solve" (all by default)
                 string cases = stages == null && solveCase.SelectedIndex > 0 ? " --cases " + Cli.Quote((string)solveCase.SelectedItem) : "";
@@ -2138,6 +2679,13 @@ namespace AsmFea.AddIn
                     if (err != null) { Say(err, true); Trace("run: job not started: " + err); return; }
                     jobId = (string)((JObj)r)["job_id"];
                     jobFile = Path.Combine(folder, "run", jobId, "job.json");
+                    if (inputs != null)
+                        try
+                        {
+                            Directory.CreateDirectory(Path.GetDirectoryName(jobFile));
+                            File.WriteAllText(Path.Combine(folder, "run", jobId, ResultsState.InputsFile), Json.Write(inputs), new UTF8Encoding(false));
+                        }
+                        catch (Exception e) { Trace("run: inputs not recorded: " + e.Message); }
                     jobDoc = DocPath();
                     Trace("run: job " + jobId + " started");
                     Say("Job " + jobId + " started.");
@@ -2155,10 +2703,19 @@ namespace AsmFea.AddIn
             }
         }
 
-        /// <summary>The job's progress on both bars: the Run tab's and the small one on the Connections tab.</summary>
+        private string jobKind = "run";           // the running job: "run" (a solve), "connections" (resolve only), "fatigue"
+
+        /// <summary>The job's progress on the bars it belongs to (the user, 2026-10-17: all three moved for every job):
+        /// a solve on the Run tab's, a connection analysis (or Check only) on the Run and Connections tabs', a fatigue
+        /// assessment on the Fatigue tab's. A full run with fatigue on ends with the fatigue stage, so it moves that
+        /// bar too.</summary>
         private void SetProgress(ProgressBarStyle style, int value)
         {
-            foreach (var bar in new[] { progress, connProgress })
+            var bars = jobKind == "fatigue" ? new[] { fatProgress }
+                     : jobKind == "connections" ? new[] { progress, connProgress }
+                     : FatigueSettings.Get(Settings(Study ?? new JObj()), false) != null ? new[] { progress, fatProgress }
+                     : new[] { progress };
+            foreach (var bar in bars)
             {
                 bar.Style = style;
                 if (style == ProgressBarStyle.Continuous) bar.Value = Math.Max(0, Math.Min(100, value));
@@ -2209,6 +2766,7 @@ namespace AsmFea.AddIn
             // per run in a box that does not stop anything
             var mp = job["memory_pressure"] as JObj;
             bool pressed = mp != null && mp["active"] is bool && (bool)mp["active"];
+            fatActivity.Text = state == "running" ? (string)job["activity"] : "";      // the Fatigue tab's own line (D113)
             Say(state + ": " + (string)job["activity"] + "  (" + Fmt(job["elapsed_s"]) + " s)"
                 + (pressed && state == "running" ? "  - slowed: other programs need memory" : ""), state == "failed" || state == "blocked");
             if (pressed && state == "running" && pressureShownFor != jobId)
@@ -2238,14 +2796,21 @@ namespace AsmFea.AddIn
                 afterJob = null;
                 replotting = false;
                 if (state == "done") RefreshResults(next);
+                var ran = ((job["stages"] as List<object>) ?? new List<object>()).OfType<string>().ToList();
+                if (state == "done" && ran.Contains("fatigue")) fatChangedAt = null;   // assessed with the settings as they are
+                if (state == "done" && ran.Contains("solve")) runStale = false;
+                // connections analysed again without a solve: the last results may not match them (the user, 2026-10-16)
+                else if (state == "done" && ran.Contains("resolve")) runStale = true;
                 LoadConnections();                               // a run (or Check only) rewrites connections.json
                 // a run that could not finish: what to change, in plain words, once per run
                 // floating parts: the gap each needs, a tolerance to apply or parts to leave out (D81), once per run
                 var floating = diags.Where(x => FloatingCodes.Contains((string)x["code"]) && Gaps(x).Count > 0).ToList();
-                bool floatDialog = floating.Count > 0 && floatShownFor != jobId;
+                string floatKey = StudyName + "|" + string.Join(",", floating.SelectMany(x => Gaps(x).Keys).Distinct().OrderBy(k => k));
+                bool floatDialog = floating.Count > 0 && floatShownFor != jobId && floatShownParts != floatKey;
                 if (floatDialog)
                 {
                     floatShownFor = jobId;
+                    floatShownParts = floatKey;
                     ShowFloatingDialog(floating);
                 }
                 if ((state == "blocked" || state == "failed") && fixShownFor != jobId)
@@ -2296,7 +2861,7 @@ namespace AsmFea.AddIn
             {
                 Dock = DockStyle.Top, Height = 54, Padding = new Padding(8),
                 Text = "These parts are not within the bond tolerance of anything joined to a fixture. Raise the tolerance to the gap " +
-                       "shown to bond them, or tick parts to leave them out of the analysis (they stay in SolidWorks)."
+                       "shown and Apply it to bond them, or tick parts and click Leave out parts (they stay in SolidWorks). Then Re-analyse."
             };
             var list = new ListView { Dock = DockStyle.Fill, View = System.Windows.Forms.View.Details, CheckBoxes = true, FullRowSelect = true, HideSelection = false };
             list.Columns.Add("Leave out / part", 280);
@@ -2323,35 +2888,55 @@ namespace AsmFea.AddIn
                 host.SelectComponents(Doc, new[] { (string)list.SelectedItems[0].Tag });
                 host.ZoomToSelection(Doc);
             };
-            var apply = new Button { Text = "Apply and analyse again", AutoSize = true };
+            // the tolerance and its Apply together; leaving parts out and analysing again are their own buttons (the user,
+            // 2026-10-16): what is ticked is stored at once, so it is not lost when the box closes
+            var apply = new Button { Text = "Apply", AutoSize = true };
+            var leave = new Button { Text = "Leave out parts", AutoSize = true };
+            var again = new Button { Text = "Re-analyse", AutoSize = true };
             var close = new Button { Text = "Close", AutoSize = true };
+            var excluded = new HashSet<string>(((Study == null ? null : Settings(Study)["excluded_parts"] as List<object>) ?? new List<object>()).OfType<string>());
+            foreach (ListViewItem i in list.Items)
+                if (excluded.Contains((string)i.Tag)) i.Checked = true;
             apply.Click += (s, e) =>
             {
                 var st = Study;
-                if (st == null) { f.Close(); return; }
+                if (st == null) return;
                 var v = Num(tol.Text);
                 if (v == null || v < 0) { tol.BackColor = Color.MistyRose; return; }
+                tol.BackColor = SystemColors.Window;
                 Settings(st)["bond_tolerance"] = v.Value;
-                var ex = (Settings(st)["excluded_parts"] as List<object>) ?? new List<object>();
-                foreach (ListViewItem i in list.Items)
-                    if (i.Checked && !ex.Contains((string)i.Tag)) ex.Add((string)i.Tag);
-                if (ex.Count > 0) Settings(st)["excluded_parts"] = ex;
                 showing = true;
                 try { bondTol.Text = Fmt(v.Value); } finally { showing = false; }
                 Stored();
-                f.Close();
-                AnalyseConnections();
+                Say("Bond tolerance " + Fmt(v.Value) + " mm stored: click Re-analyse to use it.");
             };
+            leave.Click += (s, e) =>
+            {
+                var st = Study;
+                if (st == null) return;
+                var ticked = list.Items.Cast<ListViewItem>().Where(i => i.Checked).Select(i => (string)i.Tag).ToList();
+                var ex = ((Settings(st)["excluded_parts"] as List<object>) ?? new List<object>()).OfType<string>()
+                         .Where(p => !gaps.ContainsKey(p)).Concat(ticked).Distinct().Cast<object>().ToList();
+                if (ex.Count > 0) Settings(st)["excluded_parts"] = ex; else Settings(st).Remove("excluded_parts");
+                Stored();
+                LoadConnections();
+                Say(ticked.Count + " part(s) left out of the analysis: click Re-analyse to use it.");
+            };
+            again.Click += (s, e) => { f.Close(); AnalyseConnections(); };
             close.Click += (s, e) => f.Close();
-            var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 40, Padding = new Padding(6) };
-            bar.Controls.Add(new Label { Text = "Bond tolerance, mm", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
-            bar.Controls.Add(tol);
-            bar.Controls.Add(apply);
+            var bar = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 48, Padding = new Padding(6) };
+            var tolFrame = new FlowLayoutPanel { AutoSize = true, BorderStyle = BorderStyle.FixedSingle, WrapContents = false, Margin = new Padding(0, 0, 10, 0) };
+            tolFrame.Controls.Add(new Label { Text = "Bond tolerance, mm", AutoSize = true, Padding = new Padding(0, 6, 0, 0) });
+            tolFrame.Controls.Add(tol);
+            tolFrame.Controls.Add(apply);
+            bar.Controls.Add(tolFrame);
+            bar.Controls.Add(leave);
+            bar.Controls.Add(again);
             bar.Controls.Add(close);
             f.Controls.Add(list);
             f.Controls.Add(intro);
             f.Controls.Add(bar);
-            f.AcceptButton = apply;
+            f.AcceptButton = again;
             f.Show();
         }
 
@@ -2467,9 +3052,10 @@ namespace AsmFea.AddIn
             var plots = Row(Caption("Plots:"), Btn("Stress", () => ShowPlot("vonmises")),
                             Btn("Displacement", () => ShowPlot("displacement")), Btn("FoS", () => ShowPlot("fos")));
             var other = Row(Btn("Open in PrePoMax", OpenPrePoMax));
-            reportBtn = Btn("Open report", () => OpenReport(false));
-            summaryBtn = Btn("Open summary", () => OpenReport(true));
-            var reports = Row(Caption("Reports:"), reportBtn, summaryBtn);
+            reportBtn = Btn("Open report", () => OpenReport(""));
+            summaryBtn = Btn("Open summary", () => OpenReport(" --summary"));
+            dataBtn = Btn("Open data", () => OpenReport(" --data"));
+            var reports = Row(Caption("Reports:"), reportBtn, summaryBtn, dataBtn);
             var split = new SplitContainer { Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, SplitterDistance = 160 };
             split.Panel1.Controls.Add(checksList);
             split.Panel2.Controls.Add(keyFigures);
@@ -2495,6 +3081,7 @@ namespace AsmFea.AddIn
         private void RefreshResults(Action then = null)
         {
             if (Doc == null || StudyName == null) return;
+            RefreshFatigue();                                    // the Fatigue tab's key figures (D108)
             Cli.RunAsync(this, "summary " + Cli.Quote(host.StudyFolder(Doc, StudyName)), (r, err) =>
             {
                 checksList.Items.Clear();
@@ -2515,12 +3102,12 @@ namespace AsmFea.AddIn
                     accBanner.Visible = true;
                 }
                 else accBanner.Visible = false;
-                foreach (var b in new[] { reportBtn, summaryBtn })
+                foreach (var b in new[] { reportBtn, summaryBtn, dataBtn })
                 {
                     if (b == null) continue;
                     b.Enabled = !fastResults;
                     tips.SetToolTip(b, fastResults ? "Reports are written from full runs only: click Run (not Fast run) first."
-                                                   : (b == reportBtn ? ButtonTips["Open report"] : ButtonTips["Open summary"]));
+                                                   : (b == reportBtn ? ButtonTips["Open report"] : b == dataBtn ? ButtonTips["Open data"] : ButtonTips["Open summary"]));
                 }
                 foreach (JObj c in ((res["checks"] as List<object>) ?? new List<object>()).OfType<JObj>())
                 {
@@ -2655,7 +3242,10 @@ namespace AsmFea.AddIn
             string lc = plotCase.SelectedItem as string;
             if (lc == null) { Say("No results yet: run the study first.", true); return; }
             // the 3-D data is written with the plots; results from before it existed are redrawn once
-            if (!File.Exists(Path.Combine(folder, "results", lc.Replace(" ", "_") + "_fields.vtp")))
+            // a fast run's results are in results_fast (the viewer opens the newer of the two): either will do (found live:
+            // "No 3-D result data" straight after a fast run, 2026-10-16)
+            string vtp = lc.Replace(" ", "_") + "_fields.vtp";
+            if (!File.Exists(Path.Combine(folder, "results", vtp)) && !File.Exists(Path.Combine(folder, "results_fast", vtp)))
             {
                 var v = host.CurrentView(Doc);
                 if (redrawn || v == null) { Say("No 3-D result data for " + lc + ": run the study again.", true); return; }
@@ -2735,16 +3325,17 @@ namespace AsmFea.AddIn
             }
         }
 
-        /// <summary>The full report, or the half-page summary for risk assessments.</summary>
-        private void OpenReport(bool summary)
+        /// <summary>The full report; with " --summary" the half-page summary for risk assessments, with " --data"
+        /// the data report (the appendices, D114).</summary>
+        private void OpenReport(string which)
         {
-            WithCurrentView(() => OpenReportNow(summary));       // its plots follow the view on screen
+            WithCurrentView(() => OpenReportNow(which));         // its plots follow the view on screen
         }
 
-        private void OpenReportNow(bool summary)
+        private void OpenReportNow(string which)
         {
             if (Doc == null || StudyName == null) return;
-            Cli.RunAsync(this, "report " + Cli.Quote(host.StudyFolder(Doc, StudyName)) + (summary ? " --summary" : ""), (r, err) =>
+            Cli.RunAsync(this, "report " + Cli.Quote(host.StudyFolder(Doc, StudyName)) + which, (r, err) =>
             {
                 if (err != null) { MessageBox.Show(this, "The report could not be opened:\n" + err, "AsmFEA"); return; }
                 var path = r as string ?? (string)((r as JObj)?["path"] ?? (r as JObj)?["report"]);

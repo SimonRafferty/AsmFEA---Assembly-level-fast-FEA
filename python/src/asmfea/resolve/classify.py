@@ -681,6 +681,13 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
             for b in j["parts"]:
                 if a < b:
                     clamped[(a, b)] = j["id"]
+    # the user's joins (D97): an interface on the same two faces gives way to the join
+    from .joins import check_join_types, fixed_edges_as_links, joins_from_study
+    joined, jdiags, _ = joins_from_study(model, geoms, face_map or {}, removed)
+    diags += jdiags
+    taken = {c.pop("takes_over") for c in joined}
+    for pair in list(by_pair):
+        by_pair[pair] = [i for i in by_pair[pair] if i["id"] not in taken]
     # hinges from concentric mates on cylinders; those mates then no longer decide the touching faces' type
     chosen, hdiags = hinges_from_selection(model, geoms, face_map or {}, removed)
     diags += hdiags
@@ -747,8 +754,9 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
             conns.append(c)
 
     conns += pins
+    conns += joined
     # Joints from mates where nothing touches (e.g. a pin with clearance) stay unresolved.
-    touching = set(by_pair) | {_pair(*p["parts"]) for p in pins}
+    touching = set(by_pair) | {_pair(*p["parts"]) for p in pins} | {_pair(*c["parts"]) for c in joined}
     for pair, ms in mates.items():
         joint, why = joint_from_mates(ms)
         if joint in ("revolute", "sliding", "tie") and pair not in touching and not set(pair) & set(removed):
@@ -783,6 +791,8 @@ def classify(model: Model, geoms, interfaces: list[dict], lines: list[dict],
     diags += couplings_from_mates(model, geoms, face_map or {}, conns, removed)
     _apply_overrides(model, [c for c in conns if c["type"] in COUPLINGS], diags)
     _preloaded_bolts(conns)
+    fixed_edges_as_links(conns)
+    check_join_types(conns, diags)
     _hide_incidental_lines(conns, diags)
     return conns, sorted(removed), diags
 

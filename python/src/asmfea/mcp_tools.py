@@ -55,7 +55,7 @@ class StatusIn(_In):
 
 
 class RunIn(StudyIn):
-    stages: Optional[list[Literal["resolve", "mesh", "solve", "post", "report"]]] = Field(
+    stages: Optional[list[Literal["resolve", "mesh", "solve", "post", "fatigue", "report"]]] = Field(
         None, description=f"Stages to run, in order; default all: {ALL_STAGES}")
     wait_s: float = Field(200.0, ge=0, le=MAX_WAIT_S, description="Seconds to wait for the job before returning")
     force: bool = Field(False, description="Redo every stage, ignoring every cache. By default a stage whose inputs "
@@ -86,10 +86,19 @@ class ImageIn(StudyIn):
                                        "'<case>_displacement_front', '<case>_buckling_mode1_iso'")
 
 
+class FatigueIn(StudyIn):
+    wait_s: float = Field(200.0, ge=0, le=MAX_WAIT_S, description="Seconds to wait for the job before returning")
+    force: bool = Field(False, description="Redo the fatigue stage even if its inputs are unchanged")
+
+
 class ReportIn(StudyIn):
     pdf: bool = Field(False, description="Also convert to PDF (Word or LibreOffice on this machine)")
     summary: bool = Field(False, description="The half-page summary for risk assessments (project details, a stress "
                                              "plot, max stress / displacement, min factor of safety) instead of the full report")
+    data: bool = Field(False, description="The data report (model, materials, connections, resultant forces, detailed "
+                                          "results) instead of the full report")
+    fatigue: bool = Field(False, description="The fatigue document of the same kind (report, summary or data), from "
+                                             "results/fatigue.json")
 
 
 class ReplotIn(StudyIn):
@@ -268,8 +277,19 @@ def register(server: Any, prefix: str = "asmfea_", sw_session: Optional[api.SwSe
         """Path to the Word report (written from results.json if missing or older), optionally
         with a PDF."""
         try:
-            r = api.report(params.study, params.pdf, params.summary)
+            r = api.report(params.study, params.pdf, params.summary, params.data, params.fatigue)
             return _j({"ok": True, **r.model_dump(), "lines": [f"RESULT: OK  report {r.path}"]})
+        except Exception as e:
+            return _err(e)
+
+    @tool("fatigue", "Assess fatigue on the last results", False)
+    def fatigue(params: FatigueIn) -> str:
+        """Start the fatigue stage only (study.fatigue in study.json; no new solve, D105), then wait up to wait_s.
+        Writes results/fatigue.json, the damage plot and the fatigue report, summary and data report; the figures come back as
+        RESULT and VERIFY lines, and in asmfea_summary's "fatigue"."""
+        try:
+            r = api.fatigue(params.study, params.force)
+            return _j(_job_payload(api.job(params.study, r.job_id, min(params.wait_s, MAX_WAIT_S))))
         except Exception as e:
             return _err(e)
 

@@ -110,7 +110,7 @@ def write_frd(path: Path, deck: Deck, U: np.ndarray, S: np.ndarray, nsteps: int)
 
 
 def write_dat(path: Path, deck: Deck, RF: np.ndarray, nsteps: int, info: dict | None = None,
-              pin_reaction: list | None = None) -> None:
+              pin_reaction: list | None = None, U: np.ndarray | None = None) -> None:
     """The printed forces as CalculiX writes them. With pins (``info`` "hybrid"), the supports' total is the
     force at the fixed nodes plus each pin's reaction as the solve found it (on its held motions): a pin's face
     nodes move with it rather than being fixed, and force reaches it through rings joined to it by penalty too,
@@ -125,8 +125,14 @@ def write_dat(path: Path, deck: Deck, RF: np.ndarray, nsteps: int, info: dict | 
     pj = set(info.get("pin_joint_sets", [])) if pins else set()
     for k, step in enumerate(deck.steps):
         out += ["", f"                        S T E P{k + 1:8d}", "", "", "                                INCREMENT     1", ""]
-        for nset, totals in step.prints:
+        for nset, totals, *what in step.prints:
             nodes = deck.node_ids(nset)
+            if what and what[0] == "U" and not totals and U is not None:
+                # displacements (the rigid groups' reference and rotation nodes, D96)
+                out += [f" displacements (vx,vy,vz) for set {nset.upper()} and time  0.1000000E+01", ""]
+                out += [f" {int(n):9d} " + " ".join(f"{x:13.6E}" for x in U[int(n), :, k]) for n in nodes]
+                out.append("")
+                continue
             if totals and nset.upper() in {x.upper() for x in pj}:
                 tot = np.zeros(3)                         # in the pins' reactions (FIXALL)
             elif totals and pins and nset.upper() == "FIXALL":
@@ -166,7 +172,7 @@ def run(workdir: Path, job: str = "study", settings: Settings | None = None, log
     t1 = time.perf_counter()
     S = nodal_stresses(deck, parts, U, nsteps)
     write_frd(workdir / f"{job}.frd", deck, U, S, nsteps)
-    write_dat(workdir / f"{job}.dat", deck, RF, nsteps, info, timings.get("pin_reaction"))
+    write_dat(workdir / f"{job}.dat", deck, RF, nsteps, info, timings.get("pin_reaction"), U)
     timings["output_s"] = time.perf_counter() - t1
     timings["read_s"] = timings.get("setup_s", 0.0)
     timings["wall_s"] = time.perf_counter() - t0

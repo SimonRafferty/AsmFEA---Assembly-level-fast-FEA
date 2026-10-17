@@ -57,6 +57,9 @@ class FaceInfo:
     axis_point: Optional[list[float]] = None  # cylinders / cones: a point on the axis
     convex: Optional[bool] = None             # cylinders: True = pin/shaft, False = hole
     axial_range: Optional[list[float]] = None  # cylinders: [t0, t1] along axis from axis_point
+    span: Optional[float] = None              # cylinders: the angle the face spans round its axis, radians
+    major_radius: Optional[float] = None      # tori (a shaft's shoulder fillet): axis, axis_point (the centre),
+    minor_radius: Optional[float] = None      # the two radii, and convex (False: a concave fillet)
     bbox: list[float] = field(default_factory=list)
     samples: list[list[float]] = field(default_factory=list)  # points on the face boundary
     shape: Any = field(default=None, repr=False)  # TopoDS_Face, session-local, not serialised
@@ -75,11 +78,12 @@ class PartGeometry:
     bbox: list[float]           # assembly frame (xmin, ymin, zmin, xmax, ymax, zmax)
     solid: Any = field(default=None, repr=False)   # TopoDS_Solid in the assembly frame
     body_step: str = ""         # single-body STEP (part frame), relative to the study folder
+    sharp_edges: list = field(default_factory=list)   # sharp re-entrant edges, assembly frame (F1)
 
     def to_json(self) -> dict:
         return {"part": self.part, "step": self.step, "solid_index": self.solid_index,
                 "body_step": self.body_step, "volume": self.volume, "bbox": self.bbox,
-                "faces": [f.to_json() for f in self.faces]}
+                "faces": [f.to_json() for f in self.faces], "sharp_edges": self.sharp_edges}
 
 
 def body_step_path(study: Path, geometry_hash: str, solid_index: int) -> Path:
@@ -337,13 +341,75 @@ def face_info(face, index: int) -> FaceInfo:
         info.convex = bool(np.dot(radial, n) > 0)
         if stype == "cylinder":
             info.radius = ad.Cylinder().Radius()
+            info.span = float(min(ad.LastUParameter() - ad.FirstUParameter(), 2 * np.pi))
         ts = [float(np.dot(np.asarray(s) - c, a)) for s in info.samples]
         info.axial_range = [min(ts), max(ts)] if ts else None
+    elif stype == "torus":
+        tor = ad.Torus()
+        a = np.array(_xyz(tor.Axis().Direction()))
+        c = np.array(_xyz(tor.Axis().Location()))
+        info.axis, info.axis_point = a.tolist(), c.tolist()
+        info.major_radius, info.minor_radius = float(tor.MajorRadius()), float(tor.MinorRadius())
+        p, n = _point_normal(face, ad, um, vm)
+        radial = (p - c) - np.dot(p - c, a) * a
+        q = c + radial / max(np.linalg.norm(radial), 1e-30) * info.major_radius   # the tube's centre line there
+        info.convex = bool(np.dot(p - q, n) > 0)     # outward normal pointing away from the tube's centre: convex
     return info
 
 
 def part_faces(solid) -> list[FaceInfo]:
     return [face_info(f, i) for i, f in enumerate(subshapes(solid, TopAbs_FACE))]
+
+
+SHARP_EDGE_ANGLE_DEG = 10.0   # faces meeting at an edge with normals closer than this are tangent (a fillet's edge)
+
+
+def sharp_edges(solid, size: float) -> list[dict]:
+    """A solid's sharp re-entrant edges (F1, PLAN-FATIGUE.md): concave edges with no fillet, where a notch peak has
+    no finite value (fatigue refuses them, FATIGUE_SHARP_NOTCH). For each edge between two faces, with the outward
+    normals n1, n2 at its middle: tangent faces are a smooth join, not a corner; otherwise the two points a small
+    step off the edge along n1 - n2 and n2 - n1 are both inside the material at a re-entrant edge, and both outside
+    at a convex one. size: the part's size, for the step. [{"mid", "length", "angle"}] in the solid's frame."""
+    from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.TopAbs import TopAbs_IN
+    edges, owners = _IndexedShapeMap(), {}
+    for f in subshapes(solid, TopAbs_FACE):
+        f = TopoDS.Face(f)
+        for e in subshapes(f, TopAbs_EDGE):
+            owners.setdefault(edges.Add(e), []).append(f)
+    cls = BRepClass3d_SolidClassifier(solid)
+    eps = 1e-3 * size
+    out = []
+    for i, faces in owners.items():
+        if len(faces) != 2 or faces[0].IsSame(faces[1]):
+            continue                                    # a seam (one face on both sides) is not a corner
+        e = TopoDS.Edge(edges.FindKey(i))
+        if BRep_Tool.Degenerated_s(e):
+            continue
+        c = BRepAdaptor_Curve(e)
+        p = c.Value(0.5 * (c.FirstParameter() + c.LastParameter()))
+        normals = []
+        for f in faces:
+            u, v = GeomAPI_ProjectPointOnSurf(p, BRep_Tool.Surface_s(f)).LowerDistanceParameters()
+            normals.append(_point_normal(f, BRepAdaptor_Surface(f), u, v)[1])
+        n1, n2 = normals
+        angle = float(np.degrees(np.arccos(np.clip(n1 @ n2, -1.0, 1.0))))
+        if angle < SHARP_EDGE_ANGLE_DEG:
+            continue
+        inside = 0
+        for d in (n1 - n2, n2 - n1):
+            q = np.array(_xyz(p)) + eps * d / np.linalg.norm(d)
+            cls.Perform(gp_Pnt(*q), 1e-7)
+            inside += cls.State() == TopAbs_IN
+        if inside == 2:
+            g = GProp_GProps()
+            BRepGProp.LinearProperties_s(e, g)
+            a, b = c.Value(c.FirstParameter()), c.Value(c.LastParameter())
+            out.append({"mid": [round(v, 6) for v in _xyz(p)], "a": [round(v, 6) for v in _xyz(a)],
+                        "b": [round(v, 6) for v in _xyz(b)], "length": round(g.Mass(), 6),
+                        "angle": round(180.0 + angle, 3)})
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -468,6 +534,23 @@ def match_face(ref: FaceRef, faces: list[FaceInfo]) -> list[int]:
         if fp.radius is not None and f.radius is not None and abs(f.radius - fp.radius) > 1e-3 * fp.radius:
             continue
         hits.append(f.index)
+    if not hits:
+        # SolidWorks' centroid comes from its display tessellation and can sit further off on a small face with curved
+        # edges (0.12 mm on a 290 mm2 face, found live 2026-10-16, against a 0.05 mm tolerance): one face of the same type,
+        # area and orientation within the looser FACE_CENTROID_LOOSE is that face; two or more is an ambiguity, as before
+        loose = defaults.FACE_CENTROID_LOOSE
+        near = []
+        for f in faces:
+            if f.surface != fp.surface or abs(f.area - fp.area) > defaults.FACE_AREA_RTOL * fp.area:
+                continue
+            if fp.normal is not None and f.normal is not None and float(np.dot(fp.normal, f.normal)) < defaults.FACE_NORMAL_COS:
+                continue
+            if fp.radius is not None and f.radius is not None and abs(f.radius - fp.radius) > 1e-3 * fp.radius:
+                continue
+            if math.dist(f.centroid, fp.centroid) <= loose:
+                near.append(f.index)
+        if len(near) == 1:
+            return near
     return hits
 
 
@@ -510,6 +593,7 @@ def resolve_geometry(study: Path, model: Model, on_part=None) -> tuple[dict[str,
         got, d = match_solids(users, solid_props(solids), step)
         diags += d
         chosen.update({pid: (solids[i], i) for pid, i in got.items()})
+    sharp_by_body: dict = {}
     for k, part in enumerate(model.parts):
         if on_part is not None:
             on_part(k)
@@ -522,10 +606,19 @@ def resolve_geometry(study: Path, model: Model, on_part=None) -> tuple[dict[str,
         if not body.exists():
             write_step(body, [solid])
         solid = read_step(body)[0]
-        placed = transform(solid, transform_matrix(part))
+        T = transform_matrix(part)
+        placed = transform(solid, T)
         vol, _ = volume_props(placed)
         g = PartGeometry(part.id, part.step, idx, vol, part_faces(placed), bbox(placed), placed)
         g.body_step = str(body.relative_to(study))
+        # sharp re-entrant edges: found once per body in its own frame (a rig repeats a part thousands of times)
+        key = (part.geometry_hash, idx)
+        if key not in sharp_by_body:
+            bb = np.asarray(bbox(solid), float)
+            sharp_by_body[key] = sharp_edges(solid, float(np.linalg.norm(bb[3:] - bb[:3])))
+        M = np.asarray(T, float).reshape(4, 4)
+        g.sharp_edges = [{**e, **{k: [round(float(v), 6) for v in M[:3, :3] @ np.asarray(e[k]) + M[:3, 3]]
+                                  for k in ("mid", "a", "b")}} for e in sharp_by_body[key]]
         geoms[part.id] = g
     face_map: dict[str, tuple[str, int]] = {}
     for ref in model.face_refs:

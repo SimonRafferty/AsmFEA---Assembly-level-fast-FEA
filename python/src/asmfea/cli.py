@@ -75,6 +75,10 @@ def main(argv=None) -> int:
     p.add_argument("--cases", nargs="+", default=None, help="solve only these load cases (default: all)")
     p.add_argument("--force", action="store_true", help="redo every stage: ignore every cache (unchanged stages are otherwise reused)")
     p.add_argument("--fast", action="store_true", help="a fast run: approximate results for iterative design (no report)")
+    p = sub.add_parser("fatigue", help="assess fatigue on the last full run's results (study.fatigue; no new solve)")
+    p.add_argument("study")
+    p.add_argument("--force", action="store_true", help="redo the fatigue stage even if its inputs are unchanged")
+    sub.add_parser("sn-data", help="the S-N curve fatigue would use for each material, and where it comes from").add_argument("study")
     p = sub.add_parser("job")
     p.add_argument("study")
     p.add_argument("job_id", nargs="?")
@@ -95,6 +99,8 @@ def main(argv=None) -> int:
     p.add_argument("study")
     p.add_argument("--pdf", action="store_true")
     p.add_argument("--summary", action="store_true", help="the half-page summary instead of the full report")
+    p.add_argument("--data", action="store_true", help="the data report (the appendices) instead of the full report")
+    p.add_argument("--fatigue", action="store_true", help="the fatigue document of the same kind")
     p = sub.add_parser("replot", help="redraw plots and reports of the last run from a new view (no re-solve)")
     p.add_argument("study")
     p.add_argument("--toward", required=True, help="direction towards the viewer, x,y,z (assembly frame)")
@@ -120,6 +126,10 @@ def main(argv=None) -> int:
             r = api.status()
         elif a.verb == "run":
             r = api.run(a.study, a.stages, a.cases, a.force, a.fast)
+        elif a.verb == "sn-data":
+            r = api.sn_data(a.study)
+        elif a.verb == "fatigue":
+            r = api.fatigue(a.study, a.force)
         elif a.verb == "job":
             r = api.job(a.study, a.job_id, a.wait)
         elif a.verb == "cancel":
@@ -145,7 +155,7 @@ def main(argv=None) -> int:
         elif a.verb == "image":
             r = api.image(a.study, a.name)
         elif a.verb == "report":
-            r = api.report(a.study, a.pdf, a.summary)
+            r = api.report(a.study, a.pdf, a.summary, a.data, a.fatigue)
         elif a.verb == "replot":
             r = api.replot(a.study, [float(x) for x in a.toward.split(",")], [float(x) for x in a.up.split(",")])
         elif a.verb == "view":

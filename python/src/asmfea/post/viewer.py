@@ -113,6 +113,10 @@ def show(study: Path, case: str, field: str) -> None:
                                            "position_x": 1 - 3 * mx - 0.11, "position_y": KEY_BOTTOM,
                                            "width": 0.11, "height": KEY_TOP - KEY_BOTTOM, "title_font_size": 14,
                                            "label_font_size": 13})
+    # rigid parts (D96): white and hatched, at the deformed shape the window opens on
+    from .plots import add_rigid, rigid_shapes_for
+    for V, F in rigid_shapes_for(study, case, meta["deform_scale"], vtp.parent / "results.json"):
+        add_rigid(pl, V, F, reset_camera=False)
     _frame(pl)
     marks = meta["markers"].get(field, [])
     note = ""                                      # the deformation scale is on its slider (bottom)

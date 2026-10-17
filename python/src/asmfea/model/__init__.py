@@ -38,6 +38,13 @@ class View(_M):
     up: Vec3
 
 
+class SnCurve(_M):
+    """An S-N curve stored with the SolidWorks material (D109): stress amplitude MPa against cycles."""
+    r_ratio: float
+    points: list[tuple[float, float]]
+    source: Optional[str] = None
+
+
 class Material(_M):
     name: str
     E: float
@@ -45,6 +52,7 @@ class Material(_M):
     density: float
     yield_: float = Field(alias="yield")
     ultimate: Optional[float] = None
+    sn_curves: list[SnCurve] = []
 
 
 class Body(_M):
@@ -186,6 +194,16 @@ class Hinge(_M):
     note: Optional[str] = None
 
 
+class Join(_M):
+    """A connection the user added between two parts (the Join button, D97): faces none (the nearest faces, within
+    the join gap limit), one (that face to the nearest face of the other part, within the limit) or one on each
+    part (joined whatever the distance: bonded where they meet, else a rigid link)."""
+    id: str
+    parts: list[str]
+    faces: list[str] = []
+    note: Optional[str] = None
+
+
 class MeshPrefs(_M):
     favour: Literal["speed", "balanced", "accuracy"] = "balanced"       # D60: the planner decides from this
     fidelity: Optional[Literal["coarse", "standard", "fine"]] = None      # advanced override of the mesh level
@@ -202,6 +220,67 @@ class Limits(_M):
     max_stress: Optional[float] = None      # MPa, allowable von Mises away from bonded joints (D53)
 
 
+class SpectrumRow(_M):
+    """One row of a fatigue spectrum: a load case cycling between two percentages (D102)."""
+    case: str
+    max_pct: float
+    min_pct: float
+    min_case: Optional[str] = None           # the case at the minimum; default `case`
+    cycles: float
+
+
+class Basquin(_M):
+    Sf: float                                # sigma_a = Sf (2N)^b, fully reversed amplitude, MPa
+    b: float
+    endurance_limit: Optional[float] = None  # amplitude below which constant amplitude does no damage
+
+
+class FatigueMaterial(_M):
+    """The S-N data of one material: a user curve (basquin or points) or a class of the study's standard."""
+    material: str
+    basquin: Optional[Basquin] = None
+    points: Optional[list[tuple[float, float]]] = None   # [cycles, fully reversed amplitude MPa]
+    standard_class: Optional[str] = None
+    surface_factor: float = 1.0
+    size_factor: float = 1.0
+    surface: Optional[Literal["polished", "ground", "machined", "hot_rolled", "as_forged"]] = None   # built-in data
+    source: Optional[str] = None
+
+
+class ParentPrefs(_M):
+    mean_stress: Literal["goodman", "gerber", "none"] = "goodman"
+    range: Literal["principal", "signed_von_mises"] = "principal"
+
+
+class WeldJoint(_M):
+    connection: str
+    method: Optional[Literal["dong", "nominal"]] = None
+    category: Optional[str] = None
+
+
+class WeldPrefs(_M):
+    method: Literal["dong", "nominal"] = "dong"
+    structural_category: Optional[str] = None
+    joints: list[WeldJoint] = []
+
+
+class BoltPrefs(_M):
+    thread: Literal["rolled", "machined"] = "rolled"
+
+
+class Fatigue(_M):
+    """study.fatigue (PLAN-FATIGUE.md, D102): assessed on the static results, after post."""
+    standard: Literal["bs7608", "pd5500", "en13001_3_1", "en1993_1_9"] = "bs7608"
+    spectrum: list[SpectrumRow]
+    design_blocks: float = 1.0
+    materials: list[FatigueMaterial] = []
+    parent: ParentPrefs = ParentPrefs()
+    welds: WeldPrefs = WeldPrefs()
+    bolts: BoltPrefs = BoltPrefs()
+    gamma_Ff: float = 1.0
+    gamma_Mf: float = 1.0
+
+
 class Study(_M):
     name: str
     analyses: list[Literal["static", "buckling"]] = ["static"]
@@ -211,9 +290,11 @@ class Study(_M):
     bond_tolerance: Optional[float] = None   # mm, gap or overlap still bonded; None = defaults.GAP_TOL
     connection_method: Literal["auto", "classic", "bond_first"] = "auto"   # D81: bond-first on big models
     excluded_parts: list[str] = []           # left out of the analysis by the user (never suppressed in SolidWorks)
+    rigid_parts: list[str] = []              # not meshed, moved as rigid bodies (D96); SolidWorks' material unchanged
     load_superposition: bool = False         # solve each load once, cases are sums (superpose.py, D39)
     mesh: MeshPrefs = MeshPrefs()
     limits: Limits = Limits()
+    fatigue: Optional[Fatigue] = None        # release 2 (D102)
 
 
 class IssueWhere(_M):
@@ -240,6 +321,7 @@ class Model(_M):
     fixtures: list[Fixture] = []
     overrides: list[Override] = []
     hinges: list[Hinge] = []
+    joins: list[Join] = []
     study: Optional[Study] = None
     issues: list[Issue] = []
 
@@ -274,7 +356,7 @@ def check_version(doc: dict, what: str) -> None:
 
 
 # Keys a study.json may carry; list-valued ones are appended, `study` replaces.
-_MERGE_LISTS = ("face_refs", "loads", "fixtures", "overrides", "hinges", "materials", "mates")
+_MERGE_LISTS = ("face_refs", "loads", "fixtures", "overrides", "hinges", "joins", "materials", "mates")
 
 
 def merge_study(model: dict, study: dict) -> dict:

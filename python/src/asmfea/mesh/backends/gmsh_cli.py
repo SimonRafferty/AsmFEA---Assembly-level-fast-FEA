@@ -114,7 +114,8 @@ class GmshCliBackend:
                 self._version = "unknown"
         return self._version
 
-    def script(self, req: MeshRequest, algo: int, optimise: bool = False) -> str:
+    def script(self, req: MeshRequest, algo: int, optimise: bool = False, fields: list[str] | None = None) -> str:
+        """fields: .geo lines of free holes' sizes (D101, holes.gmsh_fields), after every other setting."""
         geom = Path(req.geometry_file).resolve().as_posix()
         smin = req.size_min if req.size_min else req.size_max * defaults.MESH_SIZE_MIN_FRACTION
         return "\n".join([
@@ -134,8 +135,32 @@ class GmshCliBackend:
             "Mesh.MshFileVersion = 2.2;",
             "Mesh.Binary = 0;",
             f"General.NumThreads = {req.threads};",
+            *(fields or []),
             "",
         ])
+
+    def hole_fields(self, req: MeshRequest, out_dir: Path, log_path: Path, timeout_s: float, on_line) -> list[str]:
+        """Free holes (D101): the surface meshed once as it would be without them (curvature sizing held to the
+        usual minimum), its sizes written as a view, and the .geo lines that mesh the solid with those sizes away
+        from the holes and the holes' own near them. No holes to refine (or the surface pass fails): []."""
+        from ..holes import gmsh_fields, to_refine, write_size_view
+        holes = to_refine((req.extra or {}).get("holes") or [], req.size_max)
+        if not holes:
+            return []
+        geo, msh = out_dir / "surface_pass.geo", out_dir / "surface_pass.msh"
+        geo.write_text(self.script(req, ALGORITHMS[0][0]))
+        code, timed_out, tail = run_logged([self.exe, str(geo), "-2", "-format", "msh22", "-o", str(msh), "-nt",
+                                            str(req.threads), "-v", "4"], out_dir, log_path, timeout_s, on_line)
+        if timed_out or code != 0 or not msh.exists():
+            return []                             # mesh as before, without the holes' sizes
+        ids, coords, elems = read_msh22(msh)
+        tri = elems.get(9) if 9 in elems else elems.get(2)
+        if tri is None or not len(tri):
+            return []
+        pos = {int(n): i for i, n in enumerate(ids)}
+        view = out_dir / "surface_size.pos"
+        write_size_view(view, coords, np.vectorize(pos.__getitem__)(np.asarray(tri)[:, :3]))
+        return gmsh_fields(holes, req.size_max, view)[0]
 
     def mesh(self, req: MeshRequest, on_line: Callable[[str], None] = lambda s: None) -> MeshResult:
         out_dir = Path(req.out_dir)
@@ -149,6 +174,7 @@ class GmshCliBackend:
         # high-order optimiser, which untangles them (a 297-body weldment: 200 parts inverted; found live)
         already = bool((req.extra or {}).get("gmsh_optimize"))
         tries = [(algo, label, opt) for algo, label in ALGORITHMS for opt in ((True,) if already else (False, True))]
+        fields = self.hole_fields(req, out_dir, log_path, max(1.0, deadline - time.time()), on_line)
         skip = set()
         for algo, label, optimise in tries:
             if (label, optimise) in skip:
@@ -160,7 +186,7 @@ class GmshCliBackend:
             tag = label + ("_opt" if optimise and not already else "")
             geo = out_dir / f"mesh_{tag}.geo"
             msh = out_dir / f"mesh_{tag}.msh"
-            geo.write_text(self.script(req, algo, optimise))
+            geo.write_text(self.script(req, algo, optimise, fields))
             with open(log_path, "a") as lg:
                 lg.write(f"--- {self.name} algorithm {label}\n")
             code, timed_out, tail = run_logged(

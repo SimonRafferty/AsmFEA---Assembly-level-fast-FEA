@@ -216,7 +216,8 @@ def read(path: Path, rigid_ok: bool = False) -> Deck:
                     raise Unsupported(f"distributed load {v[1]}")
                 step.gravity.append((v[0], float(v[2]), tuple(float(x) for x in v[3:6])))
         elif kw == "*NODE PRINT":
-            step.prints.append((o["NSET"], str(o.get("TOTALS", "")).upper() == "ONLY"))
+            what = body[0].split(",")[0].strip().upper() if body else "RF"
+            step.prints.append((o["NSET"], str(o.get("TOTALS", "")).upper() == "ONLY", what))
         elif kw in IGNORED or (rigid_ok and kw in ("*RIGID BODY", "*EQUATION")):
             pass
         else:

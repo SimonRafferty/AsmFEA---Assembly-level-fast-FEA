@@ -186,6 +186,47 @@ namespace AsmFea.Extract
             catch { return null; }
         }
 
+        /// <summary>
+        /// A digest of what the exported model depends on, cheap to work out without exporting (ResultsState): the
+        /// configuration and feature count, and per component its name, suppression, file, configuration, position,
+        /// the file's last save and whether it has unsaved changes; for a part document its bodies' sizes (its own
+        /// file is saved with the study in it, so its date says nothing). A part saved unchanged reads as changed.
+        /// </summary>
+        public static string ModelSignature(IModelDoc2 doc)
+        {
+            Func<double, string> f = v => Math.Round(v, 9).ToString("R", CultureInfo.InvariantCulture);
+            var lines = new List<string>
+            {
+                "doc|" + doc.GetType() + "|" + doc.ConfigurationManager.ActiveConfiguration.Name + "|" + doc.GetFeatureCount()
+            };
+            var asm = doc as IAssemblyDoc;
+            if (asm != null)
+            {
+                var comps = new List<string>();
+                foreach (var c in ((object[])asm.GetComponents(false) ?? new object[0]).OfType<IComponent2>())
+                {
+                    string path = c.GetPathName() ?? "";
+                    string saved = "";
+                    try { if (File.Exists(path)) saved = File.GetLastWriteTimeUtc(path).Ticks.ToString(CultureInfo.InvariantCulture); } catch { }
+                    bool dirty = false;
+                    try { var m = c.GetModelDoc2() as IModelDoc2; dirty = m != null && m.GetSaveFlag(); } catch { }
+                    var t = c.Transform2 == null ? new double[0] : (double[])c.Transform2.ArrayData;
+                    comps.Add(string.Join("|", SafeName(c), c.GetSuppression(), path, c.ReferencedConfiguration,
+                                          string.Join(",", t.Select(f)), saved, dirty));
+                }
+                comps.Sort(StringComparer.Ordinal);
+                lines.AddRange(comps);
+            }
+            var part = doc as IPartDoc;
+            if (part != null)
+                foreach (var b in ((object[])part.GetBodies2((int)swBodyType_e.swSolidBody, true) ?? new object[0]).OfType<IBody2>())
+                {
+                    var mp = (double[])b.GetMassProperties(1.0);    // centre xyz, volume, area, ... (SI)
+                    lines.Add("body|" + b.Name + "|" + string.Join(",", mp.Take(5).Select(f)));
+                }
+            return ResultsState.Signature(lines);
+        }
+
         /// <summary>What the extractor is doing now: named in every failure.</summary>
         private string stage = "start";
 
@@ -911,9 +952,13 @@ namespace AsmFea.Extract
         /// comp null (a part document) the face is a part face already, and only its body is found.</summary>
         private Tuple<BodyEntry, IFace2> Trace(IComponent2 comp, IFace2 asmFace, IEnumerable<BodyEntry> candidates)
         {
+            // only faces of the same area are compared (GetCorresponding and IsSame on every face of a big part took
+            // seconds a pick, found live 2026-10-16)
+            double area = asmFace.GetArea();
             foreach (var b in candidates)
                 foreach (var pf in ((object[])b.Body.GetFaces() ?? new object[0]).Cast<IFace2>())
                 {
+                    if (Math.Abs(pf.GetArea() - area) > 1e-6 * Math.Max(area, 1e-12)) continue;
                     var corr = comp == null ? pf : comp.GetCorresponding(pf) as IFace2;   // part face -> assembly context
                     if (corr != null && sw.IsSame(corr, asmFace).Equals((int)swObjectEquality.swObjectSame))
                         return Tuple.Create(b, pf);

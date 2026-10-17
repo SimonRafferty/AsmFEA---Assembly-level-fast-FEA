@@ -341,9 +341,10 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     versions = res["versions"]
     statuses = [c["status"] for c in res["checks"]]
     overall = "FAIL" if "FAIL" in statuses else "WARN" if "WARN" in statuses else "PASS"
-    # the main body is numbered, the appendices lettered (the data sections, read on demand: the user's request)
+    # the main body is numbered; the data sections, read on demand, are lettered and go in a data report of their own
+    # (the user's request, 2026-10-17: the report was longer than anyone reads)
     num = {name: f"{i + 1}." for i, name in enumerate(SECTIONS)}
-    num.update({name: f"Appendix {chr(65 + i)}." for i, name in enumerate(APPENDICES)})
+    num.update({name: f"{chr(65 + i)}." for i, name in enumerate(APPENDICES)})
 
     def heading(name: str):
         doc.add_heading(f"{num[name]} {name}", 1)
@@ -358,13 +359,17 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                     ["Part" if model.source.assembly.lower().endswith(".sldprt") else "Assembly", model.source.assembly],
                     ["Configuration", model.source.configuration or "-"],
                     ["Overall result", overall]]
-                   + ([["Accuracy", res["accuracy"]["grade"]]] if res.get("accuracy") else []), (4.5, 12.5), size=10)
+                   + ([["Accuracy", res["accuracy"]["grade"]]] if res.get("accuracy") else [])
+                   # fatigue has its own report (D107): one line pointing to it
+                   + ([["Fatigue", f"see {study_name}_fatigue_report.docx"]]
+                      if (study / "results" / "fatigue.json").exists() else []), (4.5, 12.5), size=10)
     _para(doc, "Prepared with AsmFEA, which builds the finite element model from the SolidWorks assembly, and "
                "CalculiX, which solves it.", 9, colour=GREY)
     _para(doc)
     _para(doc, "Contents", 15, True, BLUE)
-    for name in SECTIONS + APPENDICES:
+    for name in SECTIONS:
         _para(doc, f"{num[name]}  {name}", 10.5).paragraph_format.space_after = Pt(2)
+    _para(doc, f"The data behind the results is in {study_name}_data.docx.", 9.5, colour=GREY)
     doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
 
     conv = res.get("convergence") or {}
@@ -453,7 +458,7 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                 _picture(doc, study / "results" / f"{case.replace(' ', '_')}_buckling_mode{i}_iso.png",
                          f"{asm_name} - {study_name} - {case} - buckling mode {i}", 12)
     _para(doc, "The data behind these results (model, materials, loads, connections, mesh, reactions and the "
-               "results part by part) is in the appendices.", 9, colour=GREY)
+               f"results part by part) is in {study_name}_data.docx.", 9, colour=GREY)
     # ---- 4. Conclusion
     heading("Conclusion")
     p = _para(doc, "Overall result: ")
@@ -484,8 +489,10 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     user_out = set(model.study.excluded_parts or [])
     reasons = {p_: "disconnected" if p_ in disconnected else "user" if p_ in user_out else "small" if p_ in small_ids
                else "weld bead" if model.part(p_) and model.part(p_).kind == "weld_bead" else "fastener" for p_ in removed}
-    sentences = (A.ALWAYS + A.mesh_levels(bool(conv)) + A.ties(sum(c["type"] == "tie" for c in conns))
-                 + A.removed(reasons) + A.bolted(joints)
+    man = next((p_ for p_ in (study / "mesh" / "manifest.json", study / "mesh" / "manifest_fast.json") if p_.exists()), None)
+    n_holes = sum((m.get("base") or {}).get("holes", 0) for m in read_json(man)["parts"].values()) if man else 0
+    sentences = (A.ALWAYS + A.mesh_levels(bool(conv)) + A.holes(n_holes) + A.ties(sum(c["type"] == "tie" for c in conns))
+                 + A.removed(reasons) + A.rigid(conns_doc.get("rigid_groups", [])) + A.bolted(joints)
                  + A.bond_first(conns_doc.get("method", "classic"), conns_doc.get("method_why"),
                                 len(conns_doc.get("bonded_redundant", [])) + len(conns_doc.get("bonded_on_pins", [])),
                                 small, defaults.SMALL_PART_VOLUME_FRACTION)
@@ -512,8 +519,24 @@ def build_report(study: Path, pdf: bool = False) -> Path:
     for s in sentences:
         _para(doc, s, style="List Bullet")
 
-    # ---- the appendices: the data behind it, for the technical file
-    doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    # the main report ends here
+    if not tpl:
+        _header_footer(doc, f"Simulation of {asm_name}  |  {study_name}", f"{when:%d %B %Y}",
+                       f"AsmFEA {versions['asmfea']}  |  {versions.get('solver') or 'CalculiX'}")
+    out = study / "report" / f"{study_name}_report.docx"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(out))
+    if pdf:
+        to_pdf(out)
+
+    # ---- the data report: the data behind it, for the technical file (sections A-J)
+    doc = Document(str(tpl)) if tpl else Document()
+    if not tpl:
+        _style_document(doc)
+    _para(doc, f"Simulation data: {asm_name}", 20, True, BLUE)
+    _para(doc, f"Study: {study_name}  |  {when:%d %B %Y}  |  the data behind {study_name}_report.docx", 10, colour=GREY)
+    for name in APPENDICES:
+        _para(doc, f"{num[name]}  {name}", 10).paragraph_format.space_after = Pt(1)
     # ---- A. Model information
     heading("Model information")
     _picture(doc, study / "results" / "setup_iso.png", f"{asm_name} - {study_name}: model, fixtures and loads")
@@ -533,6 +556,8 @@ def build_report(study: Path, pdf: bool = False) -> Path:
             treat += " (left out by the user)"
         elif p_.id in removed:
             treat += " (removed: see Connections)"
+        elif p_.id in set(conns_doc.get("rigid_parts", [])):
+            treat = "Rigid (not meshed)"
         vol = p_.body.volume if p_.body is not None else _geo_volume(study, p_.id)
         rows.append([p_.id, treat, p_.material or "-", vol, vol * mat.density * 1000 if mat and vol else None,
                      inst.get(p_.id, {}).get("n_elements", "-")])
@@ -727,6 +752,11 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                  p_["min_fos"], p_.get("min_fos_ultimate"), p_["max_disp"],
                  f"{max(conv_case.get(name, {}).get('max_disp', 0), conv_case.get(name, {}).get('stress', conv_case.get(name, {}).get('peak_vm_excl_ties', 0))):.1%}"
                  if conv_case else "-"] for name, p_ in lc["parts"].items()])
+        if lc.get("rigid_parts"):
+            _para(doc, "Rigid parts (not meshed, no stress: D96). Largest displacement of each, from its rigid motion.", 9)
+            _table(doc, ["Rigid part", "Max disp. (mm)", "At (x, y, z)"],
+                   [[name, r["max_disp"], ", ".join(f"{c:.1f}" for c in r["max_disp_at"])]
+                    for name, r in lc["rigid_parts"].items()])
         joints = sorted(lc.get("joints", []), key=lambda j: -j["structural_stress"])
         if joints:
             _para(doc, "Bonded joints: structural stress, from the forces each joint carries (the mesh-insensitive "
@@ -764,14 +794,19 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                 r.add_break()
 
     if not tpl:
-        _header_footer(doc, f"Simulation of {asm_name}  |  {study_name}", f"{when:%d %B %Y}",
+        _header_footer(doc, f"Simulation data of {asm_name}  |  {study_name}", f"{when:%d %B %Y}",
                        f"AsmFEA {versions['asmfea']}  |  {versions.get('solver') or 'CalculiX'}")
-    out = study / "report" / f"{study_name}_report.docx"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    doc.save(str(out))
+    data = study / "report" / f"{study_name}_data.docx"
+    doc.save(str(data))
     if pdf:
-        to_pdf(out)
+        to_pdf(data)
     return out
+
+
+def data_report_path(study: Path) -> Path:
+    """The data report written beside the main report by build_report."""
+    model = load_model(Path(study))
+    return Path(study) / "report" / f"{model.study.name}_data.docx"
 
 
 def build_summary(study: Path, pdf: bool = False) -> Path:
@@ -860,6 +895,8 @@ def build_summary(study: Path, pdf: bool = False) -> Path:
     if limits:
         note += " Limits: " + ", ".join(limits) + "."
     note += f" Full details: {study_name}_report.docx (technical file)."
+    if (study / "results" / "fatigue.json").exists():
+        note += f" Fatigue: {study_name}_fatigue_summary.docx."
     _para(doc, note, 7.5, colour=GREY)
 
     out = study / "report" / f"{study_name}_summary.docx"

@@ -30,8 +30,23 @@ def bbox_overlap(a, b, grow: float) -> bool:
 
 
 def planar_overlap(fa: FaceInfo, fb: FaceInfo, offset: float) -> tuple[float, list[list[float]]]:
-    """(area, boundary sample points) of face b projected onto a's plane, intersected with a."""
-    moved = translated(fb.shape, np.asarray(fa.normal) * offset)
+    """(area, boundary sample points) of face b projected onto a's plane, intersected with a. A face a few degrees off
+    opposing (within OPPOSING_NORMAL_COS) is first turned square to a about its centroid: moved along the normal alone it
+    met a's plane in a line only, so a cap tilted 3.6 degrees on a folded part bonded nowhere (found live, 2026-10-16)."""
+    from ..geometry import transform
+    na, nb = np.asarray(fa.normal, float), np.asarray(fb.normal, float)
+    shape = fb.shape
+    axis = np.cross(nb, -na)
+    s, c = float(np.linalg.norm(axis)), float(np.dot(nb, -na))
+    if s > 1e-9:
+        k = axis / s
+        K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+        R = np.eye(3) + s * K + (1 - c) * (K @ K)       # turns nb onto -na
+        cb = np.asarray(fb.centroid, float)
+        T = np.eye(4)
+        T[:3, :3], T[:3, 3] = R, cb - R @ cb
+        shape = transform(shape, T)
+    moved = translated(shape, na * offset)
     res = common(fa.shape, moved)
     if res is None:
         return 0.0, []

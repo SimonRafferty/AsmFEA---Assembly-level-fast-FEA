@@ -71,6 +71,7 @@ class SummaryResult(BaseModel):
     run_mode: str = "full"              # "fast": approximate results of a fast run (ADDENDUM-FAST-RUN-MODE)
     accuracy: Optional[dict] = None     # how accurate the results are likely to be (D60: grade, errors, reasons)
     plan: Optional[dict] = None         # how the run was set up (D60: favour, mesh level, solver, machine)
+    fatigue: Optional[dict] = None      # the last fatigue assessment's figures (D105): governing item, result, currency
 
 
 class ExceptionsResult(BaseModel):
@@ -132,6 +133,57 @@ def run(study: str | Path, stages: Optional[list[str]] = None, cases: Optional[l
     return RunResult(study=str(p), job_id=jobs.start(p, stages, cases, force, "fast" if fast else "full"), stages=stages)
 
 
+def sn_data(study: str | Path) -> dict:
+    """{material: the S-N curve fatigue would use for it, and where it comes from} for the study's exported model
+    (D113): the Fatigue tab's entry, else the SolidWorks material's curve (D109), else AsmFEA's built-in data (D111).
+    Each: {"from": study | solidworks | builtin | none, "name", "source", "estimated", "Sf", "b" (Basquin) or
+    "points", "amplitude_1e6", "amplitude_1e7" (design values, MPa)}. No run needed."""
+    import numpy as np
+    from .fatigue import curves_for, life
+    from .model import Fatigue, load_model
+    p = _study(study)
+    model = load_model(p)
+    fat = (model.study.fatigue if model.study and model.study.fatigue else
+           Fatigue(spectrum=[{"case": (model.study.load_cases[0] if model.study else "LC1"), "max_pct": 100, "min_pct": 0,
+                              "cycles": 1}]))
+    used = sorted({q.material for q in model.parts})
+    curves, _ = curves_for(model, fat.model_copy(update={"parent": fat.parent.model_copy(update={"mean_stress": "none"})}),
+                           [q.id for q in model.parts])
+    by_mat = {m.material: m for m in fat.materials}
+    out = {}
+    for mat in used:
+        c = curves.get(mat)
+        if c is None:
+            out[mat] = {"from": "none"}
+            continue
+        fm = by_mat.get(mat)
+        frm = ("study" if fm and (fm.basquin or fm.points or fm.standard_class) else
+               "solidworks" if "SolidWorks material" in c["name"] else "builtin")
+
+        def amp(n):
+            # the amplitude (user curves) or range (standards' classes) at n cycles, by bisection on the curve
+            lo, hi = 1e-3, 1e5
+            for _ in range(200):
+                mid = (lo * hi) ** 0.5
+                if life(c, np.array([mid]), True)[0] > n:
+                    lo = mid
+                else:
+                    hi = mid
+            return round((lo * hi) ** 0.5, 2)
+        rec = {"from": frm, "name": c["name"], "source": c.get("source"), "estimated": bool(c.get("estimated")),
+               "amplitude_1e6": amp(1e6), "amplitude_1e7": amp(1e7)}
+        if c["kind"] == "basquin":
+            rec.update(Sf=round(c["Sf"], 3), b=c["b"])
+        out[mat] = rec
+    return {"study": str(p), "materials": out}
+
+
+def fatigue(study: str | Path, force: bool = False) -> RunResult:
+    """Start a job that assesses fatigue on the last full run's static results (study.fatigue; D105): only the
+    fatigue stage runs, so a spectrum or S-N change needs no new solve."""
+    return run(study, ["fatigue"], force=force)
+
+
 def job(study: str | Path, job_id: Optional[str] = None, wait_s: float = 0.0) -> JobResult:
     p = _study(study)
     if job_id is None:
@@ -168,9 +220,23 @@ def summary(study: str | Path) -> SummaryResult:
                 if v:
                     view = {"toward_viewer": v["toward_viewer"], "up": v["up"]}
                     break
+    fat = None
+    fp = p / "results" / "fatigue.json"
+    if fp.exists():
+        from .stagecache import file_digest
+        f = json.loads(fp.read_text())
+        items = {**{f"part {k}": v for k, v in f.get("parts", {}).items()},
+                 **{f"joint {k}": v for k, v in f.get("joints", {}).items()},
+                 **{f"wall {k}": v for k, v in f.get("walls", {}).items()},
+                 **{f"bolt {k}": v for k, v in f.get("bolts", {}).items()}}
+        fat = {"governing": f.get("governing"), "standard": f.get("standard_name"),
+               "current": (p / "results" / "results.json").exists()
+               and file_digest(p / "results" / "results.json") == f.get("static_results"),
+               "items": {k: {x: v[x] for x in ("damage", "factor_k", "pass", "curve")} for k, v in items.items()},
+               "warnings": [w["code"] for w in f.get("warnings", [])]}
     return SummaryResult(study=str(p), job=r.get("job"), checks=r.get("checks", []),
                          load_cases=r.get("load_cases", {}), plot_view=view, run_mode=mode,
-                         accuracy=r.get("accuracy"), plan=r.get("plan"))
+                         accuracy=r.get("accuracy"), plan=r.get("plan"), fatigue=fat)
 
 
 def recheck(study: str | Path, limits: Optional[dict] = None) -> dict:
@@ -291,28 +357,56 @@ def image(study: str | Path, name: str) -> ImageResult:
     return ImageResult(study=str(p), name=stem, path=str(res / f"{stem}.png"), available=names)
 
 
-def report(study: str | Path, pdf: bool = False, summary: bool = False) -> ReportResult:
+def _stale(doc: Path, source: Path) -> bool:
+    """A document to write again: missing, older than the results it is made from, or written by older report code
+    (so a change to the documents shows on the next open, not only after the next run)."""
+    code = max(f.stat().st_mtime for f in (Path(__file__).parent / "report").glob("*.py"))
+    return not doc.exists() or doc.stat().st_mtime < max(source.stat().st_mtime, code)
+
+
+def report(study: str | Path, pdf: bool = False, summary: bool = False, data: bool = False,
+           fatigue: bool = False) -> ReportResult:
     """Path to the Word report, or with summary=True to the half-page summary (project
     details, a stress plot, max stress / displacement and min factor of safety) for risk
-    assessments; writes it from results.json if it is missing or older."""
+    assessments, or with data=True to the data report (the model, materials, connections,
+    resultant forces and detailed results behind the report, D114); writes them from
+    results.json if missing, older, or written by older report code. With fatigue=True the
+    fatigue document of the same kind, from results/fatigue.json."""
     from .report import build_report, build_summary, to_pdf
     from .model import load_model
-    from .runmode import FAST, model_key, results_dir
+    from .runmode import FAST, model_key_matches, results_dir
     p = _study(study)
+    if fatigue:
+        return _fatigue_report(p, pdf, "summary" if summary else "data" if data else "report")
     results = p / "results" / "results.json"
     if not results.exists():
         if (results_dir(p, FAST) / "results.json").exists():
             raise FileNotFoundError("only a fast run exists: a report needs a full run (Run, not Fast run)")
         raise FileNotFoundError("no results yet: run the post stage first")
     full = json.loads(results.read_text())
-    if full.get("model_key") and full["model_key"] != model_key(load_model(p)):
+    if full.get("model_key") and not model_key_matches(full["model_key"], load_model(p)):
         raise FileNotFoundError("the model has changed since the last full run: do a full run before producing a report")
-    pattern = "*_summary.docx" if summary else "*_report.docx"
-    existing = sorted((p / "report").glob(pattern)) if (p / "report").exists() else []
-    if existing and existing[0].stat().st_mtime >= results.stat().st_mtime:
-        out = existing[0]
-    else:
-        out = build_summary(p) if summary else build_report(p)
+    # by the exact name: a pattern would also match the fatigue documents (<study>_fatigue_report.docx)
+    name = load_model(p).study.name
+    out = p / "report" / f"{name}_{'summary' if summary else 'data' if data else 'report'}.docx"
+    if _stale(out, results):
+        main = build_summary(p) if summary else build_report(p)   # the report writes the data report too
+        out = main if summary or not data else out
+    pdf_path = to_pdf(out) if pdf else None
+    return ReportResult(study=str(p), path=str(out), pdf=str(pdf_path) if pdf_path else None)
+
+
+def _fatigue_report(p: Path, pdf: bool, which: str) -> ReportResult:
+    from .model import load_model
+    from .report import to_pdf
+    from .report import fatigue as FR
+    source = p / "results" / "fatigue.json"
+    if not source.exists():
+        raise FileNotFoundError("no fatigue results yet: Assess fatigue first")
+    out = p / "report" / f"{load_model(p).study.name}_fatigue_{which}.docx"
+    if _stale(out, source):
+        out = {"summary": FR.build_fatigue_summary, "data": FR.build_fatigue_data,
+               "report": FR.build_fatigue_report}[which](p)
     pdf_path = to_pdf(out) if pdf else None
     return ReportResult(study=str(p), path=str(out), pdf=str(pdf_path) if pdf_path else None)
 

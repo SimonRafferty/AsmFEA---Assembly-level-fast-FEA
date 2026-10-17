@@ -40,11 +40,40 @@ def latest_solve_file(study: Path, mode: str = FULL) -> Path:
     return Path(study) / "run" / ("latest_solve_fast.txt" if mode == FAST else "latest_solve.txt")
 
 
+MODEL_KEY_VERSION = "2:"
+
+
+def _without(d, key: str):
+    """``d`` with ``key`` left out of every object, however deep."""
+    if isinstance(d, dict):
+        return {k: _without(v, key) for k, v in d.items() if k != key}
+    if isinstance(d, list):
+        return [_without(v, key) for v in d]
+    return d
+
+
+def _model_dump(model, exclude_defaults: bool) -> dict:
+    d = model.model_dump(by_alias=True, mode="json", exclude_defaults=exclude_defaults)
+    d["source"] = {k: v for k, v in (d.get("source") or {}).items() if k not in ("timestamp", "view")}
+    if d.get("study"):
+        d["study"] = {k: v for k, v in d["study"].items() if k != "fatigue"}     # not a static input (D105)
+    return d
+
+
 def model_key(model) -> str:
     """What a full run's results depend on in the model (geometry by the add-in's hashes, materials,
     loads, fixtures, connections overrides, study settings), for the report's "is this full run still
-    current?" check. The export's time and view are left out."""
+    current?" check. Left out (D115): the export's time and view; the faces' SolidWorks persistent
+    references, which change when the assembly is only saved (faces are matched by fingerprint, the
+    references only find them again); and fields at their defaults, so a field added to the model
+    in a later version does not make every earlier result look out of date."""
     from .stagecache import digest
-    d = model.model_dump(by_alias=True, mode="json")
-    d["source"] = {k: v for k, v in (d.get("source") or {}).items() if k not in ("timestamp", "view")}
-    return digest(d)
+    return MODEL_KEY_VERSION + digest(_without(_model_dump(model, True), "persistent_ref"))
+
+
+def model_key_matches(stored: str, model) -> bool:
+    """True when a full run's stored model key is the model's now (a key from before D115 by the old formula)."""
+    from .stagecache import digest
+    if stored.startswith(MODEL_KEY_VERSION):
+        return stored == model_key(model)
+    return stored == digest(_model_dump(model, False))

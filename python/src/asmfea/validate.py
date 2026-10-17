@@ -55,6 +55,15 @@ def check_model(model: Model) -> list[Diagnostic]:
             if fid not in faces:
                 d.append(make("MODEL_REFERENCE_UNKNOWN", where={"faces": [fid]}, kind="Face", ref=fid,
                               owner=f"hinge {h.id}"))
+    for j in model.joins:
+        for fid in j.faces:
+            if fid not in faces:
+                d.append(make("MODEL_REFERENCE_UNKNOWN", where={"faces": [fid]}, kind="Face", ref=fid,
+                              owner=f"join {j.id}"))
+    if model.study is not None:
+        for pid in model.study.rigid_parts:
+            if pid not in parts:
+                d.append(make("RIGID_PART_UNKNOWN", where={"parts": [pid]}, part=pid))
     # A connection decision about a part that is not exported (suppressed in this configuration, or
     # deleted) is kept but silently unused: it applies again if the part comes back. The user sees the
     # suppression in the feature tree (found live: a suppressed part blocked the check; the user asked

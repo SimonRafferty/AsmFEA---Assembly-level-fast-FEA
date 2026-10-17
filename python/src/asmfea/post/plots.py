@@ -177,7 +177,7 @@ def add_markers(pl: pv.Plotter, markers, centre, size) -> list:
 
 
 def _shot(mesh: pv.PolyData, scalars, title: str, clim, cmap, path: Path, centre, size, view, note: str = "",
-          markers=(), beyond: str | None = None):
+          markers=(), beyond: str | None = None, rigid=()):
     """One image. markers: [(point, label)] drawn as labelled points (the field's min and max). A fresh plotter
     each time: reusing one (cleared, light kit restored, overlay layer removed) saved half the plotting time but
     lost the markers' leader lines after the first image (2026-10-09)."""
@@ -192,6 +192,10 @@ def _shot(mesh: pv.PolyData, scalars, title: str, clim, cmap, path: Path, centre
                 scalar_bar_args={"title": title + "\n", "color": "black", "fmt": "%.3g", "vertical": True,
                                  "position_x": 0.86, "position_y": 0.10, "width": 0.09, "height": 0.66,
                                  "title_font_size": 14, "label_font_size": 12})
+    for V, F in rigid:                  # rigid parts (D96): no stress; white, hatched by their edges
+        add_rigid(pl, V, F)
+    if rigid:
+        note = (note + "  white, hatched: rigid parts (no stress)").strip()
     pl.add_text(f"{path.stem.replace('_', ' ')}{'  ' + note if note else ''}", font_size=9, color="black")
     if _WATERMARK:
         # a fast run's plots carry their status on the image, so a screenshot cannot pass for a full result
@@ -205,6 +209,95 @@ def _shot(mesh: pv.PolyData, scalars, title: str, clim, cmap, path: Path, centre
 _WATERMARK = ""
 PLAIN_GREY = (0.75, 0.75, 0.77)    # joint edges (no assessed stress): about SolidWorks' default part colour
 PEAK_COLOUR = (0.85, 0.30, 0.85)   # local peaks beyond the assessed stress: magenta, in no part of the jet map
+RIGID_COLOUR = (1.0, 1.0, 1.0)     # rigid parts (D96): white, which no colour key uses, hatched by their triangulation
+RIGID_EDGE = (0.35, 0.35, 0.38)     # (the user, 2026-10-16: distinct from the stress, deflection and FoS colours)
+
+
+def hatch_lines(V: np.ndarray, F: np.ndarray, spacing: float, direction=(1.0, 1.0, 1.0)) -> np.ndarray:
+    """(n, 2, 3) segments where planes normal to ``direction``, ``spacing`` apart, cut the triangles: a hatch drawn on
+    the surface itself, whatever the view."""
+    V = np.asarray(V, float)
+    T = np.asarray(F).reshape(-1, 4)[:, 1:]
+    n = np.asarray(direction, float) / np.linalg.norm(direction)
+    P = V[T]                                            # (m, 3, 3)
+    d = P @ n                                           # each corner's level
+    segs = []
+    k0, k1 = np.floor(d.min() / spacing), np.ceil(d.max() / spacing)
+    for k in np.arange(k0, k1 + 1):
+        lev = k * spacing
+        hit = (d.min(axis=1) < lev) & (d.max(axis=1) > lev)
+        for tri, dd in zip(P[hit], d[hit]):
+            pts = []
+            for i, j in ((0, 1), (1, 2), (2, 0)):
+                if (dd[i] - lev) * (dd[j] - lev) < 0:
+                    t = (lev - dd[i]) / (dd[j] - dd[i])
+                    pts.append(tri[i] + t * (tri[j] - tri[i]))
+            if len(pts) == 2:
+                segs.append(pts)
+    return np.asarray(segs, float).reshape(-1, 2, 3)
+
+
+def add_rigid(pl, V, F, **kw):
+    """A rigid part's surface: flat white with dark diagonal hatching and its outline, so it reads as no field value
+    (white is in no colour key; the user, 2026-10-16)."""
+    V = np.asarray(V, float)
+    mesh = pv.PolyData(V, np.asarray(F))
+    actor = pl.add_mesh(mesh, color=RIGID_COLOUR, lighting=False, **kw)
+    size = float(np.linalg.norm(V.max(axis=0) - V.min(axis=0))) if len(V) else 1.0
+    segs = hatch_lines(V, F, max(size / 25.0, 1e-6))
+    extra = {k: v for k, v in kw.items() if k in ("reset_camera", "render")}
+    if len(segs):
+        lines = np.column_stack([np.full(len(segs), 2), np.arange(0, 2 * len(segs), 2), np.arange(1, 2 * len(segs), 2)])
+        pl.add_mesh(pv.PolyData(segs.reshape(-1, 3), lines=lines.ravel()), color=RIGID_EDGE, line_width=1.2, **extra)
+    edges = mesh.extract_feature_edges(boundary_edges=True, feature_edges=True, manifold_edges=False, feature_angle=30)
+    if edges.n_points:
+        pl.add_mesh(edges, color=RIGID_EDGE, line_width=1.5, **extra)
+    return actor
+
+
+def rigid_shapes_for(study: Path, case: str, scale: float, results_path: Path | None = None) -> list:
+    """(vertices, faces) of the rigid parts moved by scale x their motion in the load case (the 3-D viewer)."""
+    rig = rigid_surfaces(study)
+    if not rig:
+        return []
+    lc = None
+    try:
+        if results_path is not None and results_path.exists():
+            lc = read_json(results_path)["load_cases"].get(case)
+    except Exception:                                   # noqa: BLE001 - undeformed then
+        lc = None
+    return _rigid_shapes(rig, lc, scale)
+
+
+def rigid_surfaces(study: Path) -> list[dict]:
+    """The rigid parts' triangulations (rigid.json, D96): [{part, group ref point, V, faces (pyvista)}]."""
+    p = study / "rigid.json"
+    if not p.exists():
+        return []
+    doc = read_json(p)
+    ref = {g["id"]: np.asarray(g["ref"], float) for g in doc.get("groups", [])}
+    out = []
+    for pid, t in doc.get("tessellation", {}).items():
+        T = np.asarray(t["triangles"], np.int64).reshape(-1, 3)
+        if not len(T):
+            continue
+        F = np.column_stack([np.full(len(T), 3), T]).ravel()
+        out.append({"part": pid, "at": ref.get(doc["parts"][pid]["group"], np.zeros(3)),
+                    "V": np.asarray(t["vertices"], float), "F": F})
+    return out
+
+
+def _rigid_shapes(rig: list[dict], lc: dict | None, scale: float) -> list:
+    """(vertices, faces) of each rigid part, moved by scale x its rigid motion when the load case gives it."""
+    from ..deck.rigid import motion_at
+    out = []
+    for r in rig:
+        V = r["V"]
+        m = ((lc or {}).get("rigid_parts") or {}).get(r["part"])
+        if m is not None and scale:
+            V = V + scale * motion_at(m["rigid_translation"], m["rigid_rotation"], r["at"], V)
+        out.append((V, r["F"]))
+    return out
 
 
 def _shot_job(job: dict) -> str:
@@ -219,7 +312,7 @@ def _shot_job(job: dict) -> str:
 def _render_jobs(jobs: list[dict], also=None) -> None:
     """The images, one after another in this process (``also`` first: the setup view). Drawing them in worker
     processes was tried and gained nothing: starting VTK in each, and sending the meshes to them, cost what the
-    parallel drawing saved (Robo-mower 6.5 s -> 6.0 s, a 4.5 M-DOF frame 10.3 s -> 10.9 s, 2026-10-09)."""
+    parallel drawing saved (a sheet-metal vehicle frame 6.5 s -> 6.0 s, a 4.5 M-DOF frame 10.3 s -> 10.9 s, 2026-10-09)."""
     if also:
         also()
     for j in jobs:
@@ -237,7 +330,9 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
     _WATERMARK = "FAST RUN - APPROXIMATE" if mode == FAST else ""
     instances = build_instances(study, model, level, mode)
     X, cells, ids, pos, owner, facet_index = _surface(instances)
-    lo, hi = X.min(axis=0), X.max(axis=0)
+    rig = rigid_surfaces(study)
+    allX = np.vstack([X] + [r["V"] for r in rig])
+    lo, hi = allX.min(axis=0), allX.max(axis=0)
     centre, size = (lo + hi) / 2, float(np.linalg.norm(hi - lo))
     frd_cache: dict = {}
 
@@ -269,7 +364,7 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
             remote.update(read_json(d / "deck_info.json").get("remote_loads", {}))
     jobs: list[dict] = []                     # the images, drawn together at the end (_render_jobs)
     setup = lambda: images.insert(0, _setup_view(study, model, instances, X, cells, pos, facet_index,  # noqa: E731
-                                                 centre, size, out, views["iso"], remote))
+                                                 centre, size, out, views["iso"], remote, rig))
     for case in results["load_cases"]:
         frd, step_of, zone = frd_for(case)
         k = step_of[case]
@@ -285,8 +380,11 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
         sel = pos[sn[keep]] >= 0
         vm[pos[sn[keep]][sel]] = von_mises(sv[keep][sel, :6])
         umag = np.linalg.norm(U, axis=1)
-        scale = defaults.PLOT_DEFORM_FRACTION * size / umag.max() if umag.max() > 0 else 0.0
+        rig_lc = results["load_cases"][case]
+        umax = max([umag.max()] + [m["max_disp"] for m in (rig_lc.get("rigid_parts") or {}).values()])
+        scale = defaults.PLOT_DEFORM_FRACTION * size / umax if umax > 0 else 0.0
         deformed = (X + scale * U, cells)
+        rig_still, rig_moved = _rigid_shapes(rig, None, 0.0), _rigid_shapes(rig, rig_lc, scale)
         undeformed = (X, cells)
         # stress and factor of safety are not shown on the joint edges (the elements on a joint's edge line): their
         # values there are artefacts of how a joint is modelled (a hinge's rigid ring, a bond's sharp edge) and grow
@@ -339,13 +437,14 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
         for view, cam in views.items():
             p = out / f"{safe}_displacement_{view}.png"
             jobs.append(dict(mesh=deformed, scalars=umag, title="Displacement mm", clim=None, cmap="jet", path=p,
-                             centre=centre, size=size, view=cam, note=f"(deformed shape x{scale:.3g})", markers=mk_u))
+                             centre=centre, size=size, view=cam, note=f"(deformed shape x{scale:.3g})", markers=mk_u,
+                             rigid=rig_moved))
             images.append(p.name)
             p = out / f"{safe}_vonmises_{view}.png"
             jobs.append(dict(mesh=undeformed, scalars=vm_plot, title="von Mises MPa", clim=vm_clim, cmap="jet", path=p,
                              centre=centre, size=size, view=cam,
                              note=(grey + (peak_note if vm_clim else "")).strip(), markers=mk_vm,
-                             beyond="above" if vm_clim else None))
+                             beyond="above" if vm_clim else None, rigid=rig_still))
             images.append(p.name)
             p = out / f"{safe}_fos_{view}.png"
             low = fos_clim[0] > 0
@@ -354,7 +453,7 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
                              note=f"(colour scale capped at {defaults.PLOT_FOS_CAP:g}){grey}"
                                   + ("  magenta: local peaks, FoS below the assessed (membrane + bending) minimum"
                                      if low else ""), markers=mk_fos,
-                             beyond="below" if low else None))
+                             beyond="below" if low else None, rigid=rig_still))
             images.append(p.name)
     for case, bk in results.get("buckling", {}).items():
         on_progress(f"rendering buckling modes of {case}")
@@ -371,7 +470,8 @@ def render_all(study: Path, model: Model, case_dirs: dict, results: dict, level:
                 p = out / f"{case.replace(' ', '_')}_buckling_mode{i}_{view}.png"
                 jobs.append(dict(mesh=(X + scale * U, cells), scalars=umag / max(umag.max(), 1e-30),
                                  title="relative displacement", clim=(0, 1), cmap="jet", path=p, centre=centre,
-                                 size=size, view=views[view], note=f"(load factor {factor:.4g})"))
+                                 size=size, view=views[view], note=f"(load factor {factor:.4g})",
+                                 rigid=_rigid_shapes(rig, None, 0.0)))
                 images.append(p.name)
     on_progress(f"drawing {len(jobs) + 1} plot images")
     _render_jobs(jobs, also=setup)
@@ -471,7 +571,7 @@ def _marks(ext: dict, rows: dict, P: np.ndarray, fmt: str, cap: float | None = N
 
 
 def _setup_view(study, model, instances, X, cells, pos, facet_index, centre, size, out: Path, cam,
-                remote: dict | None = None) -> str:
+                remote: dict | None = None, rig: list | None = None) -> str:
     """Grey model, fixtures in blue, loaded faces in red, arrows for load directions."""
     geo = read_json(study / "geometry.json")
     face_map = {k: tuple(v) for k, v in geo["face_map"].items()}
@@ -479,6 +579,8 @@ def _setup_view(study, model, instances, X, cells, pos, facet_index, centre, siz
     pl = pv.Plotter(off_screen=True, window_size=defaults.PLOT_SIZE)
     pl.set_background("white")
     pl.add_mesh(pv.PolyData(X, cells), color="lightgrey", opacity=0.6)
+    for r in rig or []:
+        add_rigid(pl, r["V"], r["F"], opacity=0.6)
 
     def face_mesh(fid):
         part, idx = face_map[fid]
@@ -527,9 +629,41 @@ def _setup_view(study, model, instances, X, cells, pos, facet_index, centre, siz
                 c = np.asarray(fm.center)
                 pl.add_arrows(np.array([c - d / np.linalg.norm(d) * 0.12 * size]),
                               np.array([d / np.linalg.norm(d)]), mag=0.12 * size, color="red")
-    pl.add_text("set-up: fixtures blue, loaded faces red", font_size=9, color="black")
+    pl.add_text("set-up: fixtures blue, loaded faces red" + ("; rigid parts white, hatched" if rig else ""), font_size=9,
+                color="black")
     _camera(pl, centre, size, cam)
     path = out / "setup_iso.png"
     pl.screenshot(str(path))
     pl.close()
     return path.name
+
+
+def render_fatigue(study: Path, model: Model, level: str, fields: dict, markers: list, out_dir: Path) -> list[str]:
+    """The fatigue damage plot (release 2 F4, D107): log10 of the damage over the design life on the assembly's
+    surface, from the assessed nodes (fields: {part: (node ids, damage)}); grey where not assessed (joint bands,
+    support and load edges, parts not assessed). markers: [(point, label)]. Images per view in out_dir."""
+    from ..pipeline import build_instances
+    instances = build_instances(study, model, level)
+    X, cells, ids, pos, owner, facet_index = _surface(instances)
+    lo, hi = X.min(axis=0), X.max(axis=0)
+    centre, size = (lo + hi) / 2, float(np.linalg.norm(hi - lo))
+    val = np.full(len(ids), np.nan)
+    for part, (nid, D) in fields.items():
+        nid = np.asarray(nid, dtype=np.int64)
+        keep = nid < len(pos)
+        nid, D = nid[keep], np.asarray(D)[keep]
+        sel = pos[nid] >= 0
+        val[pos[nid[sel]]] = np.log10(np.maximum(D[sel], 1e-30))
+    if not np.isfinite(val).any():
+        return []
+    top = max(0.0, float(np.nanmax(val)))
+    clim = (min(float(np.nanmin(val)), top - 6.0), top)
+    mesh = pv.PolyData(X, cells)
+    images = []
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, view in views_for(model, study).items():
+        path = out_dir / f"fatigue_damage_{name}.png"
+        _shot(mesh, val, "log10 damage", (max(clim[0], top - 8.0), clim[1]), "jet", path, centre, size, view,
+              note="damage over the design life: 0 = failure; grey: not assessed", markers=markers)
+        images.append(path.name)
+    return images

@@ -43,6 +43,17 @@ def mesh_levels(two: bool) -> list[str]:
             "not measured."]
 
 
+def holes(n: int) -> list[str]:
+    """Free holes meshed finer round their edges (D101)."""
+    if not n:
+        return []
+    from .. import defaults
+    return [f"Holes with no bolt, pin or fixture in them ({n} here) are meshed finer round their edges, about "
+            f"{defaults.HOLE_ELEMENTS} elements round the hole, so their notch peaks are resolved (within about 1 % "
+            f"of the textbook value on a plate with a hole). Peaks at bolt holes, pins and fixtures depend on how "
+            f"those are modelled and are not resolved this way."]
+
+
 def ties(n_ties: int) -> list[str]:
     if not n_ties:
         return []
@@ -63,6 +74,22 @@ def removed(removed_parts: dict[str, str]) -> list[str]:
     if user:
         out.append(f"Parts left out of the analysis by the user ({', '.join(user)}); their stiffness and weight are not "
                    "included. They are not suppressed in SolidWorks.")
+    return out
+
+
+def rigid(groups: list[dict]) -> list[str]:
+    """Rigid parts (D96): [{"id", "parts", "mass"}] per group."""
+    if not groups:
+        return []
+    parts = [p for g in groups for p in g["parts"]]
+    together = [g for g in groups if len(g["parts"]) > 1]
+    out = [f"Parts set as rigid by the user ({', '.join(parts)}) are not meshed and carry no stress: each moves as one "
+           "rigid body" + (", and rigid parts bonded to each other move together" if together else "") + ". Their weight "
+           "(density from the SolidWorks material times the CAD volume) acts at their centre of mass; loads and fixtures "
+           "on their faces act on the rigid body. Their own strength is not checked."]
+    out.append("A face of another part bonded to a rigid part cannot deform where it is bonded, which stiffens that part "
+               "locally compared with a real, flexible neighbour; the stress at the edge of that bond is a modelling "
+               "artefact and is not assessed (as at any bonded joint).")
     return out
 
 
@@ -95,8 +122,9 @@ def bolted(joints: list[dict]) -> list[str]:
     if pre:
         names = ", ".join(f"{j['fastener']} ({j['preload']:g} N)" for j in pre)
         out.append(f"Preloaded bolts: {names}. Each bolt is an axial spring of its own stiffness (E x nominal area / "
-                   "grip length) between the centres of the bearing faces under head and nut, with the preload as a "
-                   "constant force pair; the bearing faces are joined to the bolt over an annulus of 0.8 x the bolt "
+                   "grip length) between the centres of the bearing faces under head and nut. It is first tightened "
+                   "to exactly its preload, then its length is locked, so under load its tension is the preload plus "
+                   "its stiffness x its stretch since tightening; the bearing faces are joined to the bolt over an annulus of 0.8 x the bolt "
                    "diameter. Bending of the bolt and thread flexibility are not modelled. The clamped faces are in "
                    "frictional contact, so the joint can open, and the bolt force is reported per load case.")
     return out
@@ -295,4 +323,83 @@ def weld_checks(load_cases: dict, names: bool = True) -> list[str]:
     if out:
         out.append("If the loads are repeated (cyclic), a fatigue assessment of the welded joints is recommended; "
                    "this static analysis does not cover fatigue.")
+    return out
+
+
+def fatigue(doc: dict) -> list[str]:
+    """The fatigue report's assumptions (release 2, D105-D107), from results/fatigue.json."""
+    out = [
+        "Fatigue is assessed on the linear static results of each load case: the stresses scale with the load, and "
+        "within a spectrum row the loading is proportional (the stress directions do not turn between its two "
+        "states).",
+        "Each spectrum row is one cycle between two load states, repeated its number of times. Damage is summed by "
+        "Miner's rule (the cycles over the cycles to failure, row by row). Larger cycles that run from one row's "
+        "maximum to another row's minimum are not counted unless they are given as a row of their own; a spectrum "
+        "from a measured history would need rainflow counting first.",
+        f"The stress range at a point is the principal stress of largest magnitude of the change in the stress "
+        f"between the row's two states ({'the signed von Mises range' if doc.get('range_measure') == 'signed_von_mises' else 'EN 1993-1-9 Annex B, for nearly proportional loading'}); "
+        "the mean stress is the largest principal of the average of the two states.",
+        "The fatigue factor is the factor on every stress (range and mean together) at which the damage over the "
+        "design life would reach 1.",
+        "The governing stress range of each part and joint is required to agree within "
+        "5 % between the last two meshes. Life goes roughly as the stress range to the power 3 to 10, so a 5 % "
+        "stress difference is 15 % to 60 % in life.",
+        "Parent material is read only where a notch peak is finite: the bands round bonded joints, the edges of "
+        "loaded faces and fixtures, and sharp inside corners (modelled with no radius) are left out, as their "
+        "elastic stress has no finite value. Free holes and fillets are meshed finely enough to resolve their peaks "
+        "(within about 1 % of converged on the reference cases).",
+    ]
+    if doc.get("mean_stress") and doc["mean_stress"] != "none":
+        out.append(f"A user's S-N curve is taken as fully reversed (zero mean stress); a cycle with a tensile mean is "
+                   f"corrected to an equivalent fully reversed amplitude by the {doc['mean_stress'].title()} rule, "
+                   "using the material's ultimate strength. A compressive mean is given no credit. The standards' "
+                   "curves already include the effect of residual stress and take no correction.")
+    else:
+        out.append("No mean-stress correction is made: the S-N data is taken to allow for the mean stress already.")
+    if any(p.get("curve_estimated") for p in doc.get("parts", {}).values()):
+        out.append("Where no S-N data was given or stored with the SolidWorks material, AsmFEA's built-in data is "
+                   "used: measured mean curves (MIL-HDBK-5J) for the alloys it covers, otherwise a curve ESTIMATED from "
+                   "the material's tensile strength (the Uniform Material Law for steels and wrought aluminium, the "
+                   "FKM fatigue-limit ratio for stainless). Both are reduced to a design curve (x 0.75 on stress) and, "
+                   "for steel, by a surface factor for the finish (hot-rolled unless chosen). Estimates are typical "
+                   "values for the material class, not data for the actual material: use measured data where the "
+                   "result matters.")
+    if doc.get("joints"):
+        w1 = [j for j in doc["joints"].values() if j["method"].startswith("W1")]
+        if w1:
+            out.append("Bonded (welded) joints: the structural stress at the weld toe is found from the forces each "
+                       "joint carries (Dong's method: the membrane and bending stress of the wall, from equilibrium, "
+                       "in windows along the joint), and read on the standard's structural (hot-spot) stress curve. "
+                       "At the corners of a tube this stress needs a refined mesh: on a reference T-joint the "
+                       "standard mesh read 18 % high and the locally refined mesh 2 % high, against a solid model "
+                       "of the same joint.")
+        if any(j["method"].startswith("W2") for j in doc["joints"].values()):
+            out.append("Joints assessed by their nominal stress use beam theory over the joint's whole section and "
+                       "the detail category given for each; the category must suit the joint's real detail.")
+        walls = doc.get("walls", {}).values()
+        if any("hand formulae" in w["method"] for w in walls):
+            out.append("The wall a hollow-section brace is welded onto (the chord's face) is assessed, for square-on "
+                       "T-joints inside their range, by the published hand formulae for welded joints (van Wingerde "
+                       "1992, the basis of CIDECT design guide 8 and IIW XV-1035-99): the stress concentration factors "
+                       "on the chord's hot-spot lines, times the brace's axial and in-plane bending stresses from the "
+                       "forces the joint carries, plus the chord's own stress beside the joint, added as absolute "
+                       "values. They are for welded joints, so these figures are what a welded joint shows. The "
+                       "formulae apply from 4 mm walls; welds started at the brace's corners can be markedly worse.")
+        if any("indicative" in w["method"] for w in walls):
+            out.append("Where the formulae do not apply (out-of-plane bending of the brace, other joint shapes), the "
+                       "wall's hot-spot stress is read from the bonded model at 0.4 and 1.0 wall thicknesses from the "
+                       "joint's edge, as an indication only: on a reference joint it read from 40 % low (coarse "
+                       "meshes) to 30 % high (refined meshes; the bonded model has no weld bead, which raises it) "
+                       "against a solid model and the formulae.")
+        out.append("The weld's root and throat are not modelled, so root failure of partial-penetration and fillet "
+                   "welds is not covered.")
+    if doc.get("bolts"):
+        out.append("Preloaded bolts are assessed on the range of their axial tension, from their preloaded state, on "
+                   "the tensile stress area. Bolt bending and shear are not modelled.")
+    if doc.get("gamma_Ff", 1) != 1 or doc.get("gamma_Mf", 1) != 1:
+        out.append(f"Partial factors: {doc['gamma_Ff']:g} on the stress ranges and {doc['gamma_Mf']:g} on the "
+                   "fatigue strength.")
+    else:
+        out.append("No partial factors are applied (gamma_Ff = gamma_Mf = 1): the design curves are the standards' "
+                   "(mean minus two standard deviations), or the user's curves as given.")
     return out

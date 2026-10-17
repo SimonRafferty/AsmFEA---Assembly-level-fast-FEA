@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Xml;
 
 namespace AsmFea.Extract
@@ -15,6 +16,9 @@ namespace AsmFea.Extract
         public string Name;
         public string Library;
         public double? E, Nu, Density, Yield, Ultimate;   // MPa, -, tonne/mm^3, MPa, MPa
+        /// <summary>S-N curves stored with the material (its Fatigue SN Curves tab; materialcurve type 19): the stress
+        /// ratio and [cycles, stress amplitude MPa] points (D109).</summary>
+        public readonly List<Tuple<double, List<double[]>>> SnCurves = new List<Tuple<double, List<double[]>>>();
 
         public bool Complete { get { return E.HasValue && Nu.HasValue && Density.HasValue && Yield.HasValue; } }
 
@@ -30,6 +34,10 @@ namespace AsmFea.Extract
         {
             var o = new JObj { { "name", Name }, { "E", E.Value }, { "nu", Nu.Value }, { "density", Density.Value }, { "yield", Yield.Value } };
             if (Ultimate.HasValue) o["ultimate"] = Ultimate.Value;
+            if (SnCurves.Count > 0)
+                o["sn_curves"] = SnCurves.Select(c => (object)new JObj {
+                    { "r_ratio", c.Item1 }, { "points", c.Item2.Select(p => (object)new List<object> { p[0], p[1] }).ToList() },
+                    { "source", "SolidWorks material library " + Library } }).ToList();
             return o;
         }
     }
@@ -62,6 +70,28 @@ namespace AsmFea.Extract
                     if (c.LocalName != "physicalproperties") continue;
                     foreach (XmlNode q in c.ChildNodes)
                     {
+                        if (q.LocalName == "materialcurve" && q.Attributes?["type"]?.Value == "19")
+                        {
+                            // an S-N curve: <data points="N S_Pa"/> rows, then <data extraparam="R"/> (the stress ratio;
+                            // -1 fully reversed, as the library's own (SN) materials). Stress amplitude (D109; LIVE-T21)
+                            var pts = new List<double[]>();
+                            double r = -1;
+                            foreach (XmlNode d in q.ChildNodes)
+                            {
+                                var ps = d.Attributes?["points"]?.Value;
+                                var ex = d.Attributes?["extraparam"]?.Value;
+                                double rr;
+                                if (ex != null && double.TryParse(ex, NumberStyles.Float, CultureInfo.InvariantCulture, out rr)) r = rr;
+                                if (ps == null) continue;
+                                var parts = ps.Split(new[] { ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                                double n, sv;
+                                if (parts.Length >= 2 && double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out n)
+                                    && double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out sv) && n > 0 && sv > 0)
+                                    pts.Add(new[] { n, sv * Units.PA_TO_MPA });
+                            }
+                            if (pts.Count >= 2) p.SnCurves.Add(Tuple.Create(r, pts));
+                            continue;
+                        }
                         double v;
                         var s = q.Attributes?["value"]?.Value;
                         if (s == null || !double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out v)) continue;

@@ -105,6 +105,8 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
                 "max_disp": float(umag[ju]) if has_u else 0.0,
                 "max_disp_at": at(un[ju]) if has_u else None,
             }
+        # kept apart: they have no stress to assess (D96); their motion from the printed reference nodes
+        rigid = rigid_parts(deck_info, dat["nodal"].get(k, {}).get(("displacements", "RGREF"), {}))
         applied = np.asarray(deck_info["load_cases"][case]["applied"])
         # CalculiX's RF omits load applied straight onto constrained DOFs; the deck
         # writer computed that share, so the balance compares like with like.
@@ -112,7 +114,9 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
         reaction = dat["totals"].get(k, {}).get("FIXALL")
         # load passed into a pin through a joint on it goes to the pin's reference node, where no reaction is
         # printed: the joint's side B nodes print it instead (deck "pin_joint_sets")
-        for pset in deck_info.get("pin_joint_sets", []):
+        # ... and the rigid groups' coupled nodes (D96): the force each group exerts on them, less the load on them
+        # and the group's own load (both counted in into_supports), is the group's reaction to the ground
+        for pset in deck_info.get("pin_joint_sets", []) + deck_info.get("rigid_support_sets", []):
             more = dat["totals"].get(k, {}).get(pset)
             if more is not None:
                 reaction = (np.asarray(reaction, float) if reaction is not None else np.zeros(3)) + np.asarray(more, float)
@@ -181,8 +185,37 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
             "support_reaction": None if reaction is None else (reaction - supports + held).tolist(),
             "reaction_balance_err": balance,
             "parts": parts,
+            **({"rigid_parts": rigid} if rigid else {}),
         }
+        far = max(rigid.items(), key=lambda kv: kv[1]["max_disp"], default=None)
+        if far is not None and far[1]["max_disp"] > umax:
+            # a rigid part moving further than any meshed point (a long rigid arm): the model's largest displacement
+            out_cases[case].update(max_disp=far[1]["max_disp"], max_disp_at=far[1]["max_disp_at"], max_disp_part=far[0],
+                                   max_disp_vector=far[1]["max_disp_vector"])
     return {"load_cases": out_cases}, diags
+
+
+def rigid_parts(deck_info: dict, printed: dict) -> dict:
+    """Results of the rigid parts (D96): no stress (not meshed: no peak, no factor of safety), and the largest
+    displacement of each, its group's rigid motion (the reference node's translation t, the rotation node's turn
+    theta) at the corners of its convex hull."""
+    from ..deck.rigid import motion_at
+    out = {}
+    groups = (deck_info.get("rigid") or {}).get("groups", [])
+    if not groups:
+        return out
+    for g in groups:
+        t = np.asarray(printed.get(int(g["ref_node"]), np.zeros(3)), float)
+        th = np.asarray(printed.get(int(g["rot_node"]), np.zeros(3)), float)
+        for pid, d in g.get("parts_data", {}).items():
+            X = np.asarray(d.get("hull") or [d["cog"]], float).reshape(-1, 3)
+            U = motion_at(t, th, np.asarray(g["at"], float), X)
+            m = np.linalg.norm(U, axis=1)
+            i = int(np.argmax(m))
+            out[pid] = {"rigid_group": g["id"], "max_disp": float(m[i]), "max_disp_at": np.round(X[i], 4).tolist(),
+                        "max_disp_vector": U[i].tolist(),
+                        "rigid_translation": t.tolist(), "rigid_rotation": th.tolist()}
+    return out
 
 
 def _contact_and_bolts(info: dict, blocks: dict, dat: dict, step: int, applied: np.ndarray, case: str,
@@ -204,16 +237,31 @@ def _contact_and_bolts(info: dict, blocks: dict, dat: dict, step: int, applied: 
             status["max_pressure"] = float(cstr[1][:, 0].max())
         out["contact"] = status
     if info.get("bolts"):
-        # bolt tension = preload + k x elongation. The reference nodes follow the weighted
+        # bolt tension = k x the spring's stretch (a pre-tension bolt, D103), or preload + k x elongation (decks
+        # written before it, with the preload as a force pair). The reference nodes follow the weighted
         # mean of their bearing annuli (equations in the deck); the annulus mean is the
         # fallback when the results do not carry the reference nodes.
         pos = {int(n): i for i, n in enumerate(un)}
+        # the .frd leaves out nodes on no element (a pre-tension bolt's nut reference node and its adjustment):
+        # every bolt node is printed to the .dat in every step (BOLTNODES)
+        printed = dat.get("nodal", {}).get(step, {}).get(("displacements", "BOLTNODES"), {})
         bolts = {}
         for b in info["bolts"]:
             hn = [pos[n] for n in b.get("head_nodes", []) if n in pos]
             nn = [pos[n] for n in b.get("nut_nodes", []) if n in pos]
             axis = np.asarray(b["axis"], float)
-            if b.get("head_node") in pos and b.get("nut_node") in pos:
+            ends = [b.get(k) for k in ("head_node", "nut_node", "spring_node")]
+            if b.get("spring_node") is not None and all(n in printed for n in ends):
+                # a pre-tension bolt (D103): the spring runs from the head to its own end node, so its stretch is
+                # the tension (exactly the preload after tightening); the elongation stays head to nut
+                uh, un_, us = (np.asarray(printed[n], float)[:3] for n in ends)
+                elong = float(np.dot(uh - un_, axis))
+                stretch = float(np.dot(uh - us, axis))
+                bolts[b["fastener"]] = {"preload": b["preload"], "elongation": elong,
+                                        "force": b["k"] * stretch, "stiffness": b["k"]}
+            elif b.get("spring_node") is not None:
+                bolts[b["fastener"]] = {"preload": b["preload"], "force": None}     # never the force-pair formula
+            elif b.get("head_node") in pos and b.get("nut_node") in pos:
                 elong = float(np.dot(uv[pos[b["head_node"]], :3] - uv[pos[b["nut_node"]], :3], axis))
                 bolts[b["fastener"]] = {"preload": b["preload"], "elongation": elong,
                                         "force": b["preload"] + b["k"] * elong, "stiffness": b["k"]}
@@ -418,14 +466,14 @@ CHECK_TEXT = {
                  ["If it fails: look for parts that are not connected (Connections tab, exceptions) or loads applied "
                   "on fixed faces."]),
     "deflection": ("The largest displacement anywhere in the model under load case {case}, found in {part}, against "
-                   "the maximum deflection set under Pass / fail criteria on the Study tab.",
+                   "the maximum deflection set under How to solve and pass/fail criteria on the Run tab.",
                    ["If it fails: stiffen the part that moves most (a deeper section, a brace, a shorter span) or "
                     "relax the limit if it was too strict."]),
     "fos": ("The lowest factor of safety under load case {case}, in {part}: the material's yield strength divided by "
             "the von Mises stress of membrane plus bending: the stress averaged through the wall plus its linear "
             "part, everywhere including round the joints. Local peaks (notches, the spikes at sharp joint edges, "
             "which have no finite value in a model with sharp corners) are left out, as static design codes do. "
-            "Compared with the minimum set under Pass / fail criteria on the Study tab.",
+            "Compared with the minimum set under How to solve and pass/fail criteria on the Run tab.",
             ["If it fails: look at the stress plot for where it peaks, then strengthen there (thicker, a larger "
              "section, a gusset or a bigger weld) or use a stronger material.",
              "A peak marked singular is at a sharp corner or edge where stress has no finite value: refine there "
@@ -445,7 +493,7 @@ CHECK_TEXT = {
                   ["Check the weld at the named part's end by hand (throat size, EN 1993-1-8), or with a fatigue "
                    "assessment if the load cycles."]),
     "stress": ("The highest von Mises stress of membrane plus bending under load case {case}, in {part}, against "
-               "the allowable stress set under Pass / fail criteria on the Study tab.",
+               "the allowable stress set under How to solve and pass/fail criteria on the Run tab.",
                ["If it fails: strengthen where the stress plot peaks, or use a material with a higher allowable."]),
     "buckling": ("The lowest buckling load factor for load case {case}: how many times the load the structure can "
                  "carry before it buckles. Below 1 it buckles under the load as applied.",

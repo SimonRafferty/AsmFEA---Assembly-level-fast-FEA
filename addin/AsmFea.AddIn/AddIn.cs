@@ -15,8 +15,8 @@ using SolidWorks.Interop.swconst;
 using SolidWorks.Interop.swpublished;
 
 [assembly: AssemblyTitle("AsmFEA SolidWorks add-in")]
-[assembly: AssemblyVersion("0.9.0.0")]
-[assembly: AssemblyFileVersion("0.9.0.0")]
+[assembly: AssemblyVersion("0.10.0.0")]
+[assembly: AssemblyFileVersion("0.10.0.0")]
 
 namespace AsmFea.AddIn
 {
@@ -39,7 +39,7 @@ namespace AsmFea.AddIn
         string ListStudies();
         /// <summary>Select the faces of the given face_ref ids (JSON array) from the study's model.json; returns how many were found.</summary>
         int HighlightFaces(string study, string faceRefIdsJson);
-        /// <summary>Show the task pane on a tab ("Study", "Loads and fixtures", "Connections", "Run", "Results")
+        /// <summary>Show the task pane on a tab ("Loads", "Connections", "Run", "Results", "Fatigue"; the old "Study" and "Loads and fixtures" still work)
         /// and, with a path, save the pane as a PNG (documentation screenshots). Returns the pane size "w x h".</summary>
         string CapturePane(string tab, string path);
         /// <summary>Add a fixture or load (JSON) to the faces selected in SolidWorks; returns its id.</summary>
@@ -72,6 +72,12 @@ namespace AsmFea.AddIn
         private readonly StudyRegistry registry = new StudyRegistry();
         private TaskpaneView paneView;
         private StudyPane pane;
+        private ColourView colours;           // the Connections tab's colour view (D98)
+        private Tuple<IModelDoc2, IList<JObj>, ICollection<string>> colourArgs;   // what it shows, to show again after a save
+        private bool selecting;               // the add-in is selecting: not the user's pick
+
+        /// <summary>The user selected something in a document (the Connections tab's two-way selection, D98).</summary>
+        public event Action<IModelDoc2> UserSelected;
 
         public string Version
         {
@@ -124,6 +130,16 @@ namespace AsmFea.AddIn
             try { cmdMgr.RemoveCommandGroup2(CMD_GROUP_ID, true); } catch { }
 
             // studies live in the assemblies: watch every assembly that is or becomes open
+            colours = new ColourView(sw);
+            registry.UserSelected += d => { if (!selecting) UserSelected?.Invoke(d); };
+            // never saved with the view's colours: off before the write (LIVE-T13), back on after it
+            registry.BeforeSave += d => { if (colours != null && colours.IsOn) colours.Clear(); };
+            registry.AfterSave += d =>
+            {
+                if (colourArgs != null && !colours.IsOn && ReferenceEquals(colourArgs.Item1, d))
+                    try { colours.Show(colourArgs.Item1, colourArgs.Item2, colourArgs.Item3, false); } catch { }
+            };
+            registry.Leaving += d => { if (colours != null && colours.IsOn) { colours.Clear(); colourArgs = null; } };
             var events = (SldWorks)sw;
             events.DocumentLoadNotify2 += OnDocumentLoad;
             events.FileNewNotify2 += (object doc, int type, string template) => { registry.Attach(doc as IModelDoc2); return 0; };
@@ -147,6 +163,7 @@ namespace AsmFea.AddIn
                 app.FileCloseNotify -= OnFileClose;
             }
             catch { }
+            try { colours?.Clear(); } catch { }
             try { paneView?.DeleteView(); } catch { }
             pane?.Dispose();
             pane = null;
@@ -162,7 +179,11 @@ namespace AsmFea.AddIn
         {
             try { pane?.DocumentOpened(path); } catch { }
             foreach (var d in ((object[])sw.GetDocuments() ?? new object[0]).OfType<IModelDoc2>())
-                if (string.Equals(d.GetPathName(), path, StringComparison.OrdinalIgnoreCase)) registry.Attach(d);
+                if (string.Equals(d.GetPathName(), path, StringComparison.OrdinalIgnoreCase))
+                {
+                    registry.Attach(d);
+                    try { ColourView.RestoreLeftovers(d); } catch { }    // a colour view a crash left in it (D98)
+                }
             return 0;
         }
 
@@ -192,7 +213,9 @@ namespace AsmFea.AddIn
 
         private int OnActiveDocChange()
         {
-            registry.Attach(sw.ActiveDoc as IModelDoc2);
+            var active = sw.ActiveDoc as IModelDoc2;
+            if (colours != null && colours.IsOn && !ReferenceEquals(colours.Doc, active)) { colours.Clear(); colourArgs = null; }
+            registry.Attach(active);
             try { pane?.RefreshDocument(); } catch { }
             return 0;
         }
@@ -337,7 +360,14 @@ namespace AsmFea.AddIn
             return n;
         }
 
-        private static int SelectFaceRefs(IModelDoc2 doc, List<object> refs, ICollection<string> ids, bool append)
+        private int SelectFaceRefs(IModelDoc2 doc, List<object> refs, ICollection<string> ids, bool append)
+        {
+            selecting = true;
+            try { return SelectFaceRefsNow(doc, refs, ids, append); }
+            finally { selecting = false; }
+        }
+
+        private static int SelectFaceRefsNow(IModelDoc2 doc, List<object> refs, ICollection<string> ids, bool append)
         {
             var faces = new List<object>();
             foreach (JObj fr in refs.OfType<JObj>())
@@ -461,6 +491,8 @@ namespace AsmFea.AddIn
             return path;
         }
 
+        public string ModelSignature(IModelDoc2 doc) { return Extractor.ModelSignature(doc); }
+
         public JObj FaceRefFromSelection(IModelDoc2 doc, IFace2 face, string id)
         {
             return new Extractor(sw, Version).FaceRefFromSelection(doc, face, id);
@@ -472,6 +504,13 @@ namespace AsmFea.AddIn
         }
 
         public void SelectComponents(IModelDoc2 doc, IEnumerable<string> partIds)
+        {
+            selecting = true;
+            try { SelectComponentsNow(doc, partIds); }
+            finally { selecting = false; }
+        }
+
+        private void SelectComponentsNow(IModelDoc2 doc, IEnumerable<string> partIds)
         {
             doc.ClearSelection2(true);
             if (doc.GetType() == (int)swDocumentTypes_e.swDocPART)
@@ -515,6 +554,69 @@ namespace AsmFea.AddIn
                 return body != null && body.Select2(true, null);
             }
             catch { return false; }
+        }
+
+        /// <summary>The selection as the analysis names it (D98): each component or body as its part id(s), each face as a
+        /// face_ref (its part, fingerprint and persistent reference), each edge or vertex as its component.</summary>
+        public IList<SelItem> SelectionItems(IModelDoc2 doc)
+        {
+            var found = new List<SelItem>();
+            if (doc == null) return found;
+            var sm = (ISelectionMgr)doc.SelectionManager;
+            bool isPart = doc.GetType() == (int)swDocumentTypes_e.swDocPART;
+            for (int i = 1; i <= sm.GetSelectedObjectCount2(-1); i++)
+            {
+                object o = sm.GetSelectedObject6(i, -1);
+                try
+                {
+                    var face = o as IFace2;
+                    // an edge stands for the narrower of its two faces (a sheet's edge: its thickness face), so an edge
+                    // can be joined to an edge or a face, as a weld line (the user, 2026-10-16)
+                    var edge = o as IEdge;
+                    if (face == null && edge != null)
+                        face = ((object[])edge.GetTwoAdjacentFaces2() ?? new object[0]).OfType<IFace2>()
+                               .OrderBy(f => f.GetArea()).FirstOrDefault();
+                    if (face != null)
+                    {
+                        var fr = FaceRefFromSelection(doc, face, "SEL" + i);
+                        found.Add(new SelItem((string)fr["part"], fr));
+                        continue;
+                    }
+                    var body = o as IBody2;
+                    if (isPart)
+                    {
+                        var mine = Extractor.BodiesOfPart(doc);
+                        if (body != null) found.AddRange(mine.Where(b => b.Body.Name == body.Name).Select(b => new SelItem(b.Id)));
+                        else if (mine.Count == 1) found.Add(new SelItem(mine[0].Id));
+                        continue;
+                    }
+                    var comp = o as IComponent2 ?? sm.GetSelectedObjectsComponent4(i, -1) as IComponent2;   // LIVE-T10
+                    if (comp == null) continue;
+                    if (body != null)
+                    {
+                        var hit = Extractor.BodiesOf(comp).FirstOrDefault(b => b.Body.Name == body.Name);
+                        found.Add(new SelItem(hit != null ? hit.Id : comp.Name2));
+                    }
+                    else found.Add(new SelItem(comp.Name2));
+                }
+                catch (Exception e) { StudyPane.Trace("selection item " + i + " not read: " + e.Message); }
+            }
+            return found;
+        }
+
+        public string ShowColours(IModelDoc2 doc, IList<JObj> sides, ICollection<string> rigidParts, bool zoom)
+        {
+            if (colours == null || doc == null) return "no document";
+            colourArgs = Tuple.Create(doc, sides, rigidParts);
+            selecting = true;
+            try { return colours.Show(doc, sides, rigidParts, zoom); }
+            finally { selecting = false; }
+        }
+
+        public void ClearColours()
+        {
+            colourArgs = null;
+            try { colours?.Clear(); } catch (Exception e) { StudyPane.Trace("colour view: " + e.Message); }
         }
 
         public IList<IFace2> SelectedFaces(IModelDoc2 doc)

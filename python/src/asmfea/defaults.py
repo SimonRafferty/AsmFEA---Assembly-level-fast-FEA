@@ -205,6 +205,48 @@ SOLID_SKIN_SPAN_DIV = 20.0
 SOLID_SKIN_FILL = 0.6          # ... and only a solid that fills most of its box: a plate or bar, not a frame of tubes
                                # (a fused tee of two SHS passed the aspect test and was skin-swept through its walls)
 SKIN_FALLBACK_SIZE_T = 1.0     # a sheet tet-meshed instead (sweep refused): tet size = thickness (D30), guess
+# Free holes (D101): a hole no connection or fixture uses (a concave cylinder through a wall, or any concave cylinder
+# of a tet-meshed solid) is meshed at HOLE_ELEMENTS elements round its edge at standard fidelity, scaled like every
+# size by fidelity and level, growing back to the part's size away from it. Before, curvature sizing was held at
+# MESH_SIZE_MIN_FRACTION x the size: a 20 mm hole in a 5 mm plate had 9 elements round it and a peak 16 % low
+# (Gusset comparison, m13). Gmsh holds every size field to its minimum size, and lowering that minimum let curvature
+# sizing refine every bend too (a bumper with 8 holes: 16 500 -> 44 000 triangles), so a part with free holes is
+# meshed twice: as before, then again with that mesh's own sizes as the field away from the holes (26 600).
+# Calibrated on m13 (Howland's 62.75 MPa at d/W = 0.2), with HOLE_NEAR_R 0.25: 24, 36 and 48 elements gave -0.7 %,
+# +0.1 % and 0.0 % (7 100, 9 500 and 11 000 DOF; 3 700 and -16 % before); a near band of 0.1 r: -1.4 %, -0.3 %, -0.4 %.
+HOLE_ELEMENTS = 36
+HOLE_NEAR_R = 0.25             # the hole's own size out to this x its radius from the edge, where the stress falls
+                               # most steeply, guess
+HOLE_SIZE_GRADIENT = 0.5       # ... then growing by this per unit distance (0.5: each element about 1.5 x the one
+                               # before) to the part's size, guess
+HOLE_SIZE_MIN_FRACTION = 0.1   # never below this x the part's element size at that level (a 2 mm hole in a 10 mm
+                               # plate would otherwise be meshed at 0.26 mm), guess
+HOLE_BORE_T = 2.5              # a hole through a swept wall: bore no longer than this x the thickness (an RHS's inner
+                               # corner radius is concave too, but runs along the member), guess
+HOLE_BORE_D = 5.0              # ... and on any part no longer than this x its diameter: a drilled hole, not the inside
+                               # of a tube modelled as a solid (m6_column's 2000 mm bore), guess
+HOLE_MAX_PER_PART = 200        # more free holes than this on one part (a perforated sheet): none refined, guess
+# Fillets (F1, PLAN-FATIGUE.md): the same treatment for a concave fillet no connection or fixture uses. A sheet's
+# outline fillet is a cylinder through the wall and was a "hole" already; on a solid a fillet is a cylinder spanning
+# less than a full turn, or a torus (a shaft's shoulder). Before F1 a shaft's shoulder fillet was 13 % low (Roark /
+# Peterson, investigations/notches).
+FILLET_LENGTH_R = 30.0         # a solid's fillet no longer than this x its radius (a cost guard: a long fillet down
+                               # a machined edge is refined along its whole length), guess
+# Fatigue (release 2, PLAN-FATIGUE.md, D105).
+FATIGUE_PEAK_TOL = 0.05        # the governing stress range must agree within this between the last two meshes. On
+                               # stress, not life: life goes as stress^m (m 3-10), so 0.75 % in stress was 7 % in life
+                               # on a b = -0.1 curve (F0, P1); 5 % on stress is m x 5 % on life, stated in the report.
+                               # Guess, against the static CONVERGENCE_TOL
+SN_DESIGN_FACTOR = 0.75       # built-in S-N data (D111) is a MEAN curve: the design curve is the mean x this on stress.
+                               # MIL-HDBK-5J's scatter (SD of log life 0.8-1.4) at slopes b -0.09 to -0.1 makes mean - 2
+                               # SD about 0.6-0.8 on stress; ASME VIII takes 1/2 on stress or 1/20 on life. Guess
+FORMULA_SCF_MIN = 2.0          # receiving walls (D110): an SCF for a brace load not below this (IIW XV-1035-99 5.5.1)
+FORMULA_ANGLE_TOL_DEG = 5.0    # a brace within this of square to the chord is a T-joint for the formulae, guess
+FORMULA_OPB_FRACTION = 0.10    # a brace whose out-of-plane bending stress range exceeds this x its axial plus in-plane
+                               # bending ranges has no published formula: the model's read-out instead, guess
+FATIGUE_EXCLUDE_ELEMENTS = 1.5 # fixture edges and sharp re-entrant edges: nodes within this many elements of them are
+                               # left out (a singular peak, D32 / D88; the joint band and load-face edges are left out
+                               # by their own bands), guess
 SKIN_THICKNESS_RTOL = 0.03     # skin pairs must be this close to one thickness, guess
 SKIN_MIN_ASPECT = 4.0          # a skin-swept wall: largest face at least 4 x the thickness across (sqrt area), guess (D30)
 SKIN_SIDE_FACTOR = 1.5         # a face whose inward ray runs further than 1.5 t is a side face, guess
@@ -237,7 +279,30 @@ DEFAULT_BOLT_FRICTION = 0.2    # clamped faces of preloaded bolts when no fricti
 
 # --- Pass/fail criteria a new study starts with (task pane, D28) -------------------------------
 # Written into the study by the add-in (AsmFea.AddIn TaskPane, DefaultMinFos etc.; keep both in step),
-# shown on its Study tab and used in the reports; the user may change or blank them.
+# shown on its Run tab (How to solve and pass/fail criteria) and used in the reports; the user may change or blank them.
 PANE_MIN_FOS = 1.5             # yield; a common static design factor for general machinery, judgement
 PANE_MIN_BUCKLING_FACTOR = 3.0 # linear (eigenvalue) buckling over-predicts real collapse loads; ~3 is usual
 PANE_DEFLECTION_RATIO = 250    # max deflection = largest assembly dimension / 250 (span/250 serviceability)
+
+# --- Rigid parts and joins (D96, D97) ----------------------------------------------------------
+RIGID_TESSELLATION_REL = 0.004  # a rigid part's triangulation for plots and its largest displacement: chord deflection =
+                                # this x its box diagonal (a coarse picture is enough; the motion is exact), guess
+RIGID_FACE_TESSELLATION_REL = 0.002  # a load or fixture face on a rigid part, as triangles: the load's moment about the
+                                # group's centre of mass from the triangles' centroids; areas scaled to the exact face area
+JOIN_MAX_GAP_ELEMENTS = 1.0     # a join without a face on each part bonds the nearest faces only within this many local
+                                # element sizes (the smaller part's): bridging a gap of one element with the tie's offset
+                                # is the same idealisation as the bond tolerance, a few times larger. Guess
+JOIN_MAX_GAP_MIN = GAP_TOL      # ... and never less than the bond tolerance
+JOIN_TIE_COS = 0.98             # two chosen faces at most ~11 degrees from opposing (planes) or parallel axes (cylinders)
+                                # are bonded where they overlap; otherwise they are linked rigidly. Guess
+
+# --- Time estimates (pipeline.estimate_solve_s, estimate_deck_s) -------------------------------------------------
+ESTIMATE_MARGIN = 1.25          # the user wants estimates on the long side; two runs of one 1.0 M DOF model took 78 and
+                                # 132 s (other programs' load, 2026-10-16)
+ESTIMATE_DOF_RANGE = 1.5        # earlier runs within this size ratio count as comparable
+ESTIMATE_RECENT = 60            # of the last this many runs (the machine and the software change)
+LINK_MAX_NODES = 64            # a rigid link's mean motion over at most this many nodes of each face, spread over it (D97;
+                               # long equations were slow in CalculiX's one-core cascade), guess
+FACE_CENTROID_LOOSE = 0.25      # mm: a face_ref matching no face within the tight centroid tolerance is accepted when exactly
+                                # one face of its type, area and orientation lies within this; found live: a 290 mm2 face
+                                # 0.12 mm off (2026-10-16); a 20 000 mm2 face 0.72 mm off stays refused. Guess

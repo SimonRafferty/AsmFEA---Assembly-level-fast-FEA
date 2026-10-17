@@ -30,6 +30,15 @@ namespace AsmFea.AddIn
         private readonly List<Entry> entries = new List<Entry>();
         public readonly List<string> Log = new List<string>();
 
+        /// <summary>The user selected something in the document (UserSelectionPostNotify: the user's picks only, not
+        /// the add-in's own Select4; LIVE-T9): the Connections tab finds its connections (D98).</summary>
+        public event Action<IModelDoc2> UserSelected;
+        /// <summary>The document is about to be saved (FileSaveNotify, FileSaveAsNotify2: before the write, LIVE-T13), or
+        /// has been (FileSavePostNotify, or the save cancelled): the colour view is taken off first and put back after.</summary>
+        public event Action<IModelDoc2> BeforeSave, AfterSave;
+        /// <summary>The document closes or changes configuration: the colour view is taken off.</summary>
+        public event Action<IModelDoc2> Leaving;
+
         /// <summary>Watch an assembly's or part's load and save so its studies travel with the file.</summary>
         public void Attach(IModelDoc2 doc)
         {
@@ -54,16 +63,34 @@ namespace AsmFea.AddIn
                 var asm = (AssemblyDoc)doc;
                 asm.LoadFromStorageNotify += () => load();
                 asm.SaveToStorageNotify += () => { Write(e); return 0; };
-                asm.DestroyNotify2 += (int t) => { entries.Remove(e); return 0; };
+                asm.DestroyNotify2 += (int t) => { Fire(Leaving, doc); entries.Remove(e); return 0; };
+                asm.UserSelectionPostNotify += () => { Fire(UserSelected, doc); return 0; };
+                asm.FileSaveNotify += (string f) => { Fire(BeforeSave, doc); return 0; };
+                asm.FileSaveAsNotify2 += (string f) => { Fire(BeforeSave, doc); return 0; };
+                asm.FileSavePostNotify += (int t, string f) => { Fire(AfterSave, doc); return 0; };
+                asm.FileSavePostCancelNotify += () => { Fire(AfterSave, doc); return 0; };
+                asm.ActiveConfigChangeNotify += () => { Fire(Leaving, doc); return 0; };
             }
             else
             {
                 var part = (PartDoc)doc;
                 part.LoadFromStorageNotify += () => load();
                 part.SaveToStorageNotify += () => { Write(e); return 0; };
-                part.DestroyNotify2 += (int t) => { entries.Remove(e); return 0; };
+                part.DestroyNotify2 += (int t) => { Fire(Leaving, doc); entries.Remove(e); return 0; };
+                part.UserSelectionPostNotify += () => { Fire(UserSelected, doc); return 0; };
+                part.FileSaveNotify += (string f) => { Fire(BeforeSave, doc); return 0; };
+                part.FileSaveAsNotify2 += (string f) => { Fire(BeforeSave, doc); return 0; };
+                part.FileSavePostNotify += (int t, string f) => { Fire(AfterSave, doc); return 0; };
+                part.FileSavePostCancelNotify += () => { Fire(AfterSave, doc); return 0; };
+                part.ActiveConfigChangeNotify += () => { Fire(Leaving, doc); return 0; };
             }
             entries.Add(e);
+        }
+
+        private static void Fire(Action<IModelDoc2> ev, IModelDoc2 doc)
+        {
+            try { ev?.Invoke(doc); }
+            catch (Exception ex) { StudyPane.Trace("document event handler failed: " + ex.Message); }   // never back into SolidWorks
         }
 
         private Entry Find(IModelDoc2 doc)

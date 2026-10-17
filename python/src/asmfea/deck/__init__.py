@@ -7,6 +7,7 @@ totals so post-processing never has to parse the deck.
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import Counter
 from collections import defaultdict
@@ -281,7 +282,8 @@ def _perp_basis(a: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return p, np.cross(a, p)
 
 
-def plan_joints(model: Model, connections: list[dict], by_part: dict, first_node: int) -> tuple[list[dict], list]:
+def plan_joints(model: Model, connections: list[dict], by_part: dict, first_node: int,
+                rigid: set | None = None) -> tuple[list[dict], list]:
     """Revolute and sliding joints: a rigid body on each side, joined by equations.
 
     revolute: both rigid bodies share one reference node (translations equal); the two
@@ -289,12 +291,14 @@ def plan_joints(model: Model, connections: list[dict], by_part: dict, first_node
     sliding:  both share one rotation node (rotations equal); the two translations
               perpendicular to the slide direction are made equal by equations.
     The axis/direction comes from the override's params.direction, else the cylindrical
-    interface, else the mates.
+    interface, else the mates. rigid: parts of rigid groups (D96), which have no nodes: a rigid side's motion is its
+    group's (the writer joins to the group's nodes); a joint inside one group (``in_group``) is left out.
     """
     diags = []
+    rigid = rigid or set()
     groups: dict[tuple, list[dict]] = {}
     for c in connections:
-        if c["type"] in ("revolute", "sliding", "hinge", "screw") and c.get("sides"):
+        if c["type"] in ("revolute", "sliding", "hinge", "screw") and c.get("sides") and not c.get("in_group"):
             # a hinge (concentric mate on cylinders) is its own joint on its own axis: two hinges on parallel
             # axes between the same parts must not merge into one
             key = c["id"] if c["type"] in ("hinge", "screw") else ""
@@ -302,8 +306,10 @@ def plan_joints(model: Model, connections: list[dict], by_part: dict, first_node
     mates = {m.id: m for m in model.mates}
     out, nxt = [], first_node
     for (kind, (pa, pb), _), cs in sorted(groups.items()):
-        if pa not in by_part or pb not in by_part:
+        if (pa not in by_part and pa not in rigid) or (pb not in by_part and pb not in rigid):
             continue
+        if pb in rigid and pa not in rigid:
+            pa, pb = pb, pa                 # a rigid group is side A: its motion leads, the other side follows it
         # the joint's own axis line: a hinge's (on a cylinder, or a round profile's normal), else a cylinder's
         cyl = next((c for c in cs if c.get("axis") is not None and c.get("axis_point") is not None), None)
         mate_dirs = [mates[m] for c in cs for m in c.get("evidence", {}).get("mates", []) if m in mates
@@ -330,6 +336,8 @@ def plan_joints(model: Model, connections: list[dict], by_part: dict, first_node
         sides = {pa: set(), pb: set()}
         for c in cs:
             for s in c["sides"]:
+                if s["part"] in rigid:
+                    continue                # no nodes: the group's reference and rotation nodes stand for it
                 inst = by_part[s["part"]]
                 sides[s["part"]].update(int(inst.node0 + n) for n in inst.face_nodes(s["face"]))
         # Side A is a *RIGID BODY (ref, rot). Side B's nodes follow A's rigid motion plus
@@ -345,6 +353,27 @@ def plan_joints(model: Model, connections: list[dict], by_part: dict, first_node
                     "locked": any(c.get("locked") for c in cs),
                     "lead": next((float(c["lead"]) for c in cs if c.get("lead")), 0.0)})
     return out, diags
+
+
+def _spread_nodes(nodes: list, w: np.ndarray, X: np.ndarray, most: int) -> tuple[list, np.ndarray, np.ndarray]:
+    """At most ``most`` of a face's nodes, spread over it (each the furthest from those chosen), each carrying the area
+    shares of the nodes nearest it: a link's mean motion over the face with short equations (a face of 1 100 nodes gave
+    rows of 3 300 terms, slow for CalculiX's cascade, which runs on one core)."""
+    if len(nodes) <= most:
+        return nodes, w, X
+    c = (w[:, None] * X).sum(axis=0) / w.sum()
+    pick = [int(np.argmin(np.linalg.norm(X - c, axis=1)))]
+    d = np.linalg.norm(X - X[pick[0]], axis=1)
+    while len(pick) < most:
+        k = int(np.argmax(d))
+        pick.append(k)
+        d = np.minimum(d, np.linalg.norm(X - X[k], axis=1))
+    from scipy.spatial import cKDTree
+    _, near = cKDTree(X[pick]).query(X)
+    wp = np.bincount(near, weights=w, minlength=len(pick))
+    keep = wp > 0
+    idx = np.asarray(pick)[keep]
+    return [nodes[i] for i in idx], wp[keep], X[idx]
 
 
 def mean_motion(X: np.ndarray, w: np.ndarray, at: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -401,12 +430,18 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                face_map: dict[str, tuple[str, int]], load_cases: list[str], threads_hint: int = 0,
                bolts: Optional[list[dict]] = None, stabilise: Optional[list[str]] = None,
                buckling: bool = True, pin_axes: Optional[dict] = None,
-               held_spins: Optional[list[str]] = None) -> DeckResult:
+               held_spins: Optional[list[str]] = None, rigid: Optional[dict] = None) -> DeckResult:
     """bolts: preloaded-bolt plans (pipeline.plan_preloaded_bolts); stabilise: parts held
     only by contact, which get weak springs to ground; buckling=False leaves out the
     buckling steps (contact decks). pin_axes: {face id: {axis, axis_point}} of the pinned cylindrical faces (pins,
-    turning only about their own axis); held_spins: pin faces whose own turn is held too (resolve)."""
+    turning only about their own axis); held_spins: pin faces whose own turn is held too (resolve). rigid: rigid.json
+    (D96): its groups of rigid parts, which have no mesh, are rigid bodies (deck/rigid.py)."""
+    from .rigid import (column_dof, coupling_equations, free_motions, normal_equation, plan_groups, point_rows,
+                        reduce_holds, resultant)
     pin_axes = pin_axes or {}
+    rigid = rigid or {}
+    rigid_parts = {p for g in rigid.get("groups", []) for p in g["parts"]}
+    rfaces = rigid.get("faces", {})
     held_spins = set(held_spins or [])
     bolts = bolts or []
     stabilise = stabilise or []
@@ -414,12 +449,23 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
     by_part = {i.part_id: i for i in instances}
     info: dict = {"instances": [], "load_cases": {}, "ties": [], "fixtures": {}, "steps": [], "buckling": {},
                   "contacts": [], "bolts": [], "springs": {}}
-    contacts = [c for c in connections if c["type"] == "contact" and c.get("sides")]
+    # (contact with a rigid part is refused by resolve: RIGID_CONNECTION_UNSUPPORTED)
+    contacts = [c for c in connections if c["type"] == "contact" and c.get("sides")
+                and not set(c["parts"][:2]) & rigid_parts]
     nonlinear = bool(contacts or bolts)
 
     def faces_of(fid: str):
         part, idx = face_map[fid]
         return by_part[part], idx
+
+    def on_rigid(fid: str) -> bool:
+        return fid in face_map and face_map[fid][0] in rigid_parts
+
+    def write_eq(terms) -> None:
+        f.write(f"*EQUATION\n{len(terms)}\n")
+        flat = [f"{nn}, {dd}, {cf:.12g}" for nn, dd, cf in terms]
+        for i0 in range(0, len(flat), 4):          # at most 4 terms (12 entries) per line
+            f.write(", ".join(flat[i0:i0 + 4]) + "\n")
 
     # Pinned fixtures: each face is a rigid body of its own (a pin), whose reference node at the face centroid is
     # held in the chosen translations; a cylindrical face turns only about its own axis (its other two turns held by
@@ -432,6 +478,8 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         if fx.type != "pinned":
             continue
         for fid in fx.faces:
+            if on_rigid(fid):
+                continue                    # a pin on a rigid part holds its group (below)
             inst, idx = faces_of(fid)
             ids = sorted({int(inst.node0 + n) for n in inst.face_nodes(idx)})
             hold = [np.eye(3)[d - 1] for d in fx.hold_rotations]
@@ -457,14 +505,94 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                          "hold_vectors": [np.asarray(v, float).tolist() for v in hold]})
             next_node += 2
 
-    joints, jdiags = plan_joints(model, connections, by_part, next_node)
+    # Rigid groups (D96): a reference and a rotation node each; their holds from the fixtures on rigid faces, as rows
+    # over the group's six motions (deck/rigid.py)
+    rgroups, next_node = plan_groups(rigid, next_node)
+    group_of = {p: g for g in rgroups for p in g["parts"]}
+    for fx in model.fixtures:
+        for fid in fx.faces:
+            if not on_rigid(fid):
+                continue
+            g = group_of[face_map[fid][0]]
+            fd = rfaces.get(fid)
+            if fd is None:
+                continue
+            C = np.asarray(fd["centroids"], float)
+            a = np.asarray(fd["areas"], float)
+            if fx.type == "pinned":
+                # the face's centroid held in the chosen translations, and the turns a pin may not make (as above)
+                at = (a[:, None] * C).sum(axis=0) / max(a.sum(), 1e-300)
+                rows = point_rows([at], sorted(fx.dofs), g["x"])
+                hold = [np.eye(3)[d - 1] for d in fx.hold_rotations]
+                pa = pin_axes.get(fid)
+                if pa is not None:
+                    ax = np.asarray(pa["axis"], float) / np.linalg.norm(pa["axis"])
+                    hold += list(np.linalg.svd(ax[None])[2][1:])
+                    if fid in held_spins:
+                        hold.append(ax)
+                rows += [np.concatenate([np.zeros(3), v / np.linalg.norm(v)]) for v in hold]
+            else:
+                held_at = np.vstack([C, np.asarray(fd.get("points") or C, float).reshape(-1, 3)])
+                rows = point_rows(held_at, [1, 2, 3] if fx.type == "fixed" else sorted(fx.dofs), g["x"])
+            g["rows"] += rows
+            g["held"] = True
+            info["fixtures"].setdefault(fx.id, {}).setdefault("rigid_groups", [])
+            if g["id"] not in info["fixtures"][fx.id]["rigid_groups"]:
+                info["fixtures"][fx.id]["rigid_groups"].append(g["id"])
+    for g in rgroups:
+        g["holds"] = reduce_holds(g["rows"])
+    # Rigid links (joins between faces that do not meet, D97): a reference and a rotation node each, midway between
+    # the faces' centroids, unless one side is rigid (its group's nodes then stand for the link)
+    # Links sharing a face are one rigid connector: each face's mean motion is written once (found live: three joins
+    # on one face wrote its rows three times, and CalculiX's cascade looped on the redundant equations, 2026-10-16)
+    link_conns = [c for c in connections if c["type"] == "tie" and c.get("link") and len(c.get("sides", [])) >= 2]
+    lpar = list(range(len(link_conns)))
+
+    def lfind(i):
+        while lpar[i] != i:
+            lpar[i] = lpar[lpar[i]]
+            i = lpar[i]
+        return i
+    owner: dict = {}
+    for i, c in enumerate(link_conns):
+        for sd in c["sides"]:
+            key = (sd["part"], int(sd["face"]))
+            if key in owner:
+                lpar[lfind(i)] = lfind(owner[key])
+            else:
+                owner[key] = i
+    comps: dict = {}
+    for i in range(len(link_conns)):
+        comps.setdefault(lfind(i), []).append(link_conns[i])
+    links = []
+    for cs in comps.values():
+        flex, seen = [], set()
+        for c in cs:
+            for sd in c["sides"]:
+                key = (sd["part"], int(sd["face"]))
+                if sd["part"] in by_part and key not in seen:
+                    seen.add(key)
+                    flex.append(sd)
+        rside = [sd for c in cs for sd in c["sides"] if sd["part"] in rigid_parts]
+        if not flex:
+            continue
+        if rside:
+            g = group_of[rside[0]["part"]]
+            links.append({"cs": cs, "flex": flex, "r": g["r"], "q": g["q"], "x": g["x"], "group": g})
+        else:
+            x = np.mean([_face_centroid(by_part[sd["part"]], int(sd["face"])) for sd in flex], axis=0)
+            links.append({"cs": cs, "flex": flex, "r": next_node, "q": next_node + 1, "x": x, "group": None})
+            next_node += 2
+
+    joints, jdiags = plan_joints(model, connections, by_part, next_node, rigid_parts)
     diags += jdiags
     for j in joints:
         next_node = max(next_node, *j["new_nodes"]) + 1
-    # Preloaded bolts: two nodes on the axis at the bearing faces (head, nut).
+    # Preloaded bolts: two nodes on the axis at the bearing faces (head, nut), the spring's own end beside the nut
+    # and the pre-tension adjustment (D103).
     for b in bolts:
-        b["n1"], b["n2"] = next_node, next_node + 1
-        next_node += 2
+        b["n1"], b["n2"], b["nm"], b["ns"] = next_node, next_node + 1, next_node + 2, next_node + 3
+        next_node += 4
     next_elem = max((i.elem0 + i.mesh.n_elements for i in instances), default=0) + 1
 
     with open(path, "w") as f:
@@ -484,8 +612,16 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         for j in joints:
             for n in j["new_nodes"]:
                 f.write(f"{n}, {j['at'][0]:.9g}, {j['at'][1]:.9g}, {j['at'][2]:.9g}\n")
+        for g in rgroups:
+            for n in (g["r"], g["q"]):
+                f.write(f"{n}, {g['x'][0]:.9g}, {g['x'][1]:.9g}, {g['x'][2]:.9g}\n")
+        for lk in links:
+            if lk["group"] is None:
+                for n in (lk["r"], lk["q"]):
+                    f.write(f"{n}, {lk['x'][0]:.9g}, {lk['x'][1]:.9g}, {lk['x'][2]:.9g}\n")
         for b in bolts:
-            for n, x in ((b["n1"], b["head"]["point"]), (b["n2"], b["nut"]["point"])):
+            for n, x in ((b["n1"], b["head"]["point"]), (b["n2"], b["nut"]["point"]), (b["nm"], b["nut"]["point"]),
+                         (b["ns"], b["nut"]["point"])):
                 f.write(f"{n}, {x[0]:.9g}, {x[1]:.9g}, {x[2]:.9g}\n")
         for inst in instances:
             row = 0
@@ -523,8 +659,12 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             if t_geo:
                 info["wall_thickness"][inst.part_id] = t_geo
 
-        # Bolts: an axial spring of the bolt's own stiffness EA/L between the bearing points,
-        # plus the preload as a constant force pair, so tension = preload + k x elongation.
+        # Bolts: an axial spring of the bolt's own stiffness EA/L from the head's bearing point to its own end node,
+        # which follows the nut's bearing point plus a pre-tension adjustment s along the axis (equations below).
+        # The preload is a force on s in the first step, so the bolt is tightened to exactly the preload whatever the
+        # stiffness of bolt and clamped parts; s is then frozen, and tension = k x (stretch since tightening) +
+        # preload (D103; a pre-tension element). The force pair this replaced, in parallel with the spring, left a
+        # clamp force of preload x k_clamp / (k_bolt + k_clamp): 1 425 N for 2 000 N on the heel bracket.
         # (A beam *PRE-TENSION SECTION was silently dropped by CalculiX 2.22 when its end
         # nodes are coupling reference nodes; milestone 10, D14.)
         for k, b in enumerate(bolts, start=1):
@@ -532,7 +672,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             next_elem += 1
             grip = float(np.linalg.norm(np.asarray(b["head"]["point"]) - np.asarray(b["nut"]["point"])))
             b["k"] = model.material(b["material"]).E * np.pi * b["d"] ** 2 / 4 / max(grip, 1e-9)
-            f.write(f"*ELEMENT, TYPE=SPRINGA, ELSET=BOLT{k}\n{b['elem']}, {b['n1']}, {b['n2']}\n")
+            f.write(f"*ELEMENT, TYPE=SPRINGA, ELSET=BOLT{k}\n{b['elem']}, {b['n1']}, {b['nm']}\n")
 
         # Weak springs to ground on parts held only by contact (stated in the report).
         spring_sets = []
@@ -573,15 +713,20 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 continue
             ids = set()
             for fid in fx.faces:
+                if on_rigid(fid):
+                    continue                # holds its rigid group (above)
                 inst, idx = faces_of(fid)
                 ids.update(int(inst.node0 + n) for n in inst.face_nodes(idx))
+            if not ids:
+                continue                    # every face on rigid parts
             name = f"FIX{len(fix_sets) + 1}"
             fix_sets.append((name, fx, sorted(ids)))
             reaction_sets.append(name)
             fixed_nodes.update(ids)
             f.write(f"*NSET, NSET={name}\n")
             _ids(f, sorted(ids))
-            info["fixtures"][fx.id] = {"set": name, "nodes": len(ids)}
+            # the node ids too: a fixture's edge is a singular point, which fatigue leaves out (D105)
+            info["fixtures"].setdefault(fx.id, {}).update({"set": name, "nodes": len(ids), "node_ids": sorted(ids)})
         for k, p in enumerate(pins, start=1):
             name = f"PIN{k}"
             f.write(f"*NSET, NSET={name}\n")
@@ -682,23 +827,31 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                     flat = [f"{nn}, {dd}, {c:.12g}" for nn, dd, c in terms]
                     for i0 in range(0, len(flat), 4):  # at most 4 terms per line
                         f.write(", ".join(flat[i0:i0 + 4]) + "\n")
+            # the spring's end follows the nut plus the adjustment along the axis: u_m = u_nut + s a (D103)
+            axis_ = np.asarray(b["axis"], float)
+            for d in (1, 2, 3):
+                terms = [(b["nm"], d, 1.0), (b["n2"], d, -1.0)]
+                if abs(axis_[d - 1]) > 1e-12:
+                    terms.append((b["ns"], 1, -float(axis_[d - 1])))
+                f.write(f"*EQUATION\n{len(terms)}\n" + ", ".join(f"{nn}, {dd}, {c:.12g}" for nn, dd, c in terms) + "\n")
+            f.write(f"*BOUNDARY\n{b['ns']}, 2, 3\n")
             info["bolts"].append({"connection": b["id"], "fastener": b["fastener"], "head_node": b["n1"],
-                                  "nut_node": b["n2"], "preload": b["preload"], "axis": b["axis"], "k": b["k"],
+                                  "nut_node": b["n2"], "spring_node": b["nm"], "adjust_node": b["ns"],
+                                  "preload": b["preload"], "axis": b["axis"], "k": b["k"], "d": b["d"],
                                   "head_nodes": b.get("head_nodes", []), "nut_nodes": b.get("nut_nodes", []),
                                   "head_fixed": b.get("head_fixed", 0.0), "nut_fixed": b.get("nut_fixed", 0.0)})
         if bolts:
-            f.write("*NSET, NSET=BOLTNODES\n" + "\n".join(f"{b['n1']}, {b['n2']}" for b in bolts) + "\n")
+            f.write("*NSET, NSET=BOLTNODES\n"
+                    + "\n".join(f"{b['n1']}, {b['n2']}, {b['nm']}, {b['ns']}" for b in bolts) + "\n")
 
-        def bolt_pairs():
-            """The preload as a force pair: head pulled towards the nut and vice versa."""
-            lines = []
-            for b in bolts:
-                a = np.asarray(b["axis"], float)   # from nut towards head
-                for node, sign in ((b["n1"], -1.0), (b["n2"], 1.0)):
-                    for dd in range(3):
-                        if abs(a[dd]) > 1e-12:
-                            lines.append(f"{node}, {dd + 1}, {sign * b['preload'] * a[dd]:.9g}\n")
-            return lines
+        def bolt_pairs(tighten: bool):
+            """The preload, in the tightening step only: a force on each bolt's adjustment s. Its virtual work is
+            tension x ds, so -preload on s holds the bolt at exactly the preload (D103)."""
+            return [f"{b['ns']}, 1, {-b['preload']:.9g}\n" for b in bolts] if tighten else []
+
+        def bolt_freeze() -> str:
+            """After tightening: each adjustment frozen at its value from the step before (*BOUNDARY, FIXED)."""
+            return "*BOUNDARY, FIXED\n" + "".join(f"{b['ns']}, 1, 1\n" for b in bolts) if bolts else ""
 
         slaved: set[int] = set()
         # Internal ties between the regions of one part (milestone 4: a swept span and the
@@ -728,7 +881,55 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         # Ties: finer side is the slave (nodal surface), coarser side the master.
         bond_tol = defaults.GAP_TOL if model.study.bond_tolerance is None else float(model.study.bond_tolerance)
         section_sets: list[str] = []      # tie slave sets whose nodal forces are printed (D33)
-        for k, c in enumerate(c for c in connections if c["type"] == "tie"):
+
+        # Bonds to rigid parts (D96): the other part's nodes over the bond follow the group's rigid motion, three
+        # equations each (deck/rigid.py). They come before the ties between flexible parts, as the internal ties do,
+        # so a bonded footprint on a rigid part keeps all its nodes
+        info["rigid_couplings"] = []
+        rigid_ties = {c["id"] for c in connections if c["type"] == "tie" and set(c["parts"][:2]) & rigid_parts
+                      and not c.get("link")}
+        link_ids = {c["id"] for lk in links for c in lk["cs"]} | {c["id"] for c in connections if c.get("link")}
+        boxes = rigid.get("face_boxes", {})
+        for c in connections:
+            if c["id"] not in rigid_ties or len(c.get("sides", [])) < 2:
+                continue
+            flex = [s for s in c["sides"] if s["part"] not in rigid_parts]
+            rside = next(s for s in c["sides"] if s["part"] in rigid_parts)
+            if not flex:
+                continue                    # two rigid parts bonded: one group
+            g = group_of[rside["part"]]
+            inst = by_part[flex[0]["part"]]
+            b = c.get("butt")
+            if b and c.get("region") is None and b["slave"]["part"] != inst.part_id:
+                # a rigid end butted onto this part's faces (D29): only under the end, as the tie's band is
+                box = boxes.get(f"{b['slave']['part']}#{int(b['slave']['face'])}")
+                cand = np.unique(np.concatenate([inst.face_nodes(int(m["face"])) for m in b["masters"]]))
+                if box is not None:
+                    lo, hi = np.asarray(box[:3]) - b["tolerance"], np.asarray(box[3:]) + b["tolerance"]
+                    X = inst.X[cand - 1]
+                    cand = cand[np.all((X >= lo) & (X <= hi), axis=1)]
+                local = cand
+            elif b and c.get("region") is None:
+                local = inst.face_nodes(int(flex[0]["face"]))
+            else:
+                local = _tie_nodes(inst, int(flex[0]["face"]), c)
+            nodes = [int(inst.node0 + n) for n in local]
+            nodes = [n for n in nodes if n not in slaved and n not in fixed_nodes]
+            slaved.update(nodes)
+            g["coupled"].update(nodes)
+            g["tie_nodes"].update(nodes)
+            for n in nodes:
+                for terms in coupling_equations(n, inst.X[n - inst.node0 - 1], g):
+                    write_eq(terms)
+            info["rigid_couplings"].append({"connection": c["id"], "group": g["id"], "part": inst.part_id,
+                                            "nodes": len(nodes)})
+            if not nodes and c.get("geometry") != "line":
+                diags.append(make("TIE_EMPTY", where={"parts": sorted(set(c["parts"][:2])), "connections": [c["id"]]},
+                                  parts=" and ".join(sorted(set(c["parts"][:2]))),
+                                  area=round(float(c.get("area", 0.0)), 1),
+                                  evidence={"rigid_group": g["id"], "flexible_part": inst.part_id}))
+
+        for k, c in enumerate(c for c in connections if c["type"] == "tie" and c["id"] not in rigid_ties | link_ids):
             (pa, fa), (pb, fb) = [(s["part"], s["face"]) for s in c["sides"]]
             ia, ib = by_part[pa], by_part[pb]
             size = lambda inst, idx: float(np.mean(inst.face_areas(idx)))  # noqa: E731
@@ -796,11 +997,76 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                     f.write(f"{eid}, S{fnum}\n")
             # an overlap bonded deeper than the tolerance (bond-first, D81) needs its own depth
             tol = (float(butt["tolerance"]) if butt else max(bond_tol, -float(c.get("gap", 0.0) or 0.0))) + 0.05
+            if c.get("join"):
+                # the user's join (D97) bonds across its gap, which may be wider than the bond tolerance (P8)
+                tol = max(tol, abs(float(c.get("gap", 0.0) or 0.0)) + 0.05)
             # A butt joint across a gap (D31): ADJUST=YES moves the butting end's nodes onto the surface
             # it meets, as if the member were extended to it (the gap filled by weld), instead of rigid
             # links across the gap, whose ends gave a false stress peak.
             adjust = "YES" if butt and defaults.BUTT_ADJUST else "NO"
             f.write(f"*TIE, NAME={name}, POSITION TOLERANCE={tol:.6g}, ADJUST={adjust}\n{name}SLAVE, {name}MASTER\n")
+
+        # Rigid links (D97, spikes/rigid P7): each linked face's mean motion (its area-weighted translation and best-fit
+        # turn, D84's mean_motion) equals the link's rigid motion at the face's centroid. Six equations per face, each
+        # with a face DOF of its own as the dependent (pivoted QR, as for pins), none already constrained
+        info["links"] = []
+        import scipy.linalg as sla
+        for lk in links:
+            c = lk["cs"][0]
+            for s in lk["flex"]:
+                inst = by_part[s["part"]]
+                share: dict[int, float] = defaultdict(float)
+                for _, fn, e, cn in inst.face_elements(int(s["face"])):
+                    a_f, _, fnodes = _face_geom(inst, e, cn, fn)
+                    for n in fnodes:
+                        share[int(inst.node0 + n)] += a_f / len(fnodes)
+                # not the fixed nodes: force sent into a held node through an equation is left out of CalculiX's
+                # printed reactions (a face reaching a fixture: 2.9 % out of balance)
+                # nor nodes another constraint drives (a tie's slave, a rigid part's bond): an equation leaning on them
+                # passes its force round the printed reactions (the same rule as for pins and slides)
+                nodes = sorted(n for n in share if n not in fixed_nodes and n not in slaved)
+                if len(nodes) < 3:
+                    continue
+                wts = np.array([share[n] for n in nodes])
+                Xf = inst.X[np.asarray(nodes) - inst.node0 - 1]
+                nodes, wts, Xf = _spread_nodes(nodes, wts, Xf, defaults.LINK_MAX_NODES)
+                at = (wts[:, None] * Xf).sum(axis=0) / wts.sum()
+                wn, Cm = mean_motion(Xf, wts, at)
+                n_f = 3 * len(nodes)
+                A = np.zeros((6, n_f + 6))
+                d = at - lk["x"]
+                for ci in range(3):
+                    A[ci, ci:n_f:3] = wn
+                    A[ci, n_f + ci] = -1.0
+                    for jj in range(3):
+                        A[ci, n_f + 3 + jj] -= sum(_eps(ci, jj, kk) * d[kk] for kk in range(3))
+                    A[3 + ci, :n_f] = Cm[:, ci, :].reshape(-1)
+                    A[3 + ci, n_f + 3 + ci] = -1.0
+                free_cols = [jc for jc in range(n_f) if nodes[jc // 3] not in slaved and nodes[jc // 3] not in fixed_nodes]
+                if len(free_cols) < 6:
+                    diags.append(make("TIE_EMPTY", where={"parts": sorted(set(c["parts"][:2])), "connections": [c["id"]]},
+                                      parts=" and ".join(sorted(set(c["parts"][:2]))),
+                                      area=round(float(c.get("area", 0.0)), 1), evidence={"link_face": s}))
+                    continue
+                piv_local = sla.qr(A[:, free_cols], pivoting=True, mode="r")[1][:6]
+                piv = [free_cols[i] for i in piv_local]
+                R = np.linalg.solve(A[:, piv], A)
+                cols = [(nodes[jc // 3], jc % 3 + 1) for jc in range(n_f)] + [(lk["r"], dd) for dd in (1, 2, 3)] + \
+                       [(lk["q"], dd) for dd in (1, 2, 3)]
+                for r_i in range(6):
+                    lead = int(piv[r_i])
+                    big = np.abs(R[r_i]).max()
+                    terms = [(cols[lead][0], cols[lead][1], 1.0)]
+                    terms += [(cols[jc][0], cols[jc][1], float(R[r_i, jc])) for jc in range(n_f + 6)
+                              if jc != lead and abs(R[r_i, jc]) > 1e-13 * big]
+                    write_eq(terms)
+                slaved.update(nodes[jc // 3] for jc in piv)
+                lk.setdefault("faces", []).append({"nodes": [int(n) for n in nodes], "weights": wts.tolist(),
+                                                   "at": at.tolist()})
+                if lk["group"] is not None:
+                    lk["group"]["coupled"].update(nodes)      # the force the group puts on the face (its reaction)
+                info["links"].append({"connection": c["id"], "part": inst.part_id, "face_nodes": len(nodes),
+                                      "ref_node": lk["r"], "rot_node": lk["q"], "rigid_group": (lk["group"] or {}).get("id")})
 
         # Faces that slide but do not separate (a hinge's parts): each slave node keeps the master face's
         # displacement along the face normal, by one equation, and is free in the face's plane
@@ -835,11 +1101,48 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         # pins, joints and sliding faces as the hybrid solver reads them (it cannot parse rigid bodies and
         # equations): each as node sets and the motions left free (deck_info["hybrid"], 2026-10-10)
         hybrid = info["hybrid"] = {"pins": [], "joints": [], "slides": [], "unsupported": []}
+        # rigid groups and links as the hybrid solver reads them (D96, D97): each group's free motions about its
+        # reference point, its bonded and sliding nodes; each link's faces and the group it hangs from, if any
+        hybrid["groups"] = []
+        hybrid["links"] = [{"at": np.asarray(lk["x"], float).tolist(), "ref": lk["r"], "rot": lk["q"],
+                            "group": None if lk["group"] is None else lk["group"]["index"], "faces": lk.get("faces", [])}
+                           for lk in links]
+        if (rgroups or links) and os.environ.get("ASMFEA_TEST_HYBRID_NO_RIGID"):
+            hybrid["unsupported"].append("rigid part (test switch)")    # the fallback path, for its test
         for c in connections:
             if c["type"] in ("gear", "rack_pinion"):
                 hybrid["unsupported"].append(f"{c['type']} coupling")
         for k, c in enumerate(c for c in connections if c["type"] == "slide" and c.get("sides")):
             (pa, fa), (pb, fb) = [(s["part"], s["face"]) for s in c["sides"]]
+            if {pa, pb} & rigid_parts:
+                # on a rigid part (D96): each node of the other face keeps the rigid face's motion along its normal
+                if pa in rigid_parts and pb in rigid_parts:
+                    continue                # refused by resolve (RIGID_CONNECTION_UNSUPPORTED)
+                (rp, _), (fp, ff) = ((pa, fa), (pb, fb)) if pa in rigid_parts else ((pb, fb), (pa, fa))
+                g, inst = group_of[rp], by_part[fp]
+                nodes = [int(inst.node0 + n) for n in _tie_nodes(inst, ff, c)]
+                nodes = [n for n in nodes if n not in slaved and n not in fixed_nodes and n not in on_pins]
+                n_eq = 0
+                for n in nodes:
+                    x = inst.X[n - inst.node0 - 1]
+                    if c.get("normal") is not None:
+                        nrm = np.asarray(c["normal"], float)
+                    elif c.get("axis") is not None and c.get("axis_point") is not None:
+                        ax = np.asarray(c["axis"], float) / np.linalg.norm(c["axis"])
+                        d = x - np.asarray(c["axis_point"], float)
+                        nrm = d - np.dot(d, ax) * ax              # a cylinder: along the radius
+                        if np.linalg.norm(nrm) < 1e-9:
+                            continue
+                    else:
+                        continue
+                    write_eq(normal_equation(n, x, nrm, g))
+                    slaved.add(n)
+                    g["coupled"].add(n)
+                    g["normals"].append([int(n), (np.asarray(nrm, float) / np.linalg.norm(nrm)).tolist()])
+                    n_eq += 1
+                info["slides"].append({"connection": c["id"], "slave_part": fp, "master_part": rp,
+                                       "slave_nodes": n_eq, "rigid_group": g["id"]})
+                continue
             ia, ib = by_part[pa], by_part[pb]
             mean = lambda inst, idx: float(np.mean(inst.face_areas(idx)))  # noqa: E731
             (si, sf), (mi, mf) = ((ia, fa), (ib, fb)) if mean(ia, fa) <= mean(ib, fb) else ((ib, fb), (ia, fa))
@@ -905,9 +1208,24 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         for k, j in enumerate(joints, start=1):
             (_, ra, qa), (_, _, free) = j["bodies"]
             (pa, pb), share = j["_sides"], j["_pin"]       # decided before the sliding faces (above)
+            ga, gb = group_of.get(pa), group_of.get(pb)
+            if gb is not None and gb["held"] and share is None and not (ga is not None and ga["held"]):
+                (pa, pb), (ga, gb) = (pb, pa), (gb, ga)      # a held group leads: its held DOFs cannot be dependents
+            if gb is not None and gb["held"] and (share is not None or (ga is not None and ga["held"])):
+                diags.append(make("RIGID_CONNECTION_UNSUPPORTED", where={"parts": sorted({pa, pb}),
+                                                                         "connections": j["connections"]},
+                                  connection=", ".join(j["connections"]), parts=f"{pa} and {pb}",
+                                  kind="a joint between two parts that are both held (a rigid part with a fixture "
+                                       "on each side, or a rigid part with a fixture on a pinned face)"))
+                continue
             if share is not None:
                 ra, qa = pins[share]["ref"], pins[share]["rot"]
                 x_ref = np.asarray(pins[share]["at"], float)
+                nodes_a = []
+            elif ga is not None:
+                # side A a rigid group (D96): the joint turns or slides against the group's own motion
+                ra, qa = ga["r"], ga["q"]
+                x_ref = ga["x"]
                 nodes_a = []
             else:
                 nodes_a = [n for n in sorted(j["nodes"][pa]) if n not in slaved and n not in fixed_nodes]
@@ -916,8 +1234,41 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 _ids(f, nodes_a)
                 f.write(f"*RIGID BODY, NSET=J{k}A, REF NODE={ra}, ROT NODE={qa}\n")
                 x_ref = np.asarray(j["at"])
-            nodes_b = [n for n in sorted(j["nodes"][pb]) if n not in slaved and n not in fixed_nodes]
+                if gb is not None:
+                    gb["coupled"].update(nodes_a)  # the ring's force reaches the group (its reaction, post)
+            a = np.asarray(j["axis"])
+            x_joint = np.asarray(j["at"])
+            if gb is not None:
+                # side B a rigid group: its reference and rotation nodes follow side A's motion plus the free one
+                xb = gb["x"]
+                rj = xb - x_joint
+                if j["kind"] in ("revolute", "hinge"):
+                    gv, turn = np.cross(a, rj), a
+                elif j["kind"] == "screw":
+                    gv, turn = np.cross(a, rj) + j["lead"] / (2 * np.pi) * a, a
+                else:
+                    gv, turn = a, np.zeros(3)
+                fnode, fscale = subst.get(free, (free, 1.0))
+                d_ab = xb - x_ref
+                for i in range(3):
+                    terms = [(gb["r"], i + 1, 1.0), (ra, i + 1, -1.0)]
+                    for jj in range(3):
+                        c = sum(_eps(i, jj, kk) * d_ab[kk] for kk in range(3))
+                        if abs(c) > 1e-12:
+                            terms.append((qa, jj + 1, -c))
+                    if abs(gv[i] * fscale) > 1e-12:
+                        terms.append((fnode, 1, -gv[i] * fscale))
+                    write_eq(terms)
+                for i in range(3):
+                    terms = [(gb["q"], i + 1, 1.0), (qa, i + 1, -1.0)]
+                    if abs(turn[i] * fscale) > 1e-12:
+                        terms.append((fnode, 1, -turn[i] * fscale))
+                    write_eq(terms)
+            nodes_b = [] if gb is not None else \
+                [n for n in sorted(j["nodes"][pb]) if n not in slaved and n not in fixed_nodes]
             fixed_nodes.update(nodes_b)
+            if ga is not None:
+                ga["coupled"].update(nodes_b)      # side B's nodes hang from the group
             if share is not None and nodes_b:
                 # the load through this joint goes into the pin's held reference node by equations, where
                 # CalculiX reports no reaction: printed here instead (the internal force at side B's nodes), and
@@ -925,9 +1276,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 f.write(f"*NSET, NSET=PJ{k}\n")
                 _ids(f, nodes_b)
                 pin_joint_sets.append(f"PJ{k}")
-            ib = coords[pb]
-            a = np.asarray(j["axis"])
-            x_joint = np.asarray(j["at"])
+            ib = coords.get(pb)
             for n in nodes_b:
                 r = ib.X[n - ib.node0 - 1] - x_ref
                 rj = ib.X[n - ib.node0 - 1] - x_joint      # the free turn is about the joint's own axis line
@@ -960,8 +1309,11 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             # left with an empty side, joining nothing (its free turn then unresisted: a singular joint system,
             # found on the cradle 2026-10-10)
             hybrid["joints"].append({"kind": j["kind"], "at": j["at"], "axis": j["axis"],
-                                     "nodes_a": [] if share is not None else sorted(int(n) for n in j["nodes"][pa]),
-                                     "nodes_b": sorted(int(n) for n in j["nodes"][pb]),
+                                     "nodes_a": [] if share is not None or ga is not None
+                                     else sorted(int(n) for n in j["nodes"][pa]),
+                                     "nodes_b": [] if gb is not None else sorted(int(n) for n in j["nodes"][pb]),
+                                     "group_a": None if ga is None else ga["index"],
+                                     "group_b": None if gb is None else gb["index"],
                                      "locked": bool(j.get("locked", False)),
                                      "coupled": free in subst, "lead": j.get("lead", 0.0), "pin": share})
             if j["kind"] == "screw" and not j.get("locked", False):
@@ -971,9 +1323,41 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             info["joints"].append({"kind": j["kind"], "parts": j["parts"], "connections": j["connections"],
                                    "axis": j["axis"], "at": j["at"], "nodes": j["new_nodes"]})
 
+        # Rigid groups (D96): holds that are not along one of the group's DOFs as equations; each group's coupled
+        # nodes as a set whose printed force (RF: the force the rigid body exerts on them) gives the group's reaction
+        # by its equilibrium (post: R = sum RF - the external load on those nodes - the group's own load)
+        rigid_sets = info["rigid_support_sets"] = []
+        info["rigid"] = {"groups": []}
+        for k, g in enumerate(rgroups, start=1):
+            for eq in g["holds"]["equations"]:
+                write_eq([(*column_dof(g, col), cf) for col, cf in eq])
+            coupled = sorted(g["coupled"])
+            name = None
+            if coupled:
+                name = f"RGS{k}"
+                f.write(f"*NSET, NSET={name}\n")
+                _ids(f, coupled)
+                rigid_sets.append(name)
+            info["rigid"]["groups"].append({
+                "id": g["id"], "parts": g["parts"], "ref_node": g["r"], "rot_node": g["q"], "at": g["x"].tolist(),
+                "mass": g["mass"], "held": g["held"], "support_set": name, "coupled_nodes": len(coupled),
+                "parts_data": {p: {"mass": d["mass"], "cog": d["cog"], "hull": d.get("hull", [])}
+                               for p, d in g["part_data"].items()}})
+        for g in rgroups:
+            hybrid["groups"].append({"id": g["id"], "at": g["x"].tolist(), "ref": g["r"], "rot": g["q"],
+                                     "free": free_motions(g["rows"]).tolist(), "nodes": sorted(g["tie_nodes"]),
+                                     "normals": g["normals"]})
+        if rgroups:
+            f.write("*NSET, NSET=RGREF\n")
+            _ids(f, [n for g in rgroups for n in (g["r"], g["q"])])
+
         # Boundary conditions (held over all steps)
-        if fix_sets or pins or joint_dummies:
+        if fix_sets or pins or joint_dummies or any(g["holds"]["spc"] for g in rgroups):
             f.write("*BOUNDARY\n")
+            for g in rgroups:
+                for col in g["holds"]["spc"]:
+                    node, dof = column_dof(g, col)
+                    f.write(f"{node}, {dof}, {dof}\n")
             for dn, locked in joint_dummies:  # only DOF 1 of a joint's dummy node is used
                 f.write(f"{dn}, {1 if locked else 2}, 3\n")      # a locked hinge (loose pin) holds it too
             for name, fx, _ in fix_sets:
@@ -999,6 +1383,9 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 held[n] = np.ones(3, dtype=bool)
         for p in pins:
             for n in p["nodes"]:
+                held[n] = np.ones(3, dtype=bool)
+        for g in rgroups:                          # their printed force counts the load on them (D96, above)
+            for n in g["coupled"]:
                 held[n] = np.ones(3, dtype=bool)
 
         def into_supports(gid: int, force: np.ndarray) -> np.ndarray:
@@ -1029,7 +1416,32 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                             if int(gids[r, k]) in pin_nodes:
                                 pin_mass += rho * vols[r] * w[k]
             total_mass += vols_all * rho
+        rigid_mass = sum(g["mass"] for g in rgroups)
+        total_mass += rigid_mass
         info["total_mass"] = total_mass
+
+        def rigid_triangles(fids):
+            """[(group, centroid, area, normal)] of the faces' triangles on rigid parts (rigid.json)."""
+            out = []
+            for fid in fids:
+                fd = rfaces.get(fid)
+                if fd is None:
+                    continue
+                g = group_of[face_map[fid][0]]
+                for c, a, n in zip(fd["centroids"], fd["areas"], fd["normals"]):
+                    out.append((g, np.asarray(c, float), float(a), np.asarray(n, float)))
+            return out
+
+        def add_rigid(cload, per_group: dict) -> np.ndarray:
+            """Point forces on rigid groups {group id: (group, [(point, force)])} as a force on each group's
+            reference node and a moment on its rotation node; returns their total (it acts on the groups)."""
+            tot = np.zeros(3)
+            for g, forces in per_group.values():
+                F, M = resultant(g, forces)
+                cload[g["r"]] = cload.get(g["r"], np.zeros(3)) + F
+                cload[g["q"]] = cload.get(g["q"], np.zeros(3)) + M
+                tot += F
+            return tot
         remote_points: dict[str, dict] = {}      # remote loads: their faces' centroid, point, moment
         info["remote_loads"] = remote_points
         hydro_points: dict[str, dict] = {}       # hydrostatic loads: their faces' centroid, the top of the fluid
@@ -1043,12 +1455,19 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             on_pins = np.zeros(3)
             cload: dict[int, np.ndarray] = {}
             dload_lines = []
+            on_groups: dict = {}             # loads on rigid faces: {group id: (group, [(point, force)])} (D96)
+
+            def to_group(g, p, fvec):
+                on_groups.setdefault(g["id"], (g, []))[1].append((p, fvec))
+
             for ld in loads:
+                flex_faces = [fid for fid in ld.faces if not on_rigid(fid)]
+                tris = rigid_triangles([fid for fid in ld.faces if on_rigid(fid)])
                 if ld.type == "force":
-                    faces = [(inst, el) for fid in ld.faces for inst, idx in [faces_of(fid)]
+                    faces = [(inst, el) for fid in flex_faces for inst, idx in [faces_of(fid)]
                              for el in inst.face_elements(idx)]
                     geo = [(inst, _face_geom(inst, e, cn, fn)) for inst, (_, fn, e, cn) in faces]
-                    area = sum(g[0] for _, g in geo)
+                    area = sum(g[0] for _, g in geo) + sum(t[2] for t in tris)
                     d = np.asarray(ld.direction, float)
                     traction = ld.magnitude * d / np.linalg.norm(d) / area
                     for inst, (a, _, nodes) in geo:
@@ -1056,6 +1475,8 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                         for n, wi in zip(nodes, w):
                             gid = int(inst.node0 + n)
                             cload[gid] = cload.get(gid, np.zeros(3)) + traction * a * wi
+                    for g, c, a, _ in tris:
+                        to_group(g, c, traction * a)
                     applied += traction * area
                 elif ld.type == "remote_force":
                     # A force acting at a point off the faces (offset from their area-weighted centroid,
@@ -1066,7 +1487,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                     # as nodal loads so no coupling card is needed.
                     weight: dict[int, float] = {}
                     pos: dict[int, np.ndarray] = {}
-                    for fid in ld.faces:
+                    for fid in flex_faces:
                         inst, idx = faces_of(fid)
                         for _, fn, e, cn in inst.face_elements(idx):
                             a, _, nodes = _face_geom(inst, e, cn, fn)
@@ -1075,8 +1496,11 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                                 weight[gid] = weight.get(gid, 0.0) + a * wi
                                 pos[gid] = inst.X[int(n) - 1]
                     gids = sorted(weight)
-                    w = np.array([weight[g] for g in gids])
-                    X = np.array([pos[g] for g in gids])
+                    # the triangles of rigid faces join in as points of their own (D96): their forces go to their
+                    # groups, so a remote force spread over rigid and flexible faces keeps its total and moment
+                    keys = [("n", g) for g in gids] + [("r", i) for i in range(len(tris))]
+                    w = np.array([weight[g] for g in gids] + [t[2] for t in tris])
+                    X = np.array([pos[g] for g in gids] + [t[1] for t in tris]).reshape(-1, 3)
                     C = (w[:, None] * X).sum(axis=0) / w.sum()
                     P = np.asarray(ld.point, float) if ld.point is not None else C + np.asarray(ld.offset or [0, 0, 0], float)
                     d = np.asarray(ld.direction, float)
@@ -1087,15 +1511,18 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                                                   - r[:, :, None] * r[:, None, :])).sum(axis=0)
                     alpha = np.linalg.pinv(inertia) @ M
                     f = (w / w.sum())[:, None] * F + w[:, None] * np.cross(alpha, r)
-                    for g, fi in zip(gids, f):
-                        cload[g] = cload.get(g, np.zeros(3)) + fi
+                    for (kind, g), fi in zip(keys, f):
+                        if kind == "n":
+                            cload[g] = cload.get(g, np.zeros(3)) + fi
+                        else:
+                            to_group(tris[g][0], tris[g][1], fi)
                     applied += F
                     remote_points[ld.id] = {"centroid": C.tolist(), "point": P.tolist(), "moment": M.tolist()}
                 elif ld.type == "pressure":
                     # written as the consistent nodal forces of the pressure on each element face (the face's
                     # force shared by TRACTION_WEIGHTS), not *DLOAD P: the same load for flat faces, and one the
                     # hybrid solver reads (it refused a tank's pressure, D56)
-                    for fid in ld.faces:
+                    for fid in flex_faces:
                         inst, idx = faces_of(fid)
                         for eid, fn, e, cn in inst.face_elements(idx):
                             a, n, nodes = _face_geom(inst, e, cn, fn)
@@ -1104,6 +1531,10 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                             for nd, wi in zip(nodes, TRACTION_WEIGHTS[len(nodes) // 2]):
                                 gid = int(inst.node0 + nd)
                                 cload[gid] = cload.get(gid, np.zeros(3)) + fvec * wi
+                    for g, c, a, n in tris:
+                        fvec = -ld.magnitude * a * n
+                        applied += fvec
+                        to_group(g, c, fvec)
                 elif ld.type == "hydrostatic":
                     # Fluid pressure (D54): on each element face, at its centre, p = (p_surface - 1 atm) +
                     # rho g depth, the depth measured along the fluid's down direction from the top of the
@@ -1117,11 +1548,13 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                         - defaults.ATMOSPHERE_MPA
                     factor = 1.0 if ld.magnitude is None else float(ld.magnitude)
                     wetted = []
-                    for fid in ld.faces:
+                    for fid in flex_faces:
                         inst, idx = faces_of(fid)
                         for eid, fn, e, cn in inst.face_elements(idx):
                             a, n, nodes = _face_geom(inst, e, cn, fn)
                             wetted.append((inst, eid, fn, a, n, nodes, inst.X[np.asarray(nodes) - 1].mean(axis=0)))
+                    # a rigid face's triangles (D96): inst None, the group in the element's place
+                    wetted += [(None, g, None, a, n, None, c) for g, c, a, n in tris]
                     area = sum(w[3] for w in wetted) or 1.0
                     C = sum(w[3] * w[6] for w in wetted) / area
                     top = np.asarray(ld.point, float) if ld.point is not None else \
@@ -1135,6 +1568,9 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                             continue
                         fvec = -p * a * n                      # as nodal forces, as a pressure load is
                         applied += fvec
+                        if inst is None:
+                            to_group(eid, c, fvec)
+                            continue
                         for nd, wi in zip(nodes, TRACTION_WEIGHTS[len(nodes) // 2]):
                             gid = int(inst.node0 + nd)
                             cload[gid] = cload.get(gid, np.zeros(3)) + fvec * wi
@@ -1145,10 +1581,15 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 elif ld.type == "gravity":
                     d = np.asarray(ld.direction, float)
                     d = d / np.linalg.norm(d)
-                    dload_lines.append(f"EALL, GRAV, {ld.magnitude:.9g}, {d[0]:.9g}, {d[1]:.9g}, {d[2]:.9g}")
+                    if instances:
+                        dload_lines.append(f"EALL, GRAV, {ld.magnitude:.9g}, {d[0]:.9g}, {d[1]:.9g}, {d[2]:.9g}")
                     applied += total_mass * ld.magnitude * d
                     supports += held_mass * ld.magnitude * d
                     on_pins += pin_mass * ld.magnitude * d
+                    # each rigid part's weight at its centre of mass (D96: density x CAD volume)
+                    for g in rgroups:
+                        for pdat in g["part_data"].values():
+                            to_group(g, pdat["cog"], pdat["mass"] * ld.magnitude * d)
                 else:
                     diags.append(make("FEATURE_NOT_IMPLEMENTED", where={"loads": [ld.id]},
                                       feature=f"load type '{ld.type}'"))
@@ -1156,17 +1597,26 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 supports += into_supports(gid, v)
                 if gid in pin_nodes:
                     on_pins += v
+            # the groups' own loads: what reaches the ground through a held group is not in any printed force
+            # (its reference node has no elements), so it counts with the supports (post adds the groups' sets)
+            supports += add_rigid(cload, on_groups)
             return cload, dload_lines, applied, supports, on_pins
 
-        def write_loads(cload, dload_lines):
-            # OP=NEW: each step carries only its own loads (CalculiX otherwise accumulates),
-            # so the bolt preload pairs are repeated in every step.
+        frozen = [False]
+
+        def write_loads(cload, dload_lines, tighten: bool = False):
+            # OP=NEW: each step carries only its own loads (CalculiX otherwise accumulates). The bolts' preload
+            # is a load of the tightening step only; the first step after it freezes their adjustments, and a
+            # boundary stays from step to step (D103).
+            if bolts and not tighten and not frozen[0]:
+                f.write(bolt_freeze())
+                frozen[0] = True
             f.write("*CLOAD, OP=NEW\n")
             for gid, v in sorted(cload.items()):
                 for d in range(3):
                     if abs(v[d]) > 0:
                         f.write(f"{gid}, {d + 1}, {v[d]:.9g}\n")
-            f.write("".join(bolt_pairs()))
+            f.write("".join(bolt_pairs(tighten)))
             f.write("*DLOAD, OP=NEW\n" + "".join(l + "\n" for l in dload_lines))
 
         # Contact makes every step nonlinear: automatic incrementation (initial, period,
@@ -1184,7 +1634,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         if bolts:
             # Step 1: the preload alone, so the joint is clamped before any load case.
             f.write("*STEP\n" + static)
-            write_loads({}, [])
+            write_loads({}, [], tighten=True)
             f.write(f"*NODE FILE{fq}\nU\n*EL FILE{fq}\nS\n")
             f.write(f"*NODE PRINT, NSET=BOLTNODES{fq}\nU\n*END STEP\n")
             step += 1
@@ -1201,8 +1651,10 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 f.write(f"*CONTACT FILE{fq}\nCDIS, CSTR\n")
             if reaction_sets:
                 f.write(f"*NODE PRINT, NSET=FIXALL, TOTALS=ONLY{fq}\nRF\n")
-            for pset in info.get("pin_joint_sets", []):
+            for pset in info.get("pin_joint_sets", []) + rigid_sets:
                 f.write(f"*NODE PRINT, NSET={pset}, TOTALS=ONLY{fq}\nRF\n")
+            if rgroups:
+                f.write(f"*NODE PRINT, NSET=RGREF{fq}\nU\n")      # the groups' motions (post, rigid parts)
             if bolts:
                 f.write(f"*NODE PRINT, NSET=BOLTNODES{fq}\nU\n")
             for sset in section_sets:
