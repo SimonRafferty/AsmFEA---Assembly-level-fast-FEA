@@ -1006,7 +1006,8 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg, plan=N
         plan = plan or plan_study(model.study)
         if os.environ.get("ASMFEA_TEST_FORCE_HYBRID"):                       # test switch: as if it would not fit
             plan.solver_pref = "hybrid"
-        solver_choice, plan_notes = choose_solver(plan, dof, spec["kind"])
+        largest = 3 * max((int(i.get("n_nodes") or 0) for i in deck.info.get("instances", [])), default=0) or None
+        solver_choice, plan_notes = choose_solver(plan, dof, spec["kind"], largest)
         for line in plan_notes:
             js.log(f"plan: {line}")
         mem = memory_check(dof)
@@ -1071,6 +1072,8 @@ def solve_level(study: Path, js: JobState, model: Model, level: str, cfg, plan=N
             _record_history(dof, outcome.seconds, len(spec["cases"]))
         stats["seconds"] += outcome.seconds
         stats["peak_rss_gb"] = max(stats["peak_rss_gb"], outcome.peak_rss_gb)
+        if solver_used == "calculix" and spec["kind"] == "linear" and outcome.peak_rss_gb:
+            plan.measured.append([dof, outcome.peak_rss_gb])     # the next level's solver choice scales from it (D131)
         extra = {"solver_info": outcome.info} if outcome.info else {}     # the hybrid's joints, for the grade
         if "model" in spec:
             from .superpose import prepare_cases
@@ -1328,12 +1331,19 @@ def _select_refine(study: Path, js, model: Model, cfg, mode: str = FULL) -> None
 
 
 def _unconverged_parts(conv: dict) -> list[str]:
-    """The parts whose deflection or assessed stress changed by more than CONVERGENCE_TOL between two meshes, or
-    whose stress kept rising (singular), in any load case."""
+    """The parts whose deflection or assessed stress changed by more than CONVERGENCE_TOL between two meshes, in any
+    load case that carries load. Not for the local pass (D131): a singular point (a stress rising at a bonded joint's
+    edge) has no settled value, so a finer mesh only raises it again; and a case with next to no load
+    (post.convergence marks it negligible) changes by rounding noise. Both had sent every part of a six-part assembly
+    to a third mesh of 4.9 M unknowns (the user, 2026-10-18)."""
     out = set()
     for case in conv["by_case"].values():
+        if case.get("negligible"):
+            continue
         for part, d in (case.get("parts") or {}).items():
-            if d.get("singular") or max(d["max_disp"], d.get("stress_model", 0.0)) > defaults.CONVERGENCE_TOL:
+            if d.get("singular"):
+                continue
+            if max(d["max_disp"], d.get("stress_model", 0.0)) > defaults.CONVERGENCE_TOL:
                 out.add(part)
     return sorted(out)
 
@@ -1737,6 +1747,8 @@ def _three_mesh_singular(per: dict, levels: list[str], local: dict, conv: dict, 
     for k, v in extra.items():
         singular.setdefault(k, []).extend(v)
     for case, c in conv["by_case"].items():
+        if c.get("negligible"):
+            continue                                     # next to no load: its change is noise (D131)
         for part, d in (c.get("parts") or {}).items():
             if d.get("singular") and not d.get("fallback"):
                 continue
@@ -1832,6 +1844,19 @@ def _post(study: Path, js, model: Model, run: Path, levels: list[str], mode: str
     floating = sum(1 for e in exc if e["code"] == "PART_FLOATING")
     plan = read_json(run / "plan.json") if (run / "plan.json").exists() else {}
     res["checks"] = checks(model, res, len(open_exc), floating=floating, fidelity=plan.get("fidelity"))
+    # a convergence change no check's outcome hangs on is a note, not a warning (D132)
+    from .post import convergence_matters
+    if conv and not convergence_matters(res["checks"], conv["worst_change"]):
+        for d in diags:
+            if d.code == "CONVERGENCE_POOR":
+                d.severity = "info"
+    elif plan.get("fidelity") == "fine":
+        # already on the finest mesh: "optimise for Accuracy" is no help; say what can be done instead (D132)
+        from .post import CONVERGENCE_AT_FINEST
+        for d in diags:
+            if d.code == "CONVERGENCE_POOR":
+                d.actions = list(CONVERGENCE_AT_FINEST)
+    res["warnings"] = [d.model_dump() for d in diags]
     # how accurate these results are likely to be, from how they were solved (D60)
     from .accuracy import grade
     all_runs = [r for lv in levels for r in read_json(run / lv / "runs.json")]
@@ -1894,6 +1919,41 @@ def fatigue_key(study: Path, model: Model, run: Path, levels: list[str]) -> str:
     return stage_key("fatigue", {"fatigue": fat, "materials": mats, "results": results, "levels": levels,
                                  "static": file_digest(study / "results" / "results.json"),
                                  "geometry": file_digest(study / "geometry.json")})
+
+
+def _quiet_settled_hotspots(diags: list, parent: dict, joints: dict, finest: bool = False) -> None:
+    """An item whose stress range moved between the last two meshes is a warning only when the move could take its
+    fatigue factor below 1 (factor / (1 + |change|) < 1); otherwise a note (D132): 23 such warnings on items with
+    factors from 24 to thousands asked nothing of the user (2026-10-18)."""
+    for d in diags:
+        if d.code != "FATIGUE_HOTSPOT_UNCONVERGED":
+            continue
+        conn = (d.where.connections or [None])[0]
+        rec = joints.get(conn) if conn else parent.get((d.where.parts or [None])[0])
+        k = (rec or {}).get("factor_k")
+        change = abs(float(((d.evidence or {}).get("change")) or 0.0))
+        if rec is not None and (k is None or math.isinf(k) or k / (1 + change) >= 1.0):   # None: no damage at all
+            d.severity = "info"
+        elif finest:
+            # already meshed finer where it had not settled: what is left to the user (D132)
+            d.actions = ["Look at where the governing point is: at an unfilleted corner, model the real fillet radius "
+                         "and run again.",
+                         "Otherwise allow for the change shown: a fatigue factor this close to 1 should not be relied "
+                         "on without a margin for it (or check the point by hand with its detail category)."]
+
+
+def fatigue_joint_marks(info: dict, joints: dict, walls: dict) -> list[dict]:
+    """The welds' and receiving walls' results on their ties' footprints, for the damage plot (D130):
+    [{"part", "nodes", "damage"}]. A tie's footprint is its slave nodes (deck_info ties' node_area); the master side's
+    band takes the same points, which lie on it."""
+    ties = {t["name"]: t for t in info.get("ties", []) if t.get("node_area")}
+    out = []
+    for v in list(joints.values()) + list(walls.values()):
+        t = ties.get(v.get("tie"))
+        if t is None or v.get("damage") is None:
+            continue
+        out.append({"part": v["part"], "nodes": [int(n) for n in t["node_area"]], "damage": v["damage"]})
+    return out
 
 
 def stage_fatigue(study: Path, js: JobState) -> None:
@@ -1962,6 +2022,8 @@ def stage_fatigue(study: Path, js: JobState) -> None:
         if not math.isfinite(v["damage"]):
             v["damage"], v["pass"] = 1e300, False
     worst = min(items, key=lambda kv: kv[1]["factor_k"], default=None)
+    _quiet_settled_hotspots(diags, parent, joints, finest=reported == "local" or (model.study.mesh is not None and
+                                                                             model.study.mesh.favour == "accuracy"))
     doc = {"schema_version": SCHEMA_VERSION, "job": outer.dir.name, "static_job": res["job"],
            "static_results": file_digest(study / "results" / "results.json"),
            "standard": fat.standard, "standard_name": tables.STANDARD_NAMES[fat.standard],
@@ -1980,9 +2042,15 @@ def stage_fatigue(study: Path, js: JobState) -> None:
     try:                                        # the damage plot and the two documents (F4, D107)
         from .post.plots import render_fatigue
         js.activity("fatigue: rendering the damage plot")
-        marks = [(np.asarray(v["governing"]["at"]), f"{n.split(' (')[0]}: factor {v['factor_k']:.3g}")
+        def label(n, v):                        # by the parts, not the joint's id (D134)
+            kind = n.split(" ", 1)[0]
+            return (f"weld {v['part']} / {v['other']}" if kind == "joint" else
+                    f"beside weld {v['part']} / {v['other']}" if kind == "wall" else n.split(" (")[0])
+        marks = [(np.asarray(v["governing"]["at"]), f"{label(n, v)}: factor {v['factor_k']:.3g}")
                  for n, v in sorted(items, key=lambda kv: kv[1]["factor_k"])[:3] if v["governing"].get("at")]
-        images = render_fatigue(study, model, reported, fields, marks, study / "results")
+        info = stresses[reported].info
+        images = render_fatigue(study, model, reported, fields, marks, study / "results",
+                                joints=fatigue_joint_marks(info, joints, walls), bands=info.get("tie_zone_nodes", {}))
         doc["images"] = images
         _write(study / "results" / "fatigue.json", doc)
         outputs += [study / "results" / n for n in images]

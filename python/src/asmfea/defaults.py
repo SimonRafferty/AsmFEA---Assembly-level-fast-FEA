@@ -92,11 +92,19 @@ HYBRID_EXACT_PART_UNKNOWNS = 10000  # D59: ... while no part condenses onto more
 MEMORY_WARN_FRACTION = 0.7     # plan: warn when estimate exceeds this share of RAM, guess
 # PARDISO memory per DOF for quadratic tets. M0: 1.94 M DOF solved; estimate refined
 # from logged runs once milestone 4 records them.
+CCX_MEMORY_EXPONENT = 4 / 3    # D131: CalculiX (PARDISO) memory ~ DOF^this when scaling one measured solve to a larger
+                               # deck: nested dissection's fill on 3-D meshes; fitted from two solves when the run has them
+CCX_MEMORY_EXPONENT_MAX = 1.4  # ... a fitted power is kept within [1, this] (a sheet assembly measured 1.06)
+HYBRID_MIN_SPLIT = 0.5         # D131: one part holding at least this share of the DOF: the hybrid saves little (it needs
+                               # about the largest part's memory) and is slow, so CalculiX is kept while it fits the RAM
 BYTES_PER_DOF = 8000           # measured 2026-10-03: >= 62 GB at 8.1 M DOF (24-part welded chassis, quadratic tets), D30
 MEMORY_BLOCK_FRACTION = 0.9    # estimate above this share of RAM: not solved (62 GB on 64 GB swapped the PC), D30
 
 # --- Checks (Results, checks and report section) -------------------------------------
 REACTION_BALANCE_TOL = 0.01    # plan: within 1 %
+CONVERGENCE_NEGLIGIBLE_CASE = 0.01  # D131: a load case whose highest assessed stress is below this share of the largest
+                                    # case's is not graded for convergence or sent to the local pass (its change is
+                                    # noise: 0.04 MPa beside 13 MPa read "24 %"); judgement, the user's run 2026-10-18
 CONVERGENCE_TOL = 0.10
 JOINT_BAND_T = 1.5             # the joint band: 1.5 x the wall thickness round a joint's edge (D32; hot-spot read-out practice); since D-joint-edge only a part wholly inside is unassessed
 JOINT_BAND_MIN = 3.0           # mm: ... and at least this distance (solids, unknown thickness), D32

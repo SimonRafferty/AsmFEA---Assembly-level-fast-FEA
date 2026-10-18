@@ -467,7 +467,9 @@ def build_report(study: Path, pdf: bool = False) -> Path:
             _para(doc, f"{c['status']}: {c['check']} = {_fmt(c['value'])} (limit {_fmt(c['limit'])})", style="List Bullet")
     else:
         _para(doc, "Every check passed against the study's limits.")
-    warnings = res.get("warnings", [])
+    # warnings only: notes (severity info) record what AsmFEA handled itself and ask nothing of the reader (D132);
+    # they stay in results.json and the run log
+    warnings = [w for w in res.get("warnings", []) if w.get("severity", "warning") != "info"]
     if warnings:
         _para(doc, "Warnings present when this report was produced:", bold=True)
         for w in warnings:
@@ -878,8 +880,7 @@ def build_summary(study: Path, pdf: bool = False) -> Path:
         _para(doc, res["accuracy"]["summary"], 8.5, bold=True)
     recs = A.weld_checks(res["load_cases"], names=False)
     if recs:                                            # the recommended joint checks, without part names
-        _para(doc, "Recommended: " + " ".join(r_ for r_ in recs if not r_.startswith("If the loads"))
-              + f" Locations: {study_name}_report.docx.", 8.5)
+        _para(doc, "Recommended: " + " ".join(recs) + f" Where: see {study_name}_report.docx.", 8.5)
     lim = model.study.limits
     limits = []
     if lim.min_fos:

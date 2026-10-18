@@ -33,6 +33,8 @@ def _conv_split(conv: Optional[dict]) -> tuple[Optional[float], Optional[float]]
         return None, None
     disp = stress = 0.0
     for case in (conv.get("by_case") or {}).values():         # post.convergence: {case: {"parts": {part: {...}}}}
+        if case.get("negligible"):
+            continue                                           # next to no load: its change is noise (D131)
         for d in (case.get("parts") or {}).values():
             if d.get("singular"):
                 continue

@@ -12,7 +12,7 @@
 ; (for checking the download and the runtime on a machine without SolidWorks).
 
 #ifndef AppVersion
-  #define AppVersion "0.10.0"
+  #define AppVersion "0.10.1"
 #endif
 
 [Setup]

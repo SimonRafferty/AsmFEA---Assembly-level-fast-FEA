@@ -170,7 +170,8 @@ namespace AsmFea.AddIn
             fatCancel.Enabled = running;
             fatAssess.Enabled = !running && staticOk;
             fatReport.Enabled = fatSummary.Enabled = fatData.Enabled = !running && haveFat;
-            if (running) { fatStateShown = null; return; }       // the job's activity on the line meanwhile
+            // the job's activity on the line meanwhile; the bar shows progress, not red (the user, 2026-10-18)
+            if (running) { fatStateShown = null; fatProgress.NeedsRun = false; return; }
             fatProgress.Style = ProgressBarStyle.Continuous;
             fatProgress.Value = 100;
             fatProgress.NeedsRun = !fatOk;
@@ -180,7 +181,7 @@ namespace AsmFea.AddIn
                        : !haveFat ? "Not assessed yet: set the spectrum, then Assess fatigue."
                        : !fatOk ? "The fatigue results are out of date: Assess fatigue again."
                        : "";
-            if (why != fatStateShown) { fatActivity.Text = why; fatStateShown = why; }
+            if (why != fatStateShown) { fatActivity.Text = why; fatActivity.ForeColor = System.Drawing.SystemColors.ControlText; fatStateShown = why; }
             tips.SetToolTip(fatProgress, fatOk ? "The fatigue results are those of the static results and fatigue settings as they are now."
                                                : why);
         }

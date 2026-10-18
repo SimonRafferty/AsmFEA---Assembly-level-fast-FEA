@@ -203,7 +203,7 @@ likely_causes = ["The mesh is too fine for the installed RAM.", "Other programs 
 actions = ["Choose Optimise for: Speed on the Run tab (How to solve) (or a coarser mesh level under Advanced).", "Close other programs before running.", "Reduce the number of parts meshed with tets (members and flat sheet use swept elements)."]
 
 [HYBRID_RETRIED]
-severity = "warning"
+severity = "info"
 stage = "solve"
 what = "The hybrid solver ran out of memory after {minutes:.0f} min with exact joints, so it solved again with smoother joints, one part at a time."
 explain = "AsmFEA joins parts exactly where the joints are small enough (as CalculiX does), which is the most accurate. On this model, with the memory free at the time, that ran out of memory, so instead of stopping the run AsmFEA solved again joining every part by smooth fields, one part at a time. The results are complete; joints by smooth fields can be up to 10 % too flexible at welded frame joints, and the accuracy grade says so."
@@ -219,7 +219,7 @@ likely_causes = ["A thin part was meshed with small tetrahedra (a sweep was refu
 actions = ["Use a coarser mesh fidelity.", "Simplify the part named in a mesh fallback warning (e.g. remove a small recess or step), or suppress parts that do not matter."]
 
 [SOLVER_HYBRID]
-severity = "warning"
+severity = "info"
 stage = "solve"
 what = "Solved with AsmFEA's hybrid solver, not CalculiX: {dof:,} unknowns would need about {need_gb:.0f} GB in CalculiX on a computer with {ram_gb:.0f} GB. The hybrid solver used {peak_gb:.1f} GB."
 explain = "CalculiX solves the whole model at once and would not fit in this computer's memory. The hybrid solver solves each part on its own and joins them through their interfaces, so it needs only about the largest part's memory. Its joints are smooth fields over each interface rather than node-by-node ties: in tests it agreed with CalculiX within about 1-3 % on displacement and on stresses away from joints, with exact reactions. Peak stresses right at a joint can differ more."
@@ -227,7 +227,7 @@ likely_causes = ["A large model: many parts or a fine mesh.", "A part meshed fin
 actions = ["Nothing is required: the results are valid for a linear static study.", "To solve with CalculiX instead, use a coarser mesh fidelity or simplify the model until it fits, or run on a computer with more memory."]
 
 [MEMORY_ESTIMATE_HIGH]
-severity = "warning"
+severity = "info"
 stage = "solve"
 what = "Estimated solver memory {need_gb:.1f} GB exceeds {frac:.0%} of installed RAM ({ram_gb:.1f} GB)."
 explain = "The solver is expected to need a large share of the computer's memory. The run continues, but the computer may slow down badly or the solve may fail. Consider a coarser mesh, or close other large programs while it runs."
@@ -235,7 +235,7 @@ likely_causes = ["The mesh is fine for the size of the model."]
 actions = ["Use a coarser mesh fidelity before solving."]
 
 [MEMORY_PRESSURE]
-severity = "warning"
+severity = "info"
 stage = "solve"
 what = "Other programs have taken {taken_gb:.1f} GB of memory since this run started ({available_gb:.1f} GB now free): the solve is continuing, but may be slower."
 explain = "When the run started, AsmFEA measured the free memory and planned the solve to fit it, leaving room for SolidWorks and other programs. Since then other programs have taken more, so parts of the solve are waiting their turn or being moved to the page file. The run is not stopped and its results are not affected; it just takes longer. Closing programs you do not need speeds it up again."
@@ -251,7 +251,7 @@ likely_causes = ["Part of the load acts on a surface that is not connected to th
 actions = ["Check the connection table for gaps near the loaded parts."]
 
 [JOB_STALLED]
-severity = "warning"
+severity = "blocking"
 stage = "job"
 what = "Job {job} has not updated for {age:.0f} s and its worker process is not running."
 explain = "The background job stopped reporting progress and its worker process is gone, usually because it was killed or the computer slept. Start the run again."
@@ -363,7 +363,7 @@ likely_causes = ["The mate was made on edges or faces the add-in could not trace
 actions = ["Make the mate on the gears' cylindrical faces or circular edges.", "Lock the gear's hinge (Lock rotation on its concentric mate) if it should not turn."]
 
 [MATE_COUPLING_HELD]
-severity = "warning"
+severity = "info"
 stage = "resolve"
 what = "{held} cannot move, so the {mate} mate holds {part} as well: it is analysed locked."
 explain = "A gear or rack and pinion mate couples the turning (or sliding) of two parts. Here one of them has no free joint: it is bonded to its neighbours (AsmFEA bonds touching faces unless a mate or your choice frees them), so the coupling locks the other one too. In SolidWorks it may move, because SolidWorks only positions parts. If it should move, give it a joint: a sliding joint for a rack (Connections tab, Sliding joint, along the rack), or a hinge (a concentric mate) for a gear."
@@ -387,7 +387,7 @@ likely_causes = ["Every connection to the part was switched to contact."]
 actions = ["Keep at least one tie, or accept the weak stabilising springs the deck will add (stated in the report)."]
 
 [MESH_SIZE_REDUCED]
-severity = "warning"
+severity = "info"
 stage = "mesh"
 what = "Part {part} would not mesh at its normal element size and was meshed at {factor} x that size ({size} mm)."
 explain = "The mesher could not mesh this part at the size its fidelity asks for, usually because the part has small features (short edges, slivers, thin faces) that larger elements cannot follow. Smaller elements were used for this part only, so the run goes on; its mesh is finer than its neighbours', which costs time but not accuracy."
@@ -395,7 +395,7 @@ likely_causes = ["Small features in the part (short edges, slivers, tiny faces),
 actions = ["Nothing is needed for the results.", "If the run is slow, simplify the part (remove tiny features) or repair it in SolidWorks (Check, Import Diagnostics)."]
 
 [MESH_SWEEP_FALLBACK]
-severity = "warning"
+severity = "info"
 stage = "mesh"
 what = "Part {part}: {regions} could not be swept through the wall and were meshed with tets instead ({reason})."
 explain = "Thin walls and members are normally meshed with layers of elements swept through the thickness, which bend accurately. Some regions of this part could not be swept and were meshed with tetrahedra instead, which are stiffer in thin-wall bending. Results are still produced; local stresses in those regions are less accurate."
@@ -403,7 +403,7 @@ likely_causes = ["The wall thickness is not constant (bosses, ribs, tapered or m
 actions = ["Check the part is meant to be thin-walled: tets in thin walls are stiffer in local wall bending (milestone 0: up to 3.6 times at one element per thickness).", "Choose a finer mesh (fidelity fine) if local stresses in this part matter."]
 
 [MESH_TIMEOUT]
-severity = "warning"
+severity = "info"
 stage = "mesh"
 what = "The {mesher} mesher did not finish part {part} within {seconds:.0f} s and was stopped; the next mesher in the chain was tried."
 explain = "One mesher took too long on this part and was stopped; the next mesher in the chain was used instead. The run continues. If it happens often, the part may have detail that is hard to mesh."
@@ -419,7 +419,7 @@ likely_causes = ["The mesher moved boundary nodes off the CAD surface (healing o
 actions = ["Check the faces used by loads, fixtures and connections still have facets (the solve stage fails if one has none).", "Re-run the mesh stage; report the part if it persists."]
 
 [STRESS_SINGULAR]
-severity = "warning"
+severity = "info"
 stage = "post"
 what = "The peak stress in {parts} rose by more than {rise:.0%} on the finer mesh while the deflection settled: a singular point, not a real stress."
 explain = "Each run solves on a base mesh and a finer one. Here the deflection hardly changed but the peak stress kept rising, the signature of a stress singularity: a sharp corner, or the end of a bonded edge, where linear analysis gives a stress that grows without limit as the mesh is refined. That number is not a real stress, so a factor of safety from it is a warning, not a fail. Read the stress a little away from that point, and check the joint (e.g. the weld) separately."
@@ -435,7 +435,7 @@ likely_causes = ["The base mesh is too coarse for these parts (thin walls, small
 actions = ["If the study is not on the finest mesh yet, optimise for Accuracy and run again; if it is, allow for the change shown before relying on a small margin in these parts.", "Check where the stress is: a sharp corner or fixture edge is a singularity (a fillet in the model settles it), not a real stress."]
 
 [REFINE_MESH_FAILED]
-severity = "warning"
+severity = "info"
 stage = "solve"
 what = "{count} of the {chosen} parts chosen for the refined mesh could not be meshed finer and kept their base mesh: {parts}."
 explain = "A large model is refined only on its most stressed parts, chosen after the base solve. These parts were chosen, but their finer mesh failed, so the refined solve used their base mesh again. Their convergence check then compares a mesh with itself and shows no change, which says nothing about their accuracy. Treat their results as base-mesh results."
@@ -491,12 +491,12 @@ likely_causes = ["A part is held only by contact and slides or lifts off freely.
 actions = ["Check the parts named here are restrained apart from the contact.", "Switch the contact pairs involved back to ties (decide: tie) to confirm the rest of the model.", "Reduce the load or add friction if sliding is expected to stop."]
 
 [WELD_NO_INTERFACE]
-severity = "blocking"
+severity = "info"
 stage = "resolve"
-what = "Weld bead {weld} on {parts} has no touching faces within its size ({size:g} mm) of its path, so it joins nothing."
-explain = "A weld bead is modelled by bonding the faces where the welded parts touch, within the bead size of the weld path. Here no touching faces were found near the path, so the weld would carry no load; the run stops rather than leave the parts unjoined. This happens when the parts have a gap at the weld (a weld across a gap is not modelled yet), or when the weld path is on an edge away from where the parts meet."
-likely_causes = ["The welded parts do not touch at the weld (a gap, or a weld across a chamfer or root opening).", "The weld path was picked on an edge that is not where the parts meet."]
-actions = ["Make the parts touch where they are welded, or pick the weld path on the edge where they meet.", "If the weld is not structural, suppress the weld bead."]
+what = "Weld bead {weld} on {parts} joins no touching faces within its size ({size:g} mm) of its path: ignored."
+explain = "A weld bead is modelled by bonding the faces where the welded parts touch, within the bead size of the weld path. No touching faces were found near this one, so it is left out. Weld beads that join nothing are common and harmless (lettering or part numbers written in weld), so the run goes on (the user, 2026-10-18, D129). If the weld was meant to hold parts together, those parts are not joined by it: a part held by nothing else is reported as floating, which does stop the run."
+likely_causes = ["The weld is not structural (lettering, part numbers, a tack mark).", "The welded parts do not touch at the weld (a gap, or a weld across a chamfer or root opening).", "The weld path was picked on an edge that is not where the parts meet."]
+actions = ["Nothing, if the weld is not structural.", "If it should join the parts: make them touch where they are welded, or pick the weld path on the edge where they meet."]
 
 [STAB_SPRING_LOAD]
 severity = "warning"
@@ -533,7 +533,7 @@ likely_causes = ["The mate uses reference geometry (a plane, axis or point) or a
 actions = ["If the mate defines a joint, re-mate it to part faces.", "Otherwise ignore: contact between the parts is found from geometry."]
 
 [MEMBER_PATH_UNKNOWN]
-severity = "warning"
+severity = "info"
 stage = "extract"
 what = "Structural member {part} has no straight axis the add-in could find; it is meshed with tets along its whole length."
 explain = "Structural members are normally meshed with swept layers along their length, which is fast and accurate. No straight path could be found for this member, so it is meshed with tetrahedra along its whole length: slower, and stiffer in bending."
@@ -605,7 +605,7 @@ likely_causes = ["A part with separating contact or a preloaded bolt was made ri
 actions = ["Set the connection to Fixed or to Sliding, no separation (Connections tab, Set to).", "Or make the part flexible again."]
 
 [RIGID_JOINT_IN_GROUP]
-severity = "warning"
+severity = "info"
 stage = "resolve"
 what = "Joint {connection} between rigid parts {parts} is ignored: they are also bonded, so they move as one rigid body."
 explain = "Rigid parts bonded to each other form one rigid body. A hinge or sliding joint between two parts of one such body can never move, so it is left out; the bond holds them."
@@ -637,7 +637,7 @@ likely_causes = ["A join between faces that are apart was set to a sliding or co
 actions = ["Set the join back to Fixed, or delete it and join faces that touch."]
 
 [HYBRID_RIGID_UNSUPPORTED]
-severity = "warning"
+severity = "info"
 stage = "solve"
 what = "The memory-saving solver cannot take {what} yet: the model was solved with CalculiX instead."
 explain = "The run planner chose the memory-saving (hybrid) solver for this model's size, but it does not yet support this combination of rigid parts or rigid links. CalculiX solved it instead; the results are complete, but the solve needed more memory."
@@ -733,7 +733,7 @@ likely_causes = ["The receiving part is a solid with no wall thickness.", "The j
 actions = ["Check the receiving wall by hand (for tube joints, CIDECT design guide 8 or EN 1993-1-9 Table 8.7), or by a local model with the weld."]
 
 [FATIGUE_RECEIVING_SIDE_INDICATIVE]
-severity = "warning"
+severity = "info"
 stage = "fatigue"
 what = "Joint {connection}: the wall it sits on ({part}) is assessed from the model's hot-spot stress, an indication only ({why})."
 explain = "The published hand formulae for the wall a tube is welded onto cover square and rectangular hollow-section T-joints inside a range, under axial load and in-plane bending. This joint is not one of those, so the wall's hot-spot stress is read from the bonded model at 0.4 and 1.0 wall thicknesses from the joint's edge. On a reference joint that read-out came out anywhere from 40 % low (coarse meshes) to 30 % high against a solid model and the formulae, so it is an indication, not an assessment."

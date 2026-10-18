@@ -24,8 +24,8 @@ from . import (BLUE, GREY, HEADER_FILL, STATUS_COLOUR, _borders, _font, _header_
 from . import assumptions as A
 
 # the kinds of item, by the prefix of their name in _items, and how the report names the lowest of each
-KINDS = (("Part", "Parent material"), ("Joint", "Bonded joint (weld, member side)"),
-         ("Wall", "Wall under a bonded joint"), ("Bolt", "Preloaded bolt"))
+KINDS = (("Part", "Parent material"), ("Weld", "Bonded joint (weld, member side)"),
+         ("Metal", "Wall under a bonded joint"), ("Bolt", "Preloaded bolt"))
 
 # warnings the report counts in one line each, instead of listing every one (they are all in the data report)
 NOTE_WORDS = {
@@ -47,12 +47,17 @@ def _f(v, nd=3) -> str:
     return f"{v:.{nd}g}"
 
 
-def _items(doc: dict) -> list[tuple[str, dict]]:
+def _items(doc: dict, ids: bool = False) -> list[tuple[str, dict]]:
+    """Every assessed item named by its parts (the user, 2026-10-18, D134: no joint ids in the reports), ranked by
+    factor. ids: the joint's connection id after the name, for the data report, where several welds can join the
+    same two parts."""
+    tag = (lambda c: f" [{c}]") if ids else (lambda c: "")
     out = [(f"Part {p}", v) for p, v in doc.get("parts", {}).items()]
-    out += [(f"Joint {c} ({v['part']} on {v['other']})", v) for c, v in doc.get("joints", {}).items()]
-    out += [(f"Wall at joint {c} ({v['part']} under {v['other']}){' [indicative]' if 'indicative' in v['method'] else ''}", v)
+    out += [(f"Weld joining {v['part']} and {v['other']}{tag(c)}", v) for c, v in doc.get("joints", {}).items()]
+    out += [(f"Metal of {v['part']} beside its weld to {v['other']}"
+             f"{' (indicative)' if 'indicative' in v['method'] else ''}{tag(c)}", v)
             for c, v in doc.get("walls", {}).items()]
-    out += [(f"Bolt {b} ({v['connection']})", v) for b, v in doc.get("bolts", {}).items()]
+    out += [(f"Bolt {b}{tag(v['connection'])}", v) for b, v in doc.get("bolts", {}).items()]
     # "no damage" is an infinite factor, written to JSON as null
     return sorted(out, key=lambda kv: math.inf if kv[1].get("factor_k") is None else kv[1]["factor_k"])
 
@@ -114,6 +119,48 @@ def _governing_rows(items) -> list[list[str]]:
     return rows
 
 
+def _plain_rows(doc: dict, items, overall: str, current: str) -> list[list[str]]:
+    """The summary's figures in plain words, for a safety officer (the user, 2026-10-18, D134): the result and what it
+    means, the loading, the margin, the weakest place and the life used. The engineer's terms (factor on stress,
+    damage, spectrum rows, S-N curve) stay in the report and the data report."""
+    blocks = float(doc.get("design_blocks") or 1)
+    loading = "; ".join(f"{r['cycles'] * blocks:,.0f} cycles of {r['case']} ({r['min_pct']:g} % to "
+                        f"{r['max_pct']:g} % of that load"
+                        + (f", against {r['min_case']}" if r.get("min_case") and r["min_case"] != r["case"] else "")
+                        + ")" for r in doc["spectrum"])
+    rows = [["Result", {"PASS": "Pass: expected to last its design life under the repeated loading given",
+                        "FAIL": "Fail: fatigue cracks are expected within the design life"}.get(overall, overall)],
+            ["Repeated loading", loading]]
+    if not items:
+        return rows + [["Checked", "nothing could be checked"]]
+    name, v = items[0]
+    k = v.get("factor_k")
+    if k is None or k == float("inf"):
+        margin = "no fatigue damage at all at these loads"
+    elif k >= 1:
+        margin = f"{_f(k)}: the stresses could be {_f(k)} times higher before fatigue cracks are expected"
+    else:
+        margin = (f"{_f(k)}: below 1, so cracks are expected; the stresses would have to fall to {k:.0%} of "
+                  "these to last the design life")
+    dmg = float(v.get("damage") or 0.0)
+    used = ("practically none (less than 0.01 %)" if dmg < 1e-4 else f"{dmg:.1%}" if dmg < 10
+            else f"{dmg:.0f} times its fatigue life")
+    where = name.split(" ", 1)[-1]
+    kind = name.split(" ", 1)[0].lower()               # part, weld, metal or bolt (_items)
+    rows += [["Safety margin", margin],
+             ["Weakest place", {"part": f"{where} (marked on the picture)",
+                                "weld": f"the weld joining {v.get('part')} and {v.get('other')}",
+                                "metal": f"the metal of {v.get('part')} beside its weld to {v.get('other')}",
+                                "bolt": f"bolt {where}"}.get(kind, name)],
+             ["Fatigue life used", used]]
+    if v.get("curve_estimated"):
+        rows.append(["Fatigue data", f"estimated from the strength of {v.get('material') or 'the material'} (no "
+                                     "fatigue test data): an engineer may want test data if the margin is small"])
+    rows.append(["Stresses used", "up to date" if current == "current"
+                 else "OUT OF DATE: the design or loads changed since; click Assess fatigue again"])
+    return rows
+
+
 def build_fatigue_summary(study: Path, pdf: bool = False) -> Path:
     """Half a page: the governing item's figures beside the damage plot."""
     study, doc, model, d, asm_name, study_name, when = _open(study)
@@ -127,9 +174,7 @@ def build_fatigue_summary(study: Path, pdf: bool = False) -> Path:
     _widths(layout, [8.0, 9.0])
     left, right = layout.rows[0].cells
     left.text = ""
-    rows = [["Design life", f"the spectrum ({len(doc['spectrum'])} row(s)) {doc['design_blocks']:g} time(s)"]]
-    rows += [r for r in _governing_rows(items) if r[0] != "Life"]
-    rows += [["Static results", current], ["Result", overall]]
+    rows = _plain_rows(doc, items, overall, current)
     t = left.add_table(rows=0, cols=2)
     _borders(t)
     for k, v in rows:
@@ -137,7 +182,7 @@ def build_fatigue_summary(study: Path, pdf: bool = False) -> Path:
         a.text = b.text = ""
         _font(a.paragraphs[0].add_run(k), 8.5, True)
         _shade(a, HEADER_FILL)
-        _font(b.paragraphs[0].add_run(str(v)), 8.5, k == "Result", STATUS_COLOUR.get(v) if k == "Result" else None)
+        _font(b.paragraphs[0].add_run(str(v)), 8.5, k == "Result", STATUS_COLOUR.get(overall) if k == "Result" else None)
     _widths(t, [2.6, 5.0])
     left.paragraphs[0].paragraph_format.space_after = Pt(0)
     iso = _iso(study)
@@ -147,16 +192,19 @@ def build_fatigue_summary(study: Path, pdf: bool = False) -> Path:
         pr.add_run().add_picture(_trimmed(iso), width=Cm(8.6))
         cap = right.add_paragraph()
         cap.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        _font(cap.add_run("Fatigue damage over the design life, log10 (0 = failure)"), 8, colour=GREY)
+        _font(cap.add_run("How much of its fatigue life each area uses over the design life: dark blue very little, "
+                          "red cracking expected; grey not checked"), 8, colour=GREY)
 
-    gaps = sum(1 for w in doc.get("warnings", []) if w["code"] in ("FATIGUE_RECEIVING_SIDE_NOT_ASSESSED",
-                                                                    "FATIGUE_RECEIVING_SIDE_INDICATIVE",
-                                                                    "FATIGUE_BOLT_NOT_ASSESSED"))
-    note = (f"{len(items)} item(s) assessed. Linear elastic stresses; Miner's rule over the spectrum rows; the "
-            "standard's design curves (mean minus two standard deviations) or S-N data for the material.")
-    if gaps:
-        note += f" {gaps} item(s) indicative or not assessed: see the report."
-    note += f" Details: {study_name}_fatigue_report.docx; every item: {study_name}_fatigue_data.docx."
+    # plain words for a safety officer (the user, 2026-10-18, D134): what was checked and who has to act
+    codes = [w["code"] for w in doc.get("warnings", [])]
+    walls, bolts = codes.count("FATIGUE_RECEIVING_SIDE_NOT_ASSESSED"), codes.count("FATIGUE_BOLT_NOT_ASSESSED")
+    note = (f"{len(items)} places were checked: the metal of each part, each weld, and the metal beside each weld, "
+            f"to {doc['standard_name']}.")
+    unchecked = [t for t in (f"the metal beside {walls} weld(s)" if walls else "",
+                             f"{bolts} group(s) of bolts" if bolts else "") if t]
+    if unchecked:
+        note += (f" Not checked by this method: {' and '.join(unchecked)}; an engineer should check them by hand.")
+    note += f" For the engineer: {study_name}_fatigue_report.docx and {study_name}_fatigue_data.docx."
     _para(d, note, 7.5, colour=GREY)
     return _save(d, study / "report" / f"{study_name}_fatigue_summary.docx", pdf)
 
@@ -180,7 +228,8 @@ def build_fatigue_report(study: Path, pdf: bool = False) -> Path:
         ["Static results", f"job {doc['static_job']}, {doc['level']} mesh: {current}"]], size=9)
     iso = _iso(study)
     if iso is not None:
-        _picture(d, iso, "Fatigue damage over the design life, log10 (0 = failure); grey: not assessed; the lowest "
+        _picture(d, iso, "Fatigue damage over the design life, log10 (0 = failure); at the joints, the weld's or the wall's beside it; "
+                         "grey: not assessed (next to supports and load edges); the lowest "
                          "fatigue factors marked", 13.0)
 
     d.add_heading("2. Lowest of each kind", 1)
@@ -207,7 +256,10 @@ def build_fatigue_report(study: Path, pdf: bool = False) -> Path:
     d.add_heading("4. To note", 1)
     counts: dict[str, int] = {}
     for w in doc.get("warnings", []):
-        counts[w["code"]] = counts.get(w["code"], 0) + 1
+        # warnings, and the walls read as an indication (they qualify results shown here); other notes ask nothing
+        # of the reader (D132)
+        if w.get("severity", "warning") != "info" or w["code"] == "FATIGUE_RECEIVING_SIDE_INDICATIVE":
+            counts[w["code"]] = counts.get(w["code"], 0) + 1
     lines = [f"{n} {NOTE_WORDS[c]}." for c, n in counts.items() if c in NOTE_WORDS]
     est = sorted({v["material"] for _, v in items if v.get("curve_estimated") and v.get("material")})
     if est:
@@ -234,7 +286,7 @@ def build_fatigue_data(study: Path, pdf: bool = False) -> Path:
     and every warning."""
     study, doc, model, d, asm_name, study_name, when = _open(study)
     overall, current = _basis(study, doc)
-    items = _items(doc)
+    items = _items(doc, ids=True)
     _header_footer(d, f"Fatigue data of {asm_name}  |  {study_name}", f"{when:%d %B %Y}",
                    f"{study_name}_fatigue_data.docx")
     _para(d, f"Fatigue data: {asm_name}", 16, True, BLUE)

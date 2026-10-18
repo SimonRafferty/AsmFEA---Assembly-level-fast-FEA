@@ -302,6 +302,25 @@ def weld_checks(load_cases: dict, names: bool = True) -> list[str]:
             if jf and (low is None or jf < low[0]):
                 low = (jf, part, p.get("joint_with"))
     out = []
+    if not names:
+        # the summary's readers (a safety officer, the user 2026-10-18) need what it means and who acts, not the method
+        if spots:
+            out.append(f"At {len(spots)} welded joint(s) the computer model cannot give a reliable stress right at the "
+                       "weld: an engineer should check those welds by hand.")
+        if low is not None:
+            k = low[0]
+            if k >= 1:
+                ratio = f"1/{k:.0f}" if k >= 2 else f"{1 / k:.0%}"
+                out.append(f"Welds: where the parts are welded together, the stress in the metal beside the welds is at "
+                           f"most {ratio} of what would start to bend the metal permanently (a safety margin of "
+                           f"{k:.1f}). That margin is for the metal, not the weld itself: an engineer should confirm "
+                           "the welds are big enough for the load.")
+            else:
+                out.append(f"Welds: where the parts are welded together, the stress in the metal beside a weld is "
+                           f"{1 / k:.0%} of what would start to bend the metal permanently (a safety margin of {k:.2f}, "
+                           "below 1): the metal there would yield. An engineer must check those welds and the metal "
+                           "beside them before the design is relied on.")
+        return out
     if spots:
         short = lambda pid: pid.split("/body:")[-1].split("/")[-1]  # noqa: E731
         where = (": " + "; ".join(f"{short(pid)} at ({', '.join(f'{c:.0f}' for c in at[0])}) mm"

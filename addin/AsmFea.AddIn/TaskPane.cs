@@ -218,7 +218,7 @@ namespace AsmFea.AddIn
             return c;
         }
         private List<JObj> shownDiagnostics = new List<JObj>();
-        // Run tab: warnings (and info notes) are hidden unless ticked, like a compiler's; what stops a run always shows
+        // Run tab: warnings are hidden unless ticked, like a compiler's, and notes are not listed (D132); what stops a run always shows
         private readonly CheckBox showWarnings = new CheckBox { Text = "Show warnings", AutoSize = true, Padding = new Padding(8, 3, 0, 0) };
 
         public StudyPane(IPaneHost host)
@@ -485,12 +485,26 @@ namespace AsmFea.AddIn
             foreach (ColumnHeader c in lv.Columns) c.Width = -2;
         }
 
-        private void Say(string text, bool error = false)
+        /// <summary>The status line, on every tab (the user's actions), or on <paramref name="only"/> those tabs'
+        /// lines (a job's progress and outcome: JobLines).</summary>
+        private void Say(string text, bool error = false, IEnumerable<Label> only = null)
         {
-            loadsActivity.Text = resActivity.Text = connActivity.Text = activity.Text = text;
-            loadsActivity.ForeColor = resActivity.ForeColor = connActivity.ForeColor = activity.ForeColor = error ? Color.Firebrick : SystemColors.ControlText;
-            // the line is cut to fit the pane: the whole message is in its tooltip
-            foreach (var l in new[] { activity, connActivity, resActivity, loadsActivity }) tips.SetToolTip(l, text);
+            foreach (var l in only ?? new[] { activity, connActivity, resActivity, loadsActivity })
+            {
+                l.Text = text;
+                l.ForeColor = error ? Color.Firebrick : SystemColors.ControlText;
+                tips.SetToolTip(l, text);                  // the line is cut to fit the pane: the whole message is in its tooltip
+            }
+        }
+
+        /// <summary>The tabs a job's messages belong on: a run's on Run and Results, a connection analysis' on
+        /// Connections and Run (Check only), fatigue's on its own tab and Run. A failed run's error was repeated on the
+        /// Connections tab, whose analysis had gone well (the user, 2026-10-18).</summary>
+        private Label[] JobLines()
+        {
+            return jobKind == "connections" ? new[] { connActivity, activity }
+                 : jobKind == "fatigue" ? new[] { fatActivity, activity }   // Run: beside the problems list
+                 : new[] { activity, resActivity };
         }
 
         // Documents being closed: SolidWorks still reports a closing document as active when it notifies the
@@ -1414,7 +1428,7 @@ namespace AsmFea.AddIn
         private void OpenLoadDialog(JObj st, JObj draft, JObj existing, Action<LoadDialog> onOk, Action onCancel)
         {
             if (openLoadDialog != null) { openLoadDialog.Activate(); Say("Finish the load dialog that is open first.", true); return; }
-            var dlg = new LoadDialog((string)draft["type"], (string)draft["load_case"], existing) { Draft = draft };
+            var dlg = new LoadDialog((string)draft["type"], (string)draft["load_case"], existing) { Draft = draft, ViewSource = () => host.CurrentView(Doc) };
             dlg.Preview = shown =>
             {
                 try { ShowLoadArrow(st, shown, true); }
@@ -1515,6 +1529,13 @@ namespace AsmFea.AddIn
             if (item == null) return;
             StudyStore.List(st, isLoad ? "loads" : "fixtures").Remove(item);
             StudyStore.Prune(st);
+            // its arrow and highlighted faces go with it: refilling the list does not clear them (the user, 2026-10-18)
+            try
+            {
+                host.ShowArrow(Doc, null, null, false);
+                host.HighlightFaces(Doc, st, new string[0]);
+            }
+            catch (Exception e) { Trace("delete: clearing the arrow failed: " + e.Message); }
             Changed();
         }
 
@@ -1857,7 +1878,16 @@ namespace AsmFea.AddIn
         }
 
         /// <summary>How a connection was found, in a few words.</summary>
+        /// <summary>How the connection was found, and the SolidWorks weld beads on it: a bead on faces that touch
+        /// adds nothing to the bond already there, so the row named only the touching faces (the user, 2026-10-18).</summary>
         private static string FoundBy(JObj c)
+        {
+            var welds = ((c["evidence"] as JObj)?["welds"] as List<object>)?.Cast<string>().Distinct().ToList();
+            string how = FoundByRule(c);
+            return welds == null || welds.Count == 0 || (string)c["source"] == "weld" ? how : how + ", " + string.Join(", ", welds).ToLowerInvariant();
+        }
+
+        private static string FoundByRule(JObj c)
         {
             switch ((string)c["source"])
             {
@@ -2031,10 +2061,10 @@ namespace AsmFea.AddIn
                 foreach (var pid in ((Settings(st)["excluded_parts"] as List<object>) ?? new List<object>()).Cast<string>())
                     connList.Items.Add(new ListViewItem(new[] { "Left out of the analysis: " + pid, "your choice (Edit... to put back)" })
                     { Tag = new ConnRow { Parts = new List<string> { pid }, Excluded = true }, ForeColor = Color.DimGray });
-            // parts the user set rigid (D96): Edit... makes one flexible again
+            // parts the user set rigid (D96): Edit..., Remove or Automatic makes one flexible again (D128)
             if (st != null)
                 foreach (var pid in RigidParts(st))
-                    connList.Items.Add(new ListViewItem(new[] { "Rigid (not meshed): " + pid, "your choice (Edit... to make flexible)" })
+                    connList.Items.Add(new ListViewItem(new[] { "Rigid (not meshed): " + pid, "your choice (Remove or Automatic makes it flexible)" })
                     { Tag = new ConnRow { Parts = new List<string> { pid }, Rigid = true }, ForeColor = Color.RoyalBlue });
             Fit(connList);
         }
@@ -2065,6 +2095,14 @@ namespace AsmFea.AddIn
             var row = SelectedConnection();
             if (st == null || row == null) { Say("Select a connection first.", true); return; }
             if (connList.SelectedItems.Count > 1) { Say("Select one connection to set (several are selected).", true); return; }
+            // a rigid part's row: Remove makes it flexible again (it was ignored, so a part made rigid by mistake seemed
+            // stuck, the user 2026-10-18); the other choices concern connections, not parts
+            if (row.Rigid)
+            {
+                if (type == "none") SetRigid(new List<string> { row.Parts[0] }, false);
+                else Say(row.Parts[0] + " is rigid: Remove (or Automatic, or Edit...) makes it flexible again; then set its connections.", true);
+                return;
+            }
             if (row.Parts.Count != 2) { Say("That problem does not concern one pair of parts; select a connection between two parts.", true); return; }
             string jid = type == "none" && row.Connection != null ? row.Connection["join"] as string : null;
             if (jid != null && StudyStore.List(st, "joins").OfType<JObj>().Any(o => (string)o["id"] == jid))
@@ -2533,6 +2571,7 @@ namespace AsmFea.AddIn
             var st = Study;
             var row = SelectedConnection();
             if (st == null || row == null) { Say("Select a connection first.", true); return; }
+            if (row.Rigid) { SetRigid(new List<string> { row.Parts[0] }, false); return; }   // back to automatic: flexible
             int n = StudyStore.List(st, "overrides").RemoveAll(o => o is JObj && OverrideMatches((JObj)o, row));
             if (n == 0) { Say("That connection has no override."); return; }
             Changed();
@@ -2598,18 +2637,19 @@ namespace AsmFea.AddIn
             catch (Exception e) { Say("Export failed: " + e.Message, true); return false; }
         }
 
-        /// <summary>The problems list from the job's diagnostics: what stops a run always, warnings and info notes
-        /// only with Show warnings ticked; the tick box counts what it hides.</summary>
+        /// <summary>The problems list from the job's diagnostics: what stops a run always, warnings only with Show
+        /// warnings ticked (the tick box counts them). Notes (info) are not listed: they record what AsmFEA handled
+        /// itself and ask nothing of the user (the user, 2026-10-18, D132); they stay in the log and the results.</summary>
         private void FillProblems()
         {
             problems.Items.Clear();
-            int hidden = 0;
             foreach (var d in shownDiagnostics)
             {
-                if (!showWarnings.Checked && (string)d["severity"] != "blocking") { hidden++; continue; }
-                problems.Items.Add(new ListViewItem(new[] { (string)d["severity"], (string)d["code"], (string)d["what"] }) { Tag = d });
+                string sev = (string)d["severity"];
+                if (sev == "info" || (!showWarnings.Checked && sev != "blocking")) continue;
+                problems.Items.Add(new ListViewItem(new[] { sev, (string)d["code"], (string)d["what"] }) { Tag = d });
             }
-            int warnings = shownDiagnostics.Count(d => (string)d["severity"] != "blocking");
+            int warnings = shownDiagnostics.Count(d => (string)d["severity"] == "warning");
             showWarnings.Text = warnings > 0 ? "Show warnings (" + warnings + ")" : "Show warnings";
             Fit(problems);
         }
@@ -2715,9 +2755,9 @@ namespace AsmFea.AddIn
         /// bar too.</summary>
         private void SetProgress(ProgressBarStyle style, int value)
         {
+            // a run no longer assesses fatigue (D125), so it does not move the Fatigue tab's bar
             var bars = jobKind == "fatigue" ? new[] { fatProgress }
                      : jobKind == "connections" ? new[] { progress, connProgress }
-                     : FatigueSettings.Get(Settings(Study ?? new JObj()), false) != null ? new[] { progress, fatProgress }
                      : new[] { progress };
             foreach (var bar in bars)
             {
@@ -2770,9 +2810,12 @@ namespace AsmFea.AddIn
             // per run in a box that does not stop anything
             var mp = job["memory_pressure"] as JObj;
             bool pressed = mp != null && mp["active"] is bool && (bool)mp["active"];
-            fatActivity.Text = state == "running" ? (string)job["activity"] : "";      // the Fatigue tab's own line (D113)
-            Say(state + ": " + (string)job["activity"] + "  (" + Fmt(job["elapsed_s"]) + " s)"
-                + (pressed && state == "running" ? "  - slowed: other programs need memory" : ""), state == "failed" || state == "blocked");
+            bool bad = state == "failed" || state == "blocked";
+            if (jobKind == "fatigue")                                // the Fatigue tab's own line (D113): progress, or what stopped it
+                Say(state == "running" ? (string)job["activity"] : bad ? state + ": " + (string)job["activity"] : "", bad, JobLines());
+            else
+                Say(state + ": " + (string)job["activity"] + "  (" + Fmt(job["elapsed_s"]) + " s)"
+                    + (pressed && state == "running" ? "  - slowed: other programs need memory" : ""), bad, JobLines());
             if (pressed && state == "running" && pressureShownFor != jobId)
             {
                 pressureShownFor = jobId;
@@ -3575,6 +3618,10 @@ namespace AsmFea.AddIn
         private readonly Timer previewTimer = new Timer { Interval = 250 };
         private readonly Label resultant = new Label { AutoSize = true, Padding = new Padding(0, 6, 0, 0) };
         private readonly WrapTip tips = new WrapTip { AutoPopDelay = 30000, InitialDelay = 400 };
+        // the assembly's axes as the model is seen now (D126), kept up to date while the dialog is open
+        public Func<JObj> ViewSource;
+        private readonly TriadView triad = new TriadView();
+        private readonly Timer viewTimer = new Timer { Interval = 200 };
 
 
         private static TextBox[] Boxes()
@@ -3702,15 +3749,30 @@ namespace AsmFea.AddIn
             foreach (var b in comp.Concat(offset).Concat(new[] { magnitude, density, surface }))
                 b.TextChanged += (s, e) => { previewTimer.Stop(); previewTimer.Start(); };
             Shown += (s, e) => FirePreview();                           // drawn before anything is typed
-            FormClosed += (s, e) => previewTimer.Dispose();
+            viewTimer.Tick += (s, e) => ShowView();
+            Shown += (s, e) => { ShowView(); viewTimer.Start(); };
+            FormClosed += (s, e) => { previewTimer.Dispose(); viewTimer.Dispose(); };
             buttons.Controls.Add(ok);
             buttons.Controls.Add(cancel);
-            add("", buttons);
+            if (type == "pressure") add("", buttons);                   // along the faces' normals: no axes to show
+            else
+            {
+                tips.SetToolTip(triad, "The assembly's X, Y and Z axes as the model is seen now in SolidWorks "
+                                     + "(X red, Y green, Z blue; an axis pointing away from you is lighter). Turn the model and it follows.");
+                t.Controls.Add(triad);
+                t.Controls.Add(buttons);
+            }
             Controls.Add(t);
             // size the dialog to its contents once laid out (an AutoSize form does not grow for a docked table)
             Load += (s, e) => ClientSize = new Size(t.PreferredSize.Width + 6, t.PreferredSize.Height + 6);
             AcceptButton = ok;
             CancelButton = cancel;
+        }
+
+        private void ShowView()
+        {
+            try { triad.SetView(ViewSource?.Invoke()); }
+            catch (Exception) { triad.SetView(null); }
         }
 
         private void ShowResultant(string unit)
@@ -3798,6 +3860,60 @@ namespace AsmFea.AddIn
                 if (off.All(x => x == 0)) { ld["type"] = "force"; ld.Remove("offset"); }
                 else { ld["type"] = "remote_force"; ld["offset"] = off.Select(x => (object)x).ToList(); }
             }
+        }
+    }
+
+    /// <summary>
+    /// A small X, Y, Z triad drawn as the assembly's axes look in the current SolidWorks view (D126), in the load
+    /// dialog's bottom-left corner: the components are typed along these axes, which are hard to place otherwise.
+    /// Colours as SolidWorks' own triad: X red, Y green, Z blue; an axis pointing away from the viewer is drawn
+    /// lighter and behind the others.
+    /// </summary>
+    public class TriadView : Control
+    {
+        private List<Triad.Axis> axes;
+        private static readonly Color[] Colours = { Color.FromArgb(214, 39, 40), Color.FromArgb(44, 160, 44), Color.FromArgb(31, 92, 200) };
+
+        public TriadView()
+        {
+            DoubleBuffered = true;
+            Size = new Size(76, 76);
+            Margin = new Padding(0, 4, 8, 0);
+        }
+
+        /// <summary>The view as IPaneHost.CurrentView gives it ({toward_viewer, up}); null hides the axes.</summary>
+        public void SetView(JObj view)
+        {
+            var next = Triad.FromView(view);
+            bool same = next != null && axes != null && next.Zip(axes, (a, b) =>
+                a.Index == b.Index && Math.Abs(a.Right - b.Right) < 1e-3 && Math.Abs(a.Up - b.Up) < 1e-3).All(ok => ok);
+            if (same || (next == null && axes == null)) return;
+            axes = next;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            if (axes == null) return;
+            var g = e.Graphics;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            float cx = Width / 2f, cy = Height / 2f, len = Math.Min(Width, Height) / 2f - 14;
+            using (var font = new Font(Font.FontFamily, 8f, FontStyle.Bold))
+                foreach (var a in axes)                              // farthest first
+                {
+                    var c = a.Toward < -0.2 ? Color.FromArgb(150, Colours[a.Index]) : Colours[a.Index];
+                    float tx = cx + (float)a.Right * len, ty = cy - (float)a.Up * len;
+                    using (var pen = new Pen(c, 2.5f) { EndCap = System.Drawing.Drawing2D.LineCap.ArrowAnchor })
+                        if (Math.Abs(a.Right) + Math.Abs(a.Up) > 0.08) g.DrawLine(pen, cx, cy, tx, ty);
+                        else using (var b = new SolidBrush(c)) g.FillEllipse(b, cx - 3, cy - 3, 6, 6);   // end on
+                    // the letter just beyond the tip (beside the centre for an axis seen end on)
+                    double r = Math.Sqrt(a.Right * a.Right + a.Up * a.Up);
+                    float lx = r > 0.08 ? tx + (float)(a.Right / r) * 7 : cx + 5, ly = r > 0.08 ? ty - (float)(a.Up / r) * 7 : cy - 12;
+                    string s = "XYZ"[a.Index].ToString();
+                    var sz = g.MeasureString(s, font);
+                    using (var b = new SolidBrush(c)) g.DrawString(s, font, b, lx - sz.Width / 2, ly - sz.Height / 2);
+                }
         }
     }
 

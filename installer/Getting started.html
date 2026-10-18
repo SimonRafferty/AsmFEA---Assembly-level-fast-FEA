@@ -179,14 +179,16 @@
       <li>A re-run redoes only what your changes need: with nothing changed it finishes in seconds, and a new
         pass/fail limit skips the solve. Tick <i>Full re-run</i> to redo everything.</li>
       <li>A model too large for CalculiX to fit in your computer's memory is no longer refused: AsmFEA solves it with
-        its own hybrid solver, part by part, using the memory it has free. A note on the Run tab and in the report says
+        its own hybrid solver, part by part, using the memory it has free. The report says
         when that happened.</li>
       <li>A run is never stopped for memory. If other programs take memory while it runs, a box says the solve is
         continuing more slowly; closing programs you don't need speeds it up again.</li>
       <li>The results say how far to trust them: a coloured line on the <b>Results</b> tab, and the reports, grade
         them <i>High</i>, <i>Good</i> or <i>Indicative</i> with the likely error on displacements and stresses, from
         how the model was solved. Click the line to see why.</li>
-      <li>Anything that needs attention is listed: double-click it to see what it means and what to do.</li>
+      <li>Anything that needs attention is listed: double-click it to see what it means and what to do. An
+        <b>error</b> stops the run; a <b>warning</b> lets it finish but may affect the results, and always says what you
+        can do about it (tick <i>Show warnings</i> to list them). What AsmFEA dealt with itself is not listed.</li>
     </ul>
   </div>
   <figure><img src="guide_images/pane_run.png" alt="The Run tab"><figcaption>The Run tab: the plan, then Advanced and Pass/fail criteria, closed</figcaption></figure>

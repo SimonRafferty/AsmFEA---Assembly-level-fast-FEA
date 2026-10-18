@@ -1449,8 +1449,9 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
 
         def build_loads(loads):
             """(cload {node: force}, dload lines, applied total, share applied onto held DOFs, the pins' faces'
-            part of that share)."""
+            part of that share, gross: the loads' sizes added up, which opposing loads do not cancel)."""
             applied = np.zeros(3)
+            gross = 0.0
             supports = np.zeros(3)   # part of `applied` that lands on constrained DOFs
             on_pins = np.zeros(3)
             cload: dict[int, np.ndarray] = {}
@@ -1478,6 +1479,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                     for g, c, a, _ in tris:
                         to_group(g, c, traction * a)
                     applied += traction * area
+                    gross += float(np.linalg.norm(traction * area))
                 elif ld.type == "remote_force":
                     # A force acting at a point off the faces (offset from their area-weighted centroid,
                     # or an absolute point): the force spread by area as for a plain force, plus the
@@ -1517,6 +1519,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                         else:
                             to_group(tris[g][0], tris[g][1], fi)
                     applied += F
+                    gross += float(np.linalg.norm(F))
                     remote_points[ld.id] = {"centroid": C.tolist(), "point": P.tolist(), "moment": M.tolist()}
                 elif ld.type == "pressure":
                     # written as the consistent nodal forces of the pressure on each element face (the face's
@@ -1528,12 +1531,14 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                             a, n, nodes = _face_geom(inst, e, cn, fn)
                             fvec = -ld.magnitude * a * n
                             applied += fvec
+                            gross += float(np.linalg.norm(fvec))
                             for nd, wi in zip(nodes, TRACTION_WEIGHTS[len(nodes) // 2]):
                                 gid = int(inst.node0 + nd)
                                 cload[gid] = cload.get(gid, np.zeros(3)) + fvec * wi
                     for g, c, a, n in tris:
                         fvec = -ld.magnitude * a * n
                         applied += fvec
+                        gross += float(np.linalg.norm(fvec))
                         to_group(g, c, fvec)
                 elif ld.type == "hydrostatic":
                     # Fluid pressure (D54): on each element face, at its centre, p = (p_surface - 1 atm) +
@@ -1568,6 +1573,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                             continue
                         fvec = -p * a * n                      # as nodal forces, as a pressure load is
                         applied += fvec
+                        gross += float(np.linalg.norm(fvec))
                         if inst is None:
                             to_group(eid, c, fvec)
                             continue
@@ -1584,6 +1590,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                     if instances:
                         dload_lines.append(f"EALL, GRAV, {ld.magnitude:.9g}, {d[0]:.9g}, {d[1]:.9g}, {d[2]:.9g}")
                     applied += total_mass * ld.magnitude * d
+                    gross += float(np.linalg.norm(total_mass * ld.magnitude * d))
                     supports += held_mass * ld.magnitude * d
                     on_pins += pin_mass * ld.magnitude * d
                     # each rigid part's weight at its centre of mass (D96: density x CAD volume)
@@ -1600,7 +1607,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             # the groups' own loads: what reaches the ground through a held group is not in any printed force
             # (its reference node has no elements), so it counts with the supports (post adds the groups' sets)
             supports += add_rigid(cload, on_groups)
-            return cload, dload_lines, applied, supports, on_pins
+            return cload, dload_lines, applied, supports, on_pins, gross
 
         frozen = [False]
 
@@ -1643,7 +1650,7 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
         # One static step per load case
         for case in load_cases:
             loads = [ld for ld in model.loads if ld.load_case == case]
-            cload, dload_lines, applied, supports, on_pins = build_loads(loads)
+            cload, dload_lines, applied, supports, on_pins, gross = build_loads(loads)
             f.write("*STEP\n" + static)
             write_loads(cload, dload_lines)
             f.write(f"*NODE FILE{fq}\nU\n*EL FILE{fq}\nS\n")
@@ -1664,7 +1671,8 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
             f.write("*END STEP\n")
             step += 1
             info["steps"].append({"kind": "static", "case": case, "step": step})
-            info["load_cases"][case] = {"applied": applied.tolist(), "into_supports": supports.tolist(),
+            info["load_cases"][case] = {"applied": applied.tolist(), "applied_gross": gross,
+                                        "into_supports": supports.tolist(),
                                         "into_pins": on_pins.tolist(), "loads": [ld.id for ld in loads]}
 
         # Linear buckling (CalculiX manual 7.5 *BUCKLE, 7.124 *STEP): with PERTURBATION the
@@ -1678,13 +1686,13 @@ def write_deck(path: Path, model: Model, instances: list[Instance], connections:
                 loads = [ld for ld in model.loads if ld.load_case == case]
                 pre = [ld for ld in loads if not scales_in_buckling(ld)]
                 scal = [ld for ld in loads if scales_in_buckling(ld)]
-                c1, d1, a1, _, _ = build_loads(pre)
+                c1, d1, a1, _, _, _ = build_loads(pre)
                 f.write("*STEP\n*STATIC, SOLVER=PARDISO\n")
                 write_loads(c1, d1)
                 f.write("*END STEP\n")
                 step += 1
                 info["steps"].append({"kind": "preload", "case": case, "step": step})
-                c2, d2, a2, _, _ = build_loads(scal)
+                c2, d2, a2, _, _, _ = build_loads(scal)
                 f.write(f"*STEP, PERTURBATION\n*BUCKLE, SOLVER=PARDISO\n{st.buckling_modes}\n")
                 write_loads(c2, d2)
                 f.write("*NODE FILE\nU\n*END STEP\n")

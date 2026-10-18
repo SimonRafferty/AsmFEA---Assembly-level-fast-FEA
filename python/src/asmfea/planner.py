@@ -58,6 +58,7 @@ class Plan:
     notes: list = field(default_factory=list)       # plain-language lines for the plan display
     solver: Optional[str] = None   # chosen once the deck's size is known
     dof: Optional[int] = None
+    measured: list = field(default_factory=list)    # [[DOF, peak GB]] of this run's CalculiX solves (D131)
     refine_unconverged: bool = False   # a third pass, finer again, on the parts that did not converge (D65)
 
     def as_dict(self) -> dict:
@@ -124,12 +125,38 @@ def ccx_estimate_gb(dof: int) -> float:
     return dof * defaults.BYTES_PER_DOF / 1e9                       # as solve.estimate_memory_gb
 
 
-def choose_solver(plan: Plan, dof: int, kind: str = "linear") -> tuple[str, list[str]]:
+def ccx_need_gb(plan: Plan, dof: int) -> tuple[float, str]:
+    """CalculiX's memory for a deck of ``dof`` unknowns, and where the figure comes from. From this run's own solves
+    when it has any (D131): the peak of the largest, scaled by the DOF to a power fitted from the two largest
+    (clamped), or CCX_MEMORY_EXPONENT from one. The generic BYTES_PER_DOF (solid tets) read 39 GB for a sheet
+    assembly's 4.9 M DOF whose own first two solves (3.8 GB at 0.79 M, 9.7 GB at 1.9 M) scale to about 26 GB."""
+    pts = sorted({int(d): float(g) for d, g in plan.measured if d and g and g > 0}.items())
+    if not pts:
+        return ccx_estimate_gb(dof), "estimate"
+    d1, g1 = pts[-1]
+    e = defaults.CCX_MEMORY_EXPONENT
+    if len(pts) >= 2:
+        d0, g0 = pts[-2]
+        if d1 > d0 * 1.2 and g1 > g0:
+            import math
+            e = min(max(math.log(g1 / g0) / math.log(d1 / d0), 1.0), defaults.CCX_MEMORY_EXPONENT_MAX)
+    return g1 * (dof / d1) ** e, f"scaled from this run's {d1:,}-unknown solve ({g1:.1f} GB)"
+
+
+def choose_solver(plan: Plan, dof: int, kind: str = "linear", largest_part_dof: Optional[int] = None
+                  ) -> tuple[str, list[str]]:
     """CalculiX when it fits the budget with a margin (it is exact and usually quicker), the hybrid solver
     otherwise (it needs about the largest part's memory). Only linear static decks can go to the hybrid. An
-    override wins, except that a forced hybrid on a deck it cannot take falls back to CalculiX."""
-    need = ccx_estimate_gb(dof)
+    override wins, except that a forced hybrid on a deck it cannot take falls back to CalculiX.
+    largest_part_dof: when one part holds most of the model, the hybrid saves little memory and is slow (one solve
+    per joint unknown of that part: 13 500 on a 3 M-DOF sheet part ran over 14 minutes, the user 2026-10-18), so CalculiX is
+    kept while it fits the computer's RAM (MEMORY_WARN_FRACTION) even beyond the budget's margin (D131)."""
+    need, source = ccx_need_gb(plan, dof)
     fits = need * defaults.PLAN_CCX_MARGIN <= plan.budget_gb
+    ram = float((plan.machine or {}).get("ram_total_gb") or 0.0)
+    dominant = (not fits and kind == "linear" and plan.solver_pref == "auto" and largest_part_dof is not None
+                and dof > 0 and largest_part_dof / dof >= defaults.HYBRID_MIN_SPLIT
+                and need <= min(plan.budget_gb, defaults.MEMORY_WARN_FRACTION * ram))   # free now, and the RAM
     notes = []
     if plan.solver_pref == "calculix":
         solver = "calculix"
@@ -138,6 +165,11 @@ def choose_solver(plan: Plan, dof: int, kind: str = "linear") -> tuple[str, list
                          "to spare: the run may be very slow (paging) or fail.")
     elif plan.solver_pref == "hybrid" and kind == "linear":
         solver = "hybrid"
+    elif dominant:
+        solver = "calculix"
+        notes.append(f"{dof:,} unknowns need about {need:.0f} GB in CalculiX ({source}); one part holds "
+                     f"{largest_part_dof / dof:.0%} of them, so the hybrid solver would save little and take much "
+                     "longer: CalculiX, within the computer's memory.")
     elif fits or kind != "linear":
         solver = "calculix"
         if not fits:
@@ -145,7 +177,7 @@ def choose_solver(plan: Plan, dof: int, kind: str = "linear") -> tuple[str, list
                          "analysis (contact or buckling) has no alternative solver: expect it to be slow.")
     else:
         solver = "hybrid"
-        notes.append(f"{dof:,} unknowns would need about {need:.0f} GB in CalculiX; the hybrid solver uses about the "
+        notes.append(f"{dof:,} unknowns would need about {need:.0f} GB in CalculiX ({source}); the hybrid solver uses about the "
                      f"largest part's memory, within the {plan.budget_gb:.0f} GB budget.")
     plan.solver, plan.dof = solver, dof
     plan.notes += notes

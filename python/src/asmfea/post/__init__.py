@@ -134,7 +134,11 @@ def summarise(model: Model, deck_info: dict, frd_path: Path, dat_path: Path,
         held += np.asarray(extra.get("stabilising_spring_force", [0.0, 0.0, 0.0]))   # springs act like supports
         balance = None
         if reaction is not None:
-            denom = max(np.linalg.norm(applied), 1e-12)
+            # scaled by the loads' sizes added up, not their resultant: loads that balance each other (two equal and
+            # opposite forces, a closed vessel's pressure) have a resultant near zero, and dividing by it made
+            # rounding noise read as a singular model (the user, 2026-10-18). Older decks: the resultant.
+            gross = deck_info["load_cases"][case].get("applied_gross")
+            denom = max(np.linalg.norm(applied), float(gross or 0.0), 1e-12)
             balance = float(np.linalg.norm(applied - supports + reaction + held) / denom)
         # PARDISO does not stop on a singular matrix: it returns huge displacements and
         # unbalanced reactions. Treat that signature as singular (milestone 0/1 finding).
@@ -361,11 +365,19 @@ def convergence(base: dict, refined: dict) -> tuple[dict, list[Diagnostic]]:
     kept for reference (peak_vm_excl_ties, peak_vm_raw).
     """
     out, worst, offenders, singular = {}, 0.0, {}, {}
+    # a load case whose stresses are a tiny share of the largest case's is not graded: its changes between the meshes
+    # are rounding noise on next to nothing (two balanced loads, a case of 0.04 MPa beside one of 13 MPa changed
+    # "24 %" and sent every part to a third, local pass; the user, 2026-10-18, D131)
+    case_vm = {case: max([v for lc_ in (r, base["load_cases"].get(case) or {}) for x in (lc_.get("parts") or {}).values()
+                          if (v := assessed_stress(x)) is not None] or [0.0])
+               for case, r in refined["load_cases"].items()}
+    top_vm = max(case_vm.values(), default=0.0)
     for case, r in refined["load_cases"].items():
         b = base["load_cases"].get(case)
         if b is None:
             continue
         rows = {}
+        negligible = len(case_vm) > 1 and top_vm > 0 and case_vm[case] < defaults.CONVERGENCE_NEGLIGIBLE_CASE * top_vm
         # a part's displacement change is measured against the model's largest displacement, not the part's own:
         # a small part that barely moves (a plastic bush on a hinge) changed by 68 % of its own 0.01 mm and made a
         # whole folding step "Indicative", while every structural part had settled within 6 % (the user's
@@ -391,6 +403,8 @@ def convergence(base: dict, refined: dict) -> tuple[dict, list[Diagnostic]]:
                  "peak_vm_excl_ties": _rel(q["peak_vm_excl_ties"], p["peak_vm_excl_ties"]) if peaks else 0.0,
                  "peak_vm_raw": _rel(q["peak_vm"], p["peak_vm"])}
             rows[part] = d
+            if negligible:
+                continue                                 # noise on a case that carries next to nothing
             # deflection settled but the stress keeps rising with refinement: a singular point (D32)
             rise = (sp - sq) / max(sq, 1e-30) if assessed else 0.0
             if d["max_disp"] <= defaults.CONVERGENCE_TOL and rise > defaults.SINGULAR_RISE:
@@ -426,6 +440,8 @@ def convergence(base: dict, refined: dict) -> tuple[dict, list[Diagnostic]]:
             if w > defaults.CONVERGENCE_TOL:
                 offenders.setdefault(part, []).append(f"{case}: {w:.1%}")
         out[case] = {"global_max_disp": _rel(b["max_disp"], r["max_disp"]), "parts": rows}
+        if negligible:
+            out[case]["negligible"] = True
     for case, bk in refined.get("buckling", {}).items():
         q = base.get("buckling", {}).get(case)
         if q and q.get("lowest") and bk.get("lowest"):
@@ -514,6 +530,22 @@ CHECK_TEXT = {
 }
 
 
+def convergence_matters(rows: list, change: float) -> bool:
+    """Whether a change of ``change`` (a fraction) in the results could turn any limit check: a factor of safety or
+    buckling factor within that share above its limit, a deflection or stress within it below its limit (D132). A
+    10.6 % change on a part with a factor of safety of 12 against 1.5 asks nothing of the user, so it is a note, not
+    a warning (the user, 2026-10-18: "I found a problem and fixed it... I didn't need to know")."""
+    for r in rows:
+        v, lim, kind = r.get("value"), r.get("limit"), r.get("kind")
+        if v is None or lim is None or not isinstance(v, (int, float)) or not isinstance(lim, (int, float)):
+            continue
+        if kind in ("fos", "buckling") and v / (1 + change) < lim:
+            return True
+        if kind in ("deflection", "stress") and v * (1 + change) > lim:
+            return True
+    return False
+
+
 def checks(model: Model, results: dict, open_exceptions: int, mesh_failed: int = 0,
            floating: int = 0, fidelity: str | None = None) -> list[dict]:
     """PASS / WARN / FAIL rows with measured value and limit, and for More Info what each means (`explain`), where
@@ -525,6 +557,7 @@ def checks(model: Model, results: dict, open_exceptions: int, mesh_failed: int =
         # ok None: for information only, no pass or fail (status INFO)
         r = {"check": name, "value": value, "limit": limit, "status": "INFO" if ok is None else "PASS" if ok else bad}
         if kind:
+            r["kind"] = kind
             text, actions = CHECK_TEXT[kind]
             if kind == "convergence" and fidelity == "fine":
                 actions = CONVERGENCE_AT_FINEST          # a finer mesh is not on offer: say what to do instead
@@ -579,6 +612,8 @@ def checks(model: Model, results: dict, open_exceptions: int, mesh_failed: int =
     if conv is not None:
         row("Convergence between the two solves", conv["worst_change"], defaults.CONVERGENCE_TOL,
             conv["worst_change"] <= defaults.CONVERGENCE_TOL, kind="convergence", tol=f"{defaults.CONVERGENCE_TOL:.0%}")
+    if conv is not None and conv["worst_change"] > defaults.CONVERGENCE_TOL and not convergence_matters(rows, conv["worst_change"]):
+        rows[-1]["status"] = "INFO"           # no check's outcome hangs on it (D132)
     row("Parts that failed to mesh", mesh_failed, 0, mesh_failed == 0, "FAIL", kind="mesh")
     row("Floating parts", floating, 0, floating == 0, "FAIL", kind="floating")
     row("Open exceptions", open_exceptions, 0, open_exceptions == 0, kind="exceptions")

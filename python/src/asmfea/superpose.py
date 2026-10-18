@@ -71,13 +71,14 @@ def prepare_cases(level_dir: Path, model) -> None:
     steps, terms, cases_info, remote = [], {}, {}, {}
     for k, case in enumerate(model.study.load_cases, start=1):
         t = []
-        applied, into, on_pins = np.zeros(3), np.zeros(3), np.zeros(3)
+        applied, into, on_pins, gross = np.zeros(3), np.zeros(3), np.zeros(3), 0.0
         for ld in (ld for ld in model.loads if ld.load_case == case):
             s = solved[ld.id]
             w = float(ld.magnitude) / s["magnitude"]
             t.append([s["step"], w])
             li = info["load_cases"][pseudo_case(ld.id)]
             applied += w * np.asarray(li["applied"])
+            gross += abs(w) * float(li.get("applied_gross", np.linalg.norm(li["applied"])))
             into += w * np.asarray(li["into_supports"])
             on_pins += w * np.asarray(li.get("into_pins", [0.0, 0.0, 0.0]))
             if ld.id in info.get("remote_loads", {}):
@@ -86,7 +87,7 @@ def prepare_cases(level_dir: Path, model) -> None:
                 remote[ld.id] = r
         steps.append({"kind": "static", "case": case, "step": k})
         terms[str(k)] = t
-        cases_info[case] = {"applied": applied.tolist(), "into_supports": into.tolist(), "into_pins": on_pins.tolist(),
+        cases_info[case] = {"applied": applied.tolist(), "applied_gross": gross, "into_supports": into.tolist(), "into_pins": on_pins.tolist(),
                             "loads": [ld.id for ld in model.loads if ld.load_case == case]}
     combined = dict(info, steps=steps, load_cases=cases_info, remote_loads=remote, kind="linear (superposed loads)")
     combined.pop("superposition", None)

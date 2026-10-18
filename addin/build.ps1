@@ -10,6 +10,11 @@ param([switch]$NoTests, [string]$OutDir, [string]$SwApi = '26')   # -OutDir: bui
 $ErrorActionPreference = 'Stop'
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $bin = if ($OutDir) { $OutDir } else { Join-Path $here 'bin' }
+# SolidWorks loads the registered add-in from bin\ and keeps its files locked: a build into it then fails part-way and
+# can leave bin\ without AsmFea.Extract.dll, so the task pane cannot be created at the next start (2026-10-18)
+if (-not $OutDir -and (Get-Process SLDWORKS -ErrorAction SilentlyContinue)) {
+    throw 'SolidWorks is running and holds addin\bin: close it first, or build elsewhere with -OutDir <folder>'
+}
 New-Item -ItemType Directory -Force $bin | Out-Null
 
 # --- tools -------------------------------------------------------------------

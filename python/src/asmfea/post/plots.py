@@ -638,10 +638,39 @@ def _setup_view(study, model, instances, X, cells, pos, facet_index, centre, siz
     return path.name
 
 
-def render_fatigue(study: Path, model: Model, level: str, fields: dict, markers: list, out_dir: Path) -> list[str]:
+def _joint_bands(val: np.ndarray, X: np.ndarray, pos: np.ndarray, joints: list, bands: dict) -> None:
+    """Fill the unassessed nodes of each part's joint bands with the log10 damage of the nearest joint on that part
+    (in place). A band node with no joint result on its part (a receiving side not assessed) stays grey."""
+    from scipy.spatial import cKDTree
+    by_part: dict[str, list] = {}
+    for j in joints:
+        nid = np.asarray(j["nodes"], dtype=np.int64)
+        nid = nid[(nid < len(pos))]
+        nid = nid[pos[nid] >= 0]
+        if len(nid):
+            by_part.setdefault(j["part"], []).append((X[pos[nid]], np.log10(max(float(j["damage"]), 1e-30))))
+    for part, items in by_part.items():
+        band = np.asarray(bands.get(part, []), dtype=np.int64)
+        band = band[band < len(pos)]
+        rows = pos[band]
+        rows = rows[(rows >= 0)]
+        rows = rows[~np.isfinite(val[rows])]
+        if not len(rows):
+            continue
+        pts = np.vstack([p for p, _ in items])
+        vals = np.concatenate([np.full(len(p), v) for p, v in items])
+        _, k = cKDTree(pts).query(X[rows])
+        val[rows] = vals[k]
+
+
+def render_fatigue(study: Path, model: Model, level: str, fields: dict, markers: list, out_dir: Path,
+                   joints: list | None = None, bands: dict | None = None) -> list[str]:
     """The fatigue damage plot (release 2 F4, D107): log10 of the damage over the design life on the assembly's
-    surface, from the assessed nodes (fields: {part: (node ids, damage)}); grey where not assessed (joint bands,
-    support and load edges, parts not assessed). markers: [(point, label)]. Images per view in out_dir."""
+    surface, from the assessed nodes (fields: {part: (node ids, damage)}); grey where not assessed (support and load
+    edges, parts not assessed). markers: [(point, label)]. Images per view in out_dir.
+    joints: [{"part", "nodes": the joint's footprint (global ids), "damage"}], the welds' and receiving walls' results,
+    shown on the joint bands (bands: {part: global ids}) of their own part, each band node taking its nearest joint's
+    damage: the bands were grey and read as not assessed, though the welds there are (the user, 2026-10-18, D130)."""
     from ..pipeline import build_instances
     instances = build_instances(study, model, level)
     X, cells, ids, pos, owner, facet_index = _surface(instances)
@@ -654,6 +683,7 @@ def render_fatigue(study: Path, model: Model, level: str, fields: dict, markers:
         nid, D = nid[keep], np.asarray(D)[keep]
         sel = pos[nid] >= 0
         val[pos[nid[sel]]] = np.log10(np.maximum(D[sel], 1e-30))
+    _joint_bands(val, X, pos, joints or [], bands or {})
     if not np.isfinite(val).any():
         return []
     top = max(0.0, float(np.nanmax(val)))
@@ -664,6 +694,7 @@ def render_fatigue(study: Path, model: Model, level: str, fields: dict, markers:
     for name, view in views_for(model, study).items():
         path = out_dir / f"fatigue_damage_{name}.png"
         _shot(mesh, val, "log10 damage", (max(clim[0], top - 8.0), clim[1]), "jet", path, centre, size, view,
-              note="damage over the design life: 0 = failure; grey: not assessed", markers=markers)
+              note="damage over the design life: 0 = failure; at joints, the weld's or wall's; grey: not assessed",
+              markers=markers)
         images.append(path.name)
     return images
