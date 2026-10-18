@@ -2642,6 +2642,10 @@ namespace AsmFea.AddIn
         /// <summary>Start a job. ``fatigueOnly``: the fatigue stage on the last results, with only study.json's
         /// fatigue settings written and no export (D115): saving the assembly changes the faces' persistent references,
         /// and a fresh export then made the static results look out of date.</summary>
+        /// <summary>Run: every stage but fatigue, which runs only on Assess fatigue (the user, 2026-10-18: it doubled
+        /// the time to the first results).</summary>
+        private const string FullRunStages = "resolve mesh solve post report";
+
         private bool Run(string stages, bool fast = false, bool fatigueOnly = false)
         {
             if (Busy()) return false;
@@ -2673,7 +2677,7 @@ namespace AsmFea.AddIn
                 fullRun.Checked = false;                         // a one-off: the next Run reuses again
                 string mode = fast ? " --fast" : "";       // a fast run: approximate, no report (ADDENDUM-FAST-RUN-MODE)
                 Trace("run: starting the job");
-                Cli.RunAsync(this, "run " + Cli.Quote(folder) + (stages == null ? "" : " --stages " + stages) + cases + force + mode, (r, err) =>
+                Cli.RunAsync(this, "run " + Cli.Quote(folder) + " --stages " + (stages ?? FullRunStages) + cases + force + mode, (r, err) =>
                 {
                     starting = false;
                     if (err != null) { Say(err, true); Trace("run: job not started: " + err); return; }

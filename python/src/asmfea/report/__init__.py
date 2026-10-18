@@ -359,10 +359,8 @@ def build_report(study: Path, pdf: bool = False) -> Path:
                     ["Part" if model.source.assembly.lower().endswith(".sldprt") else "Assembly", model.source.assembly],
                     ["Configuration", model.source.configuration or "-"],
                     ["Overall result", overall]]
-                   + ([["Accuracy", res["accuracy"]["grade"]]] if res.get("accuracy") else [])
-                   # fatigue has its own report (D107): one line pointing to it
-                   + ([["Fatigue", f"see {study_name}_fatigue_report.docx"]]
-                      if (study / "results" / "fatigue.json").exists() else []), (4.5, 12.5), size=10)
+                   # fatigue is reported on its own (D107, D125): nothing of it here
+                   + ([["Accuracy", res["accuracy"]["grade"]]] if res.get("accuracy") else []), (4.5, 12.5), size=10)
     _para(doc, "Prepared with AsmFEA, which builds the finite element model from the SolidWorks assembly, and "
                "CalculiX, which solves it.", 9, colour=GREY)
     _para(doc)
@@ -895,8 +893,6 @@ def build_summary(study: Path, pdf: bool = False) -> Path:
     if limits:
         note += " Limits: " + ", ".join(limits) + "."
     note += f" Full details: {study_name}_report.docx (technical file)."
-    if (study / "results" / "fatigue.json").exists():
-        note += f" Fatigue: {study_name}_fatigue_summary.docx."
     _para(doc, note, 7.5, colour=GREY)
 
     out = study / "report" / f"{study_name}_summary.docx"

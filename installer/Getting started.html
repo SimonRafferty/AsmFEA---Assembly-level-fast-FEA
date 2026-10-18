@@ -126,7 +126,7 @@
   </div>
   <figure><img src="guide_images/pane_loads.png" alt="The Loads tab"><figcaption>The Loads tab</figcaption></figure>
   <figure style="grid-column: 1 / -1"><img src="guide_images/model_fixtures.png" alt="A fixed face highlighted on the model">
-    <figcaption>The fixed face highlighted in blue. This assembly is a plate on a base, held by a 6 mm weld bead along one edge.</figcaption></figure>
+    <figcaption>A fixed face highlighted in blue (the other end of the long tube is fixed too). This assembly is a 40 mm square hollow section welded on to the side of a 60 mm one, loaded at its free end.</figcaption></figure>
 </section>
 
 <section class="card step">
@@ -219,7 +219,7 @@
   </div>
   <figure><img src="guide_images/pane_results.png" alt="The Results tab"><figcaption>Results</figcaption></figure>
   <div class="pair" style="grid-column: 1 / -1">
-    <figure><img src="guide_images/plot_stress.png" alt="Stress plot"><figcaption>Stress (von Mises), with the highest and lowest values marked</figcaption></figure>
+    <figure><img src="guide_images/plot_stress.png" alt="Stress plot"><figcaption>Stress (von Mises), with the highest and lowest values marked; the peak is where the two tubes join</figcaption></figure>
     <figure><img src="guide_images/viewer_displacement.png" alt="The 3-D viewer"><figcaption>The 3-D window: displacement with the undeformed outline, a clicked point and the min / max labels</figcaption></figure>
   </div>
 </section>
@@ -238,11 +238,12 @@
       <li>The <b>S-N data</b> per material is built in: the SolidWorks material's own curve if it has one, otherwise
         published data, or an estimate from the tensile strength (marked ESTIMATED). Give your own if you have it.</li>
       <li>Click <span class="btn">Assess fatigue</span>. The result shows the damage over the design life (1 means a crack
-        is expected) and the fatigue factor: how much every stress could rise before that.</li>
+        is expected) and the fatigue factor: how much every stress could rise before that. <span class="btn">Run</span>
+        does not assess fatigue; after a new run the bar turns red until you click <span class="btn">Assess fatigue</span> again.</li>
       <li>Bonded joints (welds) are listed weakest first, with the factors of the weld and of the wall under it: click
         one to see it on the model.</li>
       <li><span class="btn">Fatigue report</span>, <span class="btn">Summary</span> and <span class="btn">Data</span>
-        open its own documents. Hover over any setting for an explanation.</li>
+        open its own documents, separate from the static report. Hover over any setting for an explanation.</li>
     </ol>
   </div>
   <figure><img src="guide_images/pane_fatigue.png" alt="The Fatigue tab"><figcaption>The Fatigue tab after an assessment</figcaption></figure>
